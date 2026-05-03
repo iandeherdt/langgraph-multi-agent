@@ -1,0 +1,23 @@
+# Playwright MCP server image.
+#
+# Why we have this Dockerfile (and not just `image:` in compose):
+# Earlier we ran `npx -y @playwright/mcp@<version>` at container startup. That meant every
+# boot fetched the package from npm — a network dependency for a service that should be
+# deterministic, plus exposure to npm-registry hiccups, version yanks, and the kind of
+# silent floating-tag drift that has bitten us before. Baking the package in at build time
+# gives us reproducible startup. Resolves the v1.4 TODO previously in docker-compose.yml.
+#
+# Why Firefox, not Chrome:
+# The base image already ships Playwright's bundled Firefox/WebKit/Chromium under
+# /ms-playwright/. Google Chrome (the branded Chromium variant) would need an extra ~300MB
+# download via `npx playwright install chrome --with-deps`. For our evaluator (does the
+# page render, does the admin redirect, is seeded content visible) the rendering engine is
+# invisible — we never touch Chrome-specific features. Firefox saves the download and
+# avoids rebuild churn whenever Chrome ships a new version.
+FROM mcr.microsoft.com/playwright:v1.49.0-jammy
+
+# Pinned MCP version. Bump deliberately, not via floating tag. When bumping:
+#   1. Run `docker run --rm <image> playwright-mcp --help` and confirm flags still match
+#      (--port, --host, --headless, --browser, --allowed-hosts).
+#   2. Rebuild and verify the langgraph container can curl the /sse endpoint.
+RUN npm install -g @playwright/mcp@0.0.73
