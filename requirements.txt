@@ -1,6 +1,8 @@
 langgraph>=1.0
+langgraph-checkpoint-sqlite>=2.0
 langchain>=1.0
 langchain-openai>=1.0
 langchain-anthropic>=1.0
 langchain-mcp-adapters>=0.1.0
 pexpect>=4.9
+aiosqlite>=0.19

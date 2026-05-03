@@ -61,12 +61,37 @@ All in `.env`:
 | `OPENAI_BASE_URL` | OpenAI-compatible endpoint | `https://openrouter.ai/api/v1` |
 | `BUILDER_MODEL` | Builder slug | `qwen/qwen3-coder-next` |
 | `EVAL_MODEL` | Evaluator slug (must be vision-capable) | `qwen/qwen3.6-27b` |
-| `OPENROUTER_PROVIDERS` | Comma-separated provider pin | (unset) |
+| `OPENROUTER_PROVIDERS` | Comma-separated provider pin (priority order, fallbacks disabled) | (unset) |
+| `OPENROUTER_IGNORE_PROVIDERS` | Comma-separated providers to exclude (other providers still tried) | (unset) |
 | `PLAYWRIGHT_MCP_URL` | MCP server SSE URL | `http://playwright-mcp:8931/sse` |
 
-OpenRouter routes flakily for tool-calling on some providers (the model returns native XML format, the provider doesn't translate it back). If you see broken tool calls, find a working provider in your OpenRouter activity log and pin via `OPENROUTER_PROVIDERS=...`.
+OpenRouter routes flakily for tool-calling on some providers (the model returns native XML format, the provider doesn't translate it back). If you see broken tool calls, find a working provider in your OpenRouter activity log and pin via `OPENROUTER_PROVIDERS=...`. To exclude a single bad provider without pinning everything, use `OPENROUTER_IGNORE_PROVIDERS=parasail` (etc.) — the rest of the fallback set still runs.
 
 The `local` compose profile starts a llama.cpp server alongside, for the eventual move off OpenRouter. See `docker-compose.yml`.
+
+## Resilience
+
+- **Model retry**: every planner / builder model call is wrapped in `_ainvoke_streaming`, which retries the full astream on transient upstream errors (HTTP 5xx, connection drops, asyncio timeouts) up to `MODEL_RETRY_MAX_ATTEMPTS=3` with exponential backoff (2s / 4s / 8s). Partial chunks from failed attempts are discarded; the returned `AIMessage` is always assembled from a single successful stream. Each retry shows `↻ <label> retry N/M in Ks (ErrorType: ...)` on stdout and a `model_retry` event in the trace. 4xx errors and 429 are NOT retried (TODO: 429 needs Retry-After parsing).
+- **Checkpoint resume**: outer + inner graph state is persisted to `workspace/.trace/checkpoints.db` (SQLite) at every node boundary. On crash, the next start scans for unfinished tasks (last trace event isn't `task_end`, file modified <24h ago) and prompts `Resume? [y/N]` (default N — fresh runs are fresh by default; same-task-text does NOT auto-resume). On resume, the inner builder graph picks up at the exact step it crashed at, not from step 0.
+- **Schema versioning**: each saved checkpoint is stamped with `CHECKPOINT_SCHEMA_VERSION` in metadata. **Bump it whenever the `State` or `BuilderState` TypedDict shape changes** (in `graph.py`). Mismatched checkpoints are rejected with a `checkpoint_schema_mismatch` trace event and the run starts fresh — no silent corruption from old state.
+
+### Manual checkpoint-resume verification
+
+There's no automated test for end-to-end resume (it requires a real model + a kill mid-builder), but the recipe is short:
+
+1. `docker compose run --rm langgraph` and give it a multi-step task that takes ≥30s of builder work (e.g. "scaffold a Next.js app with Prisma").
+2. Watch the builder progress (`Step N of 50`). When you see, say, step 5 has executed, **kill the process** (Ctrl-C the docker run, or `docker kill` from another shell).
+3. Confirm `workspace/.trace/checkpoints.db` exists and the most-recent trace `.jsonl` does NOT end with a `task_end` line: `tail -1 workspace/.trace/<latest>.jsonl | jq .kind` → not `"task_end"`.
+4. `docker compose run --rm langgraph` again. Expect: `Found unfinished task from Nm ago: '<task text>' / Last event: <kind> / Resume? [y/N]:`. Type `y`.
+5. Verify in stdout that the builder step counter resumes at ≥6 (the exact post-crash checkpoint), not 1. The trace will show a `task_resume` event followed by the existing iteration's events continuing.
+
+If step 5 shows the counter at 1, checkpointing isn't actually working — check that `_graph_holder["builder"]` is being replaced in `main()`.
+
+For automated resilience tests (model retry classification, schema mismatch detection, transient-error retry), run:
+
+```bash
+docker compose run --rm langgraph python /app/test_resilience.py
+```
 
 ## Tunable thresholds
 
@@ -93,6 +118,13 @@ SHELL_KILL_SIGQUIT_WAIT = 2     # before escalating to respawn
 
 HEARTBEAT_THRESHOLD_SECONDS = 10  # don't tick on fast tools
 HEARTBEAT_INTERVAL_SECONDS = 20   # tick cadence after threshold
+
+MODEL_RETRY_MAX_ATTEMPTS = 3
+MODEL_RETRY_BASE_DELAY = 2        # seconds; doubled per attempt → 2, 4, 8
+MODEL_RETRY_RETRYABLE_STATUS = {500, 502, 503, 504, 529}
+
+CHECKPOINT_SCHEMA_VERSION = 1     # bump when State/BuilderState TypedDict changes
+RESUME_FRESHNESS_HOURS = 24       # checkpoints older than this aren't offered
 ```
 
 Tune from real validation runs (the trace logs are designed for this).

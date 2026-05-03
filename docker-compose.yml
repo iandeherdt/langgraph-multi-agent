@@ -15,10 +15,29 @@ services:
 
   # Playwright MCP server — gives the evaluator browser_navigate / browser_take_screenshot etc.
   # The langgraph container reaches it via service DNS (http://playwright-mcp:8931/sse).
+  #
+  # @playwright/mcp is PINNED. Floating @latest broke once already (the --transport flag was
+  # removed in a newer release without warning). When bumping the pin, run
+  # `npx -y @playwright/mcp@<new> --help` first and confirm --port + --host + --headless still
+  # exist, then verify the langgraph container can curl the /sse endpoint.
+  # TODO (v1.4): bake @playwright/mcp into the image so we stop fetching from npm at startup.
   playwright-mcp:
     image: mcr.microsoft.com/playwright:v1.49.0-jammy
-    command: >
-      sh -c "npx -y @playwright/mcp@latest --transport sse --port 8931 --host 0.0.0.0 --headless"
+    # List-form so YAML folding + shell quoting can't mangle args (esp. --allowed-hosts).
+    command:
+      - npx
+      - -y
+      - "@playwright/mcp@0.0.73"
+      - --port
+      - "8931"
+      - --host
+      - 0.0.0.0
+      - --headless
+      # 0.0.73 added a host-check that 403s anything not matching the bind host. Comparison
+      # is on the literal Host: header (including port), so we list each "name:port" combo
+      # we expect: docker service DNS (how langgraph reaches it) and host-side dev.
+      - --allowed-hosts
+      - playwright-mcp:8931,localhost:8931
     ports:
       - "8931:8931"
 

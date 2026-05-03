@@ -21,6 +21,7 @@ import asyncio
 import hashlib
 import json
 import os
+import pickle
 import re
 import socket
 import subprocess
@@ -31,12 +32,17 @@ from pathlib import Path
 from typing import Annotated, Literal
 from typing_extensions import TypedDict
 
+import anthropic
+import httpx
+import openai
 import pexpect
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 
@@ -97,6 +103,23 @@ HEARTBEAT_THRESHOLD_SECONDS = 10
 HEARTBEAT_INTERVAL_SECONDS = 20
 SHELL_HEARTBEAT_TAIL_BYTES = 200
 
+# Model retry: a single bad upstream provider call (Parasail dying mid-stream, transient
+# 5xx) must not kill an entire run. Retry the FULL astream call up to MODEL_RETRY_MAX_ATTEMPTS
+# with exponential backoff. Discard partial chunks from failed attempts; never resume mid-stream.
+# 429 is intentionally NOT in the retryable set — handling it correctly requires Retry-After
+# parsing + provider-aware throttling, which is a separate problem (TODO).
+MODEL_RETRY_MAX_ATTEMPTS = 3
+MODEL_RETRY_BASE_DELAY = 2  # seconds; doubled per attempt → 2, 4, 8
+MODEL_RETRY_RETRYABLE_STATUS = {500, 502, 503, 504, 529}
+
+# Checkpointing: persist outer + inner graph state to .trace/checkpoints.db so a crash
+# doesn't lose in-progress builder work. Bump CHECKPOINT_SCHEMA_VERSION whenever the State
+# or BuilderState TypedDict changes shape — old checkpoints will be rejected (load fails
+# loudly with checkpoint_schema_mismatch trace event) and the run starts fresh.
+CHECKPOINT_DB_PATH = TRACE_DIR / "checkpoints.db"
+CHECKPOINT_SCHEMA_VERSION = 1
+RESUME_FRESHNESS_HOURS = 24  # checkpoints older than this are not offered for resume
+
 # File editor
 FILE_VIEW_DEFAULT_MAX_LINES = 400     # if file ≤ this, return whole file by default
 FILE_VIEW_TRUNCATE_TO = 200           # if file > default, return first N lines unless start/end specified
@@ -114,7 +137,7 @@ STUCK_EDIT_REPEAT_THRESHOLD = 3       # same (file, edit-fingerprint) ≥ this �
 STUCK_EDIT_WINDOW = 10                # within last N edits
 STUCK_BUILD_ERROR_REPEAT = 2          # same build-error fingerprint in ≥ this many of last K builds
 STUCK_BUILD_HISTORY = 3               # K = window for build-error comparison
-STUCK_TOOL_REPEAT = 2                 # identical (tool, args) consecutively ≥ this → fire
+STUCK_TOOL_REPEAT = 3                 # identical (tool, args) consecutively ≥ this → fire (was 2; bumped because a single back-to-back retry is normal recovery, not stuck)
 STUCK_INJECTION_CAP = 3               # max stuck-injection messages before forced exit
 NO_TOOL_CALL_REMINDER_CAP = 2         # consecutive no-tool-call turns before exit_signal=abandoned
 
@@ -271,6 +294,32 @@ async def _call_with_heartbeat(make_coro, tool_name: str):
         TRACE.log("tool_progress", tool=tool_name, elapsed_ms=int(elapsed * 1000))
 
 
+_MODEL_RETRY_EXCEPTIONS = (
+    asyncio.TimeoutError,
+    httpx.HTTPError,
+    openai.APIError,
+    anthropic.APIError,
+)
+
+
+def _is_retryable_error(e: Exception) -> bool:
+    """Decide if an exception from astream is worth retrying.
+
+    Retryable: network/transport errors with no status, or HTTP status in our 5xx allowlist.
+    Not retryable: 4xx client errors (auth/permission/bad-request — no point retrying).
+
+    NOTE: 429 is deliberately excluded — correct handling requires honouring Retry-After,
+    which we don't do yet. TODO: add Retry-After parsing + per-provider rate-limit memory.
+    """
+    status = getattr(e, "status_code", None)
+    if status is None:
+        # No status means it's a connection/transport error — generally transient.
+        return True
+    if status in MODEL_RETRY_RETRYABLE_STATUS:
+        return True
+    return False
+
+
 async def _ainvoke_streaming(llm, messages: list, label: str):
     """Stream chat-model output to stdout, accumulate chunks into a single AIMessage, return it.
 
@@ -281,24 +330,64 @@ async def _ainvoke_streaming(llm, messages: list, label: str):
     Providers that don't support real token streaming through their OpenRouter route still
     work — astream yields one large chunk at the end, so we degrade to "no-stream visible"
     with no semantic regression.
+
+    On transient upstream errors (5xx, connection drops, timeouts), retries the FULL astream
+    call up to MODEL_RETRY_MAX_ATTEMPTS with exponential backoff. Partial chunks from failed
+    attempts are discarded — `final` is reset each attempt — so the returned AIMessage is
+    always assembled from a single successful stream. The retry banner (↻) on stdout warns
+    the human that any text duplication is a re-attempt, not a model glitch.
     """
-    final = None
-    started = False
-    async for chunk in llm.astream(messages):
-        content = getattr(chunk, "content", None)
-        if isinstance(content, str) and content:
-            if not started:
-                print(f"  [{label}] ", end="", flush=True)
-                started = True
-            print(content, end="", flush=True)
-        # AIMessageChunk supports + for accumulation; first chunk seeds the running total.
-        final = chunk if final is None else final + chunk
-    if started:
-        print(flush=True)
-    if final is not None:
-        for tc in getattr(final, "tool_calls", None) or []:
-            print(f"  → {tc.get('name', '?')}({_format_args(tc.get('args', {}))})", flush=True)
-    return final
+    last_exc: Exception | None = None
+    for attempt in range(MODEL_RETRY_MAX_ATTEMPTS):
+        final = None
+        started = False
+        try:
+            async for chunk in llm.astream(messages):
+                content = getattr(chunk, "content", None)
+                if isinstance(content, str) and content:
+                    if not started:
+                        print(f"  [{label}] ", end="", flush=True)
+                        started = True
+                    print(content, end="", flush=True)
+                # AIMessageChunk supports + for accumulation; first chunk seeds the running total.
+                final = chunk if final is None else final + chunk
+            if started:
+                print(flush=True)
+            if final is not None:
+                for tc in getattr(final, "tool_calls", None) or []:
+                    print(f"  → {tc.get('name', '?')}({_format_args(tc.get('args', {}))})", flush=True)
+            return final
+        except _MODEL_RETRY_EXCEPTIONS as e:
+            last_exc = e
+            if not _is_retryable_error(e):
+                # End the partial line if we already started streaming, then re-raise.
+                if started:
+                    print(flush=True)
+                raise
+            if attempt + 1 >= MODEL_RETRY_MAX_ATTEMPTS:
+                if started:
+                    print(flush=True)
+                break  # exhausted; raise after the loop
+            delay = MODEL_RETRY_BASE_DELAY * (2 ** attempt)
+            # Newline first if mid-stream so the ↻ marker is on its own line.
+            if started:
+                print(flush=True)
+            print(
+                f"  ↻ {label} retry {attempt + 1}/{MODEL_RETRY_MAX_ATTEMPTS - 1} "
+                f"in {delay}s ({type(e).__name__}: {str(e)[:200]})",
+                flush=True,
+            )
+            TRACE.log(
+                "model_retry", label=label, attempt=attempt + 1,
+                error_type=type(e).__name__, error=str(e)[:500],
+                status_code=getattr(e, "status_code", None), delay_s=delay,
+            )
+            await asyncio.sleep(delay)
+    # Exhausted retries — raise the last exception so the caller (and trace) sees it.
+    assert last_exc is not None
+    TRACE.log("model_retry_exhausted", label=label,
+              attempts=MODEL_RETRY_MAX_ATTEMPTS, error=str(last_exc)[:500])
+    raise last_exc
 
 
 def _hash_short(s: str) -> str:
@@ -887,6 +976,29 @@ def str_replace(path: str, old_str: str, new_str: str) -> str:
     except Exception as e:
         return f"ERROR: {type(e).__name__}: {e}"
 
+    # Identical-args guard. Looping on this is a common failure mode: the model thinks an
+    # edit hasn't landed and retries it, but old_str == new_str means there's no actual
+    # change to apply. Discriminate the three sub-cases so the model gets actionable info
+    # without a follow-up view_file round-trip.
+    if old_str == new_str:
+        try:
+            string_present = old_str in content
+        except Exception:
+            string_present = False
+        TRACE.log("tool_result", tool="str_replace", ok=False, path=path,
+                  error="identical_args", string_present=string_present)
+        if string_present:
+            return (
+                f"ERROR: old_str and new_str are identical — no change to apply. "
+                f"The string IS already present in {path}; the file likely already contains "
+                f"the desired content. View the file if you need to confirm before moving on."
+            )
+        return (
+            f"ERROR: old_str and new_str are identical — no change to apply. "
+            f"The string is NOT present in {path} either; this call would have no effect "
+            f"regardless. Check the intended new content and use a non-identical old_str/new_str."
+        )
+
     count = content.count(old_str)
     if count == 0:
         TRACE.log("tool_result", tool="str_replace", ok=False, path=path, error="no_match")
@@ -1371,7 +1483,8 @@ def _check_stuck(state: "BuilderState") -> str | None:
         counts = Counter((e["file"], e["fingerprint"]) for e in recent)
         for (file, _fp), count in counts.items():
             if count >= STUCK_EDIT_REPEAT_THRESHOLD:
-                TRACE.log("stuck_fire", signal="edit_repeat", file=file, count=count)
+                TRACE.log("stuck_fire", signal="edit_repeat", file=file, count=count,
+                          threshold=STUCK_EDIT_REPEAT_THRESHOLD, window=STUCK_EDIT_WINDOW)
                 return (
                     f"STUCK DETECTED: same edit applied to {file} {count} times in the last "
                     f"{STUCK_EDIT_WINDOW} edits without resolving the underlying problem. "
@@ -1389,7 +1502,8 @@ def _check_stuck(state: "BuilderState") -> str | None:
         if fps:
             most_common, count = Counter(fps).most_common(1)[0]
             if count >= STUCK_BUILD_ERROR_REPEAT:
-                TRACE.log("stuck_fire", signal="build_error_repeat", count=count)
+                TRACE.log("stuck_fire", signal="build_error_repeat", count=count,
+                          threshold=STUCK_BUILD_ERROR_REPEAT, history=STUCK_BUILD_HISTORY)
                 return (
                     f"STUCK DETECTED: the same build error has occurred {count} times in the "
                     f"last {STUCK_BUILD_HISTORY} build attempts. STOP applying the same fix. "
@@ -1401,7 +1515,8 @@ def _check_stuck(state: "BuilderState") -> str | None:
     if len(tools_h) >= STUCK_TOOL_REPEAT:
         tail = tools_h[-STUCK_TOOL_REPEAT:]
         if all(t == tail[0] for t in tail):
-            TRACE.log("stuck_fire", signal="tool_repeat", tool=tail[0][0])
+            TRACE.log("stuck_fire", signal="tool_repeat", tool=tail[0][0],
+                      threshold=STUCK_TOOL_REPEAT)
             return (
                 f"STUCK DETECTED: you've called {tail[0][0]} with identical arguments "
                 f"{STUCK_TOOL_REPEAT} times in a row. The result hasn't changed; doing it again "
@@ -1415,14 +1530,25 @@ def _check_stuck(state: "BuilderState") -> str | None:
 
 
 def _openrouter_llm(model: str) -> ChatOpenAI:
+    """Build a ChatOpenAI pointed at OpenRouter (or any OpenAI-compat endpoint).
+
+    Provider routing knobs (OpenRouter only):
+    - OPENROUTER_PROVIDERS=a,b,c    pins to listed providers in priority order; disables fallbacks.
+    - OPENROUTER_IGNORE_PROVIDERS=x  excludes specific providers (e.g. parasail) without pinning;
+                                     other providers are still tried via fallbacks.
+    Both can be combined: order pins primary, ignore blocks bad ones from the fallback set.
+    """
     base = os.environ.get("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
     extra: dict = {}
     if "openrouter" in base:
-        provider_cfg: dict = {"require_parameters": True}
+        provider_cfg: dict = {"require_parameters": True, "allow_fallbacks": True}
         pinned = os.environ.get("OPENROUTER_PROVIDERS", "").strip()
         if pinned:
             provider_cfg["order"] = [p.strip() for p in pinned.split(",") if p.strip()]
-            provider_cfg["allow_fallbacks"] = False
+            provider_cfg["allow_fallbacks"] = False  # explicit pin wins
+        ignored = os.environ.get("OPENROUTER_IGNORE_PROVIDERS", "").strip()
+        if ignored:
+            provider_cfg["ignore"] = [p.strip() for p in ignored.split(",") if p.strip()]
         extra["extra_body"] = {"provider": provider_cfg}
     return ChatOpenAI(
         model=model,
@@ -1663,17 +1789,20 @@ def after_tools_router(state: BuilderState) -> Literal["model", "__end__"]:
     return "model"
 
 
-def build_builder_graph():
+def build_builder_graph(checkpointer=None):
     g = StateGraph(BuilderState)
     g.add_node("model", builder_model_node)
     g.add_node("tools", builder_tools_node)
     g.add_edge(START, "model")
     g.add_conditional_edges("model", after_model_router, {"tools": "tools", END: END})
     g.add_conditional_edges("tools", after_tools_router, {"model": "model", END: END})
-    return g.compile()
+    return g.compile(checkpointer=checkpointer)
 
 
-_builder_graph = build_builder_graph()
+# Holder so main() can swap in a checkpointer-equipped builder graph after opening the saver.
+# The module-level no-checkpointer compile keeps `import graph` working for tests/external use.
+_graph_holder: dict = {"builder": None, "outer": None}
+_graph_holder["builder"] = build_builder_graph()
 
 
 def _format_builder_summary(state: BuilderState, exit_signal: str, exit_payload: dict) -> str:
@@ -1699,7 +1828,7 @@ def _format_builder_summary(state: BuilderState, exit_signal: str, exit_payload:
     return "\n".join(parts)
 
 
-async def builder_node(outer_state: State) -> dict:
+async def builder_node(outer_state: State, config: RunnableConfig | None = None) -> dict:
     print(f"\n━━━ BUILDER (iteration {outer_state['iteration']}) ━━━")
     TRACE.log("builder_start", iteration=outer_state["iteration"])
     _reset_exit()
@@ -1725,9 +1854,19 @@ async def builder_node(outer_state: State) -> dict:
         "no_tool_call_streak": 0,
     }
 
-    final = await _builder_graph.ainvoke(
+    # Inner thread_id derives from the outer one + iteration, so each PBE iteration's builder
+    # gets a fresh-but-resumable thread. On crash + resume, ainvoke picks up at the last
+    # checkpointed step within this iteration; on normal flow, each iter starts fresh.
+    outer_thread_id = (config or {}).get("configurable", {}).get("thread_id", "default")
+    inner_thread_id = f"{outer_thread_id}:builder:iter{outer_state['iteration']}"
+    inner_graph = _graph_holder["builder"]
+    final = await inner_graph.ainvoke(
         builder_state,
-        config={"recursion_limit": MAX_BUILDER_STEPS * 4 + 20},
+        config={
+            "recursion_limit": MAX_BUILDER_STEPS * 4 + 20,
+            "configurable": {"thread_id": inner_thread_id},
+            "metadata": {"schema_version": CHECKPOINT_SCHEMA_VERSION},
+        },
     )
 
     exit_signal = _exit_holder["signal"] or "budget_exhausted"
@@ -2176,7 +2315,7 @@ def route_after_eval(state: State) -> Literal["planner", "builder", "__end__"]:
     return "builder"
 
 
-def build_outer_graph():
+def build_outer_graph(checkpointer=None):
     g = StateGraph(State)
     g.add_node("planner", planner_node)
     g.add_node("builder", builder_node)
@@ -2189,10 +2328,122 @@ def build_outer_graph():
     g.add_conditional_edges("evaluator", route_after_eval, {
         "planner": "planner", "builder": "builder", END: END,
     })
-    return g.compile()
+    return g.compile(checkpointer=checkpointer)
 
 
-graph = build_outer_graph()
+# Module-level no-checkpointer compile so `import graph` works for tests/external callers.
+# main() compiles checkpointer-equipped versions and swaps them into _graph_holder.
+_graph_holder["outer"] = build_outer_graph()
+graph = _graph_holder["outer"]
+
+
+# ────────────────────────── checkpoint resume ──────────────────────────
+
+
+def _find_unfinished_recent_task() -> dict | None:
+    """Scan trace dir for the most-recent <24h trace whose last event isn't task_end.
+
+    Returns a dict with `thread_id`, `task_text`, `mtime` (datetime), and `last_event_kind`,
+    or None if there's nothing resumable. The thread_id matches the trace-file basename
+    (no .jsonl suffix) — that's exactly what we used as thread_id at task-start time.
+    """
+    if not TRACE_DIR.exists():
+        return None
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=RESUME_FRESHNESS_HOURS)
+    best: dict | None = None
+    for p in TRACE_DIR.glob("*.jsonl"):
+        try:
+            mtime = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
+        except OSError:
+            continue
+        if mtime < cutoff:
+            continue
+        # Read last non-empty line cheaply. These files are typically small (< few MB);
+        # for now just read all and take the last line. If they grow, switch to seek-from-end.
+        try:
+            with open(p, "r") as fh:
+                lines = [ln for ln in fh.readlines() if ln.strip()]
+        except OSError:
+            continue
+        if not lines:
+            continue
+        try:
+            last_event = json.loads(lines[-1])
+        except json.JSONDecodeError:
+            continue
+        if last_event.get("kind") == "task_end":
+            continue  # cleanly finished, not a candidate
+        # Find the original task text from task_start (first line, usually).
+        task_text = ""
+        try:
+            first_event = json.loads(lines[0])
+            if first_event.get("kind") == "task_start":
+                task_text = first_event.get("task", "")
+        except json.JSONDecodeError:
+            pass
+        candidate = {
+            "thread_id": p.stem,
+            "task_text": task_text,
+            "mtime": mtime,
+            "last_event_kind": last_event.get("kind", "?"),
+            "trace_path": p,
+        }
+        if best is None or candidate["mtime"] > best["mtime"]:
+            best = candidate
+    return best
+
+
+async def _check_resume_compatibility(saver: AsyncSqliteSaver, thread_id: str) -> bool:
+    """Verify the most recent checkpoint for this thread has a compatible schema version.
+
+    Returns True if safe to resume, False otherwise. On mismatch / corruption emits a
+    checkpoint_schema_mismatch trace event so the failure mode is loud and diagnosable.
+    """
+    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        tup = await saver.aget_tuple(config)
+    except (pickle.UnpicklingError, KeyError, EOFError) as e:
+        TRACE.log("checkpoint_schema_mismatch", thread_id=thread_id,
+                  error=str(e), error_type=type(e).__name__)
+        return False
+    if tup is None:
+        return False  # nothing to resume
+    metadata = tup.metadata or {}
+    saved_version = metadata.get("schema_version")
+    if saved_version != CHECKPOINT_SCHEMA_VERSION:
+        TRACE.log("checkpoint_schema_mismatch", thread_id=thread_id,
+                  saved_version=saved_version, current_version=CHECKPOINT_SCHEMA_VERSION)
+        return False
+    return True
+
+
+async def _maybe_resume(saver: AsyncSqliteSaver) -> dict | None:
+    """If a recent unfinished task exists, prompt the user to resume. Default N (fresh).
+
+    Returns {thread_id, task_text} on accepted resume, None otherwise.
+    """
+    candidate = _find_unfinished_recent_task()
+    if candidate is None:
+        return None
+    if not await _check_resume_compatibility(saver, candidate["thread_id"]):
+        # Mismatch / corruption already traced. Don't offer.
+        return None
+    age = datetime.now(timezone.utc) - candidate["mtime"]
+    age_str = (
+        f"{int(age.total_seconds() / 60)}m ago" if age.total_seconds() < 3600
+        else f"{age.total_seconds() / 3600:.1f}h ago"
+    )
+    task_preview = candidate["task_text"][:80] + ("…" if len(candidate["task_text"]) > 80 else "")
+    print(f"\n  Found unfinished task from {age_str}: {task_preview!r}")
+    print(f"  Last event: {candidate['last_event_kind']}")
+    try:
+        ans = input("  Resume? [y/N]: ").strip().lower()
+    except EOFError:
+        print()
+        return None
+    if ans == "y":
+        return {"thread_id": candidate["thread_id"], "task_text": candidate["task_text"]}
+    return None
 
 
 # ────────────────────────── main loop ──────────────────────────
@@ -2204,32 +2455,63 @@ async def main():
     print(f"Evaluator: {evaluator_llm.model_name}  (via {evaluator_llm.openai_api_base})")
     print(f"Each task: planner → builder (max {MAX_BUILDER_STEPS} steps) → evaluator, looped (max {MAX_PBE_ITERATIONS} iterations).")
     print(f"Trace dir: {TRACE_DIR}")
+    print(f"Checkpoints: {CHECKPOINT_DB_PATH} (schema v{CHECKPOINT_SCHEMA_VERSION})")
     print("Ctrl-D to exit.\n")
 
-    while True:
-        try:
-            user_input = input("Task: ")
-        except EOFError:
+    TRACE_DIR.mkdir(parents=True, exist_ok=True)
+    async with AsyncSqliteSaver.from_conn_string(str(CHECKPOINT_DB_PATH)) as saver:
+        # Replace the no-checkpointer compiles with checkpointer-equipped ones.
+        _graph_holder["builder"] = build_builder_graph(checkpointer=saver)
+        _graph_holder["outer"] = build_outer_graph(checkpointer=saver)
+        outer_graph = _graph_holder["outer"]
+
+        # One-shot resume offer at startup. Only the most-recent unfinished task is offered.
+        resume = await _maybe_resume(saver)
+
+        while True:
+            if resume is not None:
+                user_input = resume["task_text"]
+                # Re-attach the existing trace file as the active one (append, don't overwrite).
+                # The thread_id matches the trace stem, so we reconstruct the path.
+                trace_path = TRACE_DIR / f"{resume['thread_id']}.jsonl"
+                TRACE.path = trace_path
+                TRACE.fh = open(trace_path, "a")
+                TRACE.log("task_resume", thread_id=resume["thread_id"])
+                print(f"\n  Resuming: {user_input!r}")
+                print(f"  Trace (appending): {trace_path}\n")
+                thread_id = resume["thread_id"]
+                resume = None  # only resume once per startup
+            else:
+                try:
+                    user_input = input("Task: ")
+                except EOFError:
+                    print()
+                    break
+                if not user_input.strip():
+                    continue
+                trace_path = TRACE.start_task(user_input)
+                # Thread ID = trace file basename (no .jsonl). Already timestamped → unique per
+                # task launch. Same task text → fresh thread by default; resume is opt-in only.
+                thread_id = trace_path.stem
+                print(f"Trace: {trace_path}\n")
+
+            config = {
+                "recursion_limit": 200,
+                "configurable": {"thread_id": thread_id},
+                "metadata": {"schema_version": CHECKPOINT_SCHEMA_VERSION},
+            }
+            try:
+                final = await outer_graph.ainvoke(
+                    {"task": user_input, "iteration": 0, "plan": _empty_plan_doc(), "replan_count": 0},
+                    config=config,
+                )
+                TRACE.end_task(reason="completed", final_iter=final.get("iteration"),
+                               final_verdict=final.get("eval_verdict"),
+                               builder_exit=final.get("builder_exit_signal"))
+            except Exception as e:
+                TRACE.end_task(reason="exception", error=str(e))
+                raise
             print()
-            break
-        if not user_input.strip():
-            continue
-
-        trace_path = TRACE.start_task(user_input)
-        print(f"Trace: {trace_path}\n")
-
-        try:
-            final = await graph.ainvoke(
-                {"task": user_input, "iteration": 0, "plan": _empty_plan_doc(), "replan_count": 0},
-                config={"recursion_limit": 200},
-            )
-            TRACE.end_task(reason="completed", final_iter=final.get("iteration"),
-                           final_verdict=final.get("eval_verdict"),
-                           builder_exit=final.get("builder_exit_signal"))
-        except Exception as e:
-            TRACE.end_task(reason="exception", error=str(e))
-            raise
-        print()
 
 
 if __name__ == "__main__":
