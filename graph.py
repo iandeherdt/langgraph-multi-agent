@@ -2773,6 +2773,24 @@ def route_after_builder(state: State) -> Literal["evaluator", "planner", "__end_
 
 
 def route_after_eval(state: State) -> Literal["planner", "builder", "__end__"]:
+    # Verified completion is terminal. The builder reached mark_done, which required a single-
+    # use verification_token from a successful verify_completion advisor verdict — that's the
+    # gating mechanism for completion. From here the eval is a second opinion: a crash or a
+    # contradiction does NOT restart the loop. Without this short-circuit, infrastructure
+    # flakes (MCP transport down, Playwright crash) feed into the eval-converted-to-'continue'
+    # path and the harness loops forever on a genuinely complete task.
+    if state.get("builder_exit_signal") == "done":
+        verdict = state.get("eval_verdict", "unknown")
+        if verdict == "done":
+            print(f"\n━━━ Done in {state['iteration']} iteration(s). Eval concurred. ━━━")
+        else:
+            TRACE.log("verification_disagreement",
+                      builder_exit="done", eval_verdict=verdict,
+                      eval_notes=str(state.get("eval_notes", ""))[:1000])
+            print(f"\n━━━ Done (advisor verified). Eval verdict: {verdict} (informational, "
+                  f"see verification_disagreement trace event). ━━━")
+        return END
+
     if state["iteration"] >= MAX_PBE_ITERATIONS:
         print(f"\n━━━ Stopped: max PBE iterations ({MAX_PBE_ITERATIONS}) reached. ━━━")
         return END

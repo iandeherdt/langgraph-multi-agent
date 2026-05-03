@@ -21,6 +21,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.playwright-mcp
+    # Catch transient crashes — without restart, the langgraph evaluator gets
+    # `Name or service not known` on the SSE transport (the container is just gone),
+    # which used to feed back into the loop forever.
+    restart: unless-stopped
     # List-form so YAML folding + shell quoting can't mangle args (esp. --allowed-hosts).
     command:
       - playwright-mcp
