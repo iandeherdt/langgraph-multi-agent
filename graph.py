@@ -68,6 +68,35 @@ SHELL_COMMAND_TIMEOUT_SECONDS = 300
 SHELL_OUTPUT_HEAD_BYTES = 2000        # head of head+tail truncation
 SHELL_OUTPUT_TAIL_BYTES = 5000        # tail (bias toward exit-code/end-of-build errors)
 
+# Env injected into the persistent shell at spawn. Forces npm/npx/create-* and most Node
+# tooling into "don't prompt, take defaults, fail loud" mode. Reason: interactive prompts
+# (e.g. create-next-app's "directory contains files that could conflict") deadlock the
+# shell because stdin is a pty with no human attached.
+SHELL_NONINTERACTIVE_ENV = {
+    "CI": "true",
+    "DEBIAN_FRONTEND": "noninteractive",
+    "NEXT_TELEMETRY_DISABLED": "1",
+    "npm_config_yes": "true",
+    "npm_config_fund": "false",
+    "npm_config_audit": "false",
+    "NPM_CONFIG_LOGLEVEL": "error",
+}
+
+# Timeout-recovery escalation. SIGINT first (lets npx/npm clean up). If the queued sentinel
+# doesn't appear within SHELL_KILL_SIGINT_WAIT, escalate to SIGQUIT. If still nothing within
+# SHELL_KILL_SIGQUIT_WAIT, terminate the bash process and respawn.
+SHELL_KILL_SIGINT_WAIT = 3
+SHELL_KILL_SIGQUIT_WAIT = 2
+SHELL_DRAIN_TIMEOUT = 10  # was 5; npx leaves a lot of buffered spinner garbage
+
+# Heartbeat: live-progress signal so slow vs hung is distinguishable from outside. After
+# HEARTBEAT_THRESHOLD_SECONDS of silence on a tool call, emit a tool_progress trace event
+# + stdout tick every HEARTBEAT_INTERVAL_SECONDS. Shell self-reports stdout bytes; other
+# tools just report elapsed.
+HEARTBEAT_THRESHOLD_SECONDS = 10
+HEARTBEAT_INTERVAL_SECONDS = 20
+SHELL_HEARTBEAT_TAIL_BYTES = 200
+
 # File editor
 FILE_VIEW_DEFAULT_MAX_LINES = 400     # if file ≤ this, return whole file by default
 FILE_VIEW_TRUNCATE_TO = 200           # if file > default, return first N lines unless start/end specified
@@ -212,6 +241,64 @@ def _format_args(args: dict) -> str:
             s = s[:200] + f"...[+{len(s) - 200} chars]"
         parts.append(f"{k}={s}")
     return ", ".join(parts)
+
+
+async def _call_with_heartbeat(make_coro, tool_name: str):
+    """Run an awaitable and emit a tool_progress event + stdout tick if it exceeds the
+    heartbeat threshold. `make_coro` is a zero-arg callable returning the coroutine to await
+    (so we can construct it inside the task) — caller must NOT pre-await.
+
+    Skipped for tool_name == "shell" because PersistentShell.run self-reports with richer
+    stdout-bytes info; double output would be noisy.
+    """
+    if tool_name == "shell":
+        return await make_coro()
+    task = asyncio.create_task(make_coro())
+    start = time.monotonic()
+    last_tick = 0.0
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=HEARTBEAT_INTERVAL_SECONDS)
+        if done:
+            return await task
+        elapsed = time.monotonic() - start
+        if elapsed < HEARTBEAT_THRESHOLD_SECONDS:
+            continue
+        # Throttle so we don't double-tick when wait() returns slightly early.
+        if elapsed - last_tick < HEARTBEAT_INTERVAL_SECONDS - 1:
+            continue
+        last_tick = elapsed
+        print(f"  ·· {tool_name} [{int(elapsed)}s]", flush=True)
+        TRACE.log("tool_progress", tool=tool_name, elapsed_ms=int(elapsed * 1000))
+
+
+async def _ainvoke_streaming(llm, messages: list, label: str):
+    """Stream chat-model output to stdout, accumulate chunks into a single AIMessage, return it.
+
+    Drop-in for `await llm.ainvoke(messages)` at sites where we want live "model thinking"
+    visible while the request is in flight. Tool-call deltas are NOT printed during the stream
+    (partial JSON is noise); the assembled tool_calls print once after, on `→` lines.
+
+    Providers that don't support real token streaming through their OpenRouter route still
+    work — astream yields one large chunk at the end, so we degrade to "no-stream visible"
+    with no semantic regression.
+    """
+    final = None
+    started = False
+    async for chunk in llm.astream(messages):
+        content = getattr(chunk, "content", None)
+        if isinstance(content, str) and content:
+            if not started:
+                print(f"  [{label}] ", end="", flush=True)
+                started = True
+            print(content, end="", flush=True)
+        # AIMessageChunk supports + for accumulation; first chunk seeds the running total.
+        final = chunk if final is None else final + chunk
+    if started:
+        print(flush=True)
+    if final is not None:
+        for tc in getattr(final, "tool_calls", None) or []:
+            print(f"  → {tc.get('name', '?')}({_format_args(tc.get('args', {}))})", flush=True)
+    return final
 
 
 def _hash_short(s: str) -> str:
@@ -458,16 +545,24 @@ def _maybe_syntax_check(path: Path) -> str | None:
 
 
 class PersistentShell:
-    """Long-lived bash session via pexpect. cwd, env, venv all persist across commands."""
+    """Long-lived bash session via pexpect. cwd, env, venv all persist across commands.
+
+    Timeout discipline: any pexpect.TIMEOUT triggers an escalating kill (SIGINT → SIGQUIT
+    → terminate+respawn) AND an unconditional reset() before returning, so the next call
+    always sees a clean session. The `_needs_reset` flag is belt-and-braces in case the
+    in-handler reset itself fails — checked at the top of run() on the next call.
+    """
 
     PROMPT = "__SHELL_PROMPT_X1Y2Z3__"
 
     def __init__(self, cwd: Path = WORKSPACE):
         self.cwd = cwd
         self.proc: pexpect.spawn | None = None
+        self._needs_reset = False
         self._spawn()
 
     def _spawn(self) -> None:
+        env = {**os.environ, **SHELL_NONINTERACTIVE_ENV}
         self.proc = pexpect.spawn(
             "/bin/bash",
             ["--norc", "--noprofile", "-i"],
@@ -475,6 +570,7 @@ class PersistentShell:
             encoding="utf-8",
             echo=False,
             timeout=30,
+            env=env,
         )
         self.proc.sendline("PROMPT_COMMAND=")
         self.proc.sendline(f"PS1='{self.PROMPT}\\n'")
@@ -485,11 +581,75 @@ class PersistentShell:
             self.proc.expect_exact(self.PROMPT, timeout=5)
         except pexpect.exceptions.ExceptionPexpect:
             pass
+        self._needs_reset = False
+
+    def _try_recover_after_signal(self, sentinel: str, wait: int) -> tuple[bool, str, int]:
+        """Wait for the queued sentinel after a kill signal. Returns (recovered, output, exit_code)."""
+        try:
+            self.proc.expect(rf"{re.escape(sentinel)}(\d+)", timeout=wait)
+            return True, (self.proc.before or ""), int(self.proc.match.group(1))
+        except pexpect.exceptions.ExceptionPexpect:
+            return False, "", -1
+
+    def _expect_with_heartbeat(self, sentinel_re: str, total_timeout: int) -> None:
+        """Poll-expect loop. Wakes every HEARTBEAT_INTERVAL_SECONDS after threshold to emit a
+        tool_progress event + stdout tick. Raises pexpect.TIMEOUT if total_timeout elapses with
+        no sentinel match. On match, leaves self.proc.before / .match populated as usual.
+
+        Reads (without consuming) self.proc.buffer between polls — pexpect retains unmatched
+        OS-delivered data there even when expect raises TIMEOUT, so we can surface live tail.
+        """
+        start = time.time()
+        last_bytes_seen = 0
+        while True:
+            elapsed = time.time() - start
+            remaining = total_timeout - elapsed
+            if remaining <= 0:
+                raise pexpect.TIMEOUT(f"total timeout {total_timeout}s elapsed")
+            # Use a short poll once we're past the heartbeat threshold; otherwise wait for
+            # the full remaining time (no point waking up for a 2-second command).
+            if elapsed >= HEARTBEAT_THRESHOLD_SECONDS:
+                poll = min(HEARTBEAT_INTERVAL_SECONDS, remaining)
+            else:
+                poll = min(HEARTBEAT_THRESHOLD_SECONDS - elapsed + 0.1, remaining)
+            try:
+                self.proc.expect(sentinel_re, timeout=poll)
+                return  # matched; caller reads self.proc.before / .match
+            except pexpect.TIMEOUT:
+                # Past threshold → emit heartbeat. Otherwise just keep polling.
+                if elapsed + poll < HEARTBEAT_THRESHOLD_SECONDS:
+                    continue
+                buf = getattr(self.proc, "buffer", "") or ""
+                bytes_now = len(buf)
+                delta = bytes_now - last_bytes_seen
+                stuck = delta == 0
+                # Tail: last N bytes, control chars stripped, single-line for log readability.
+                tail_raw = buf[-SHELL_HEARTBEAT_TAIL_BYTES:]
+                tail = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", tail_raw)
+                tail = tail.replace("\r", "").replace("\n", " ⏎ ").strip()
+                if len(tail) > 120:
+                    tail = "…" + tail[-120:]
+                elapsed_now = int(time.time() - start)
+                stuck_marker = ", STUCK" if stuck else ""
+                print(
+                    f"  ·· shell [{elapsed_now}s, {bytes_now}B, +{delta}{stuck_marker}"
+                    + (f', last: "{tail}"' if tail else "")
+                    + "]",
+                    flush=True,
+                )
+                TRACE.log(
+                    "tool_progress", tool="shell",
+                    elapsed_ms=int((time.time() - start) * 1000),
+                    stdout_bytes=bytes_now, delta_bytes=delta, stuck=stuck,
+                )
+                last_bytes_seen = bytes_now
 
     def run(self, command: str, timeout: int = SHELL_COMMAND_TIMEOUT_SECONDS) -> dict:
-        if not self.proc or not self.proc.isalive():
-            self._spawn()
+        # Defense-in-depth: previous call's in-handler reset may have failed.
+        if self._needs_reset or not self.proc or not self.proc.isalive():
+            self.reset()
         sentinel = f"__EXIT_{int(time.time() * 1_000_000)}__"
+        sentinel_re = rf"{re.escape(sentinel)}(\d+)"
         start = time.time()
 
         self.proc.sendline(command)
@@ -497,25 +657,61 @@ class PersistentShell:
 
         timed_out = False
         try:
-            self.proc.expect(rf"{re.escape(sentinel)}(\d+)", timeout=timeout)
+            self._expect_with_heartbeat(sentinel_re, total_timeout=timeout)
             output = self.proc.before or ""
             exit_code = int(self.proc.match.group(1))
         except pexpect.TIMEOUT:
             timed_out = True
             output = self.proc.before or ""
             exit_code = -1
-            # SIGINT and try to recover
+
+            # Tier 1: SIGINT. Most well-behaved tools (npx, npm, prisma) clean up on this.
+            TRACE.log("shell_kill_escalation", tier="sigint", command=command[:200])
             try:
                 self.proc.sendcontrol("c")
-                self.proc.expect(rf"{re.escape(sentinel)}(\d+)", timeout=10)
-                output = self.proc.before or ""
-                exit_code = int(self.proc.match.group(1))
-            except pexpect.exceptions.ExceptionPexpect:
+            except Exception:
+                pass
+            recovered, recovered_output, recovered_code = self._try_recover_after_signal(
+                sentinel, SHELL_KILL_SIGINT_WAIT
+            )
+            if recovered:
+                output = recovered_output
+                exit_code = recovered_code
+            else:
+                # Tier 2: SIGQUIT. Stronger than SIGINT; some inquirer-style prompts trap SIGINT.
+                TRACE.log("shell_kill_escalation", tier="sigquit", command=command[:200])
+                try:
+                    self.proc.sendcontrol("\\")
+                except Exception:
+                    pass
+                recovered, recovered_output, recovered_code = self._try_recover_after_signal(
+                    sentinel, SHELL_KILL_SIGQUIT_WAIT
+                )
+                if recovered:
+                    output = recovered_output
+                    exit_code = recovered_code
+                else:
+                    # Tier 3: full respawn. Bash itself is unresponsive — nuke and restart.
+                    TRACE.log("shell_kill_escalation", tier="respawn", command=command[:200])
+
+            # Always reset on timeout, even if a tier "recovered" the sentinel — the session
+            # is suspect (queued input, partial state, mutated env from the killed command).
+            # Cleanest contract: timeout means next call gets a fresh shell.
+            try:
                 self.reset()
+            except Exception:
+                # If reset itself fails, mark for retry on next run() call.
+                self._needs_reset = True
+            return {
+                "output": output.strip("\r\n"),
+                "exit_code": exit_code,
+                "timed_out": True,
+                "elapsed_ms": int((time.time() - start) * 1000),
+            }
 
         # Drain to next prompt sentinel
         try:
-            self.proc.expect_exact(self.PROMPT, timeout=5)
+            self.proc.expect_exact(self.PROMPT, timeout=SHELL_DRAIN_TIMEOUT)
         except pexpect.exceptions.ExceptionPexpect:
             pass
 
@@ -1330,7 +1526,7 @@ async def builder_model_node(state: BuilderState) -> dict:
 
     full_messages = [sys_msg] + extra + state["messages"]
     llm_with_tools = builder_llm.bind_tools(_builder_tools())
-    response = await llm_with_tools.ainvoke(full_messages)
+    response = await _ainvoke_streaming(llm_with_tools, full_messages, label="builder")
     return {"messages": [response], "stuck_injections": new_stuck_count}
 
 
@@ -1381,21 +1577,32 @@ async def builder_tools_node(state: BuilderState) -> dict:
         TRACE.set_step(step + 1)
         TRACE.log("tool_call", tool=name, args=args)
 
+        # Builder doesn't print tool calls today; do it here so the human watching can see
+        # what's happening between model turns. (`→` already printed by _ainvoke_streaming
+        # for the current turn — we re-emit per-tool here to anchor the heartbeats below.)
+        tool_start = time.monotonic()
         if name not in tools_by_name:
             result = f"ERROR: unknown tool {name}"
         else:
             try:
                 t = tools_by_name[name]
                 if hasattr(t, "ainvoke"):
-                    result = await t.ainvoke(args)
+                    result = await _call_with_heartbeat(lambda t=t, args=args: t.ainvoke(args), name)
                 else:
-                    result = t.invoke(args)
+                    result = await _call_with_heartbeat(
+                        lambda t=t, args=args: asyncio.to_thread(t.invoke, args), name
+                    )
             except Exception as e:
                 result = f"ERROR: {type(e).__name__}: {e}"
                 TRACE.log("tool_exception", tool=name, error=str(e))
+        tool_elapsed = time.monotonic() - tool_start
 
         if not isinstance(result, str):
             result = str(result)
+
+        # Result line — only print elapsed if non-trivial (avoid flooding for fast tools).
+        if tool_elapsed >= 1.0:
+            print(f"  ← {name} [{tool_elapsed:.1f}s]", flush=True)
 
         new_messages.append(ToolMessage(content=result, tool_call_id=tc["id"]))
 
@@ -1752,10 +1959,11 @@ async def planner_node(state: State) -> dict:
         )
 
     print(f"\n━━━ PLANNER (iteration {iteration}) ━━━")
-    response = await planner_llm.ainvoke([
-        SystemMessage(content=PLANNER_PROMPT),
-        HumanMessage(content=msg),
-    ])
+    response = await _ainvoke_streaming(
+        planner_llm,
+        [SystemMessage(content=PLANNER_PROMPT), HumanMessage(content=msg)],
+        label="planner",
+    )
     text = response.content if isinstance(response.content, str) else str(response.content)
 
     # Parse all sections
@@ -1870,11 +2078,27 @@ async def build_evaluator_subagent():
 
 async def _stream_subagent(subagent, prompt: str, label: str, recursion_limit: int) -> str:
     final_text = ""
-    async for event in subagent.astream(
+    stream = subagent.astream(
         {"messages": [HumanMessage(content=prompt)]},
         config={"recursion_limit": recursion_limit},
         stream_mode="updates",
-    ):
+    ).__aiter__()
+    last_event_time = time.monotonic()
+    idle_ticks = 0
+    while True:
+        try:
+            event = await asyncio.wait_for(stream.__anext__(), timeout=HEARTBEAT_INTERVAL_SECONDS)
+        except StopAsyncIteration:
+            break
+        except asyncio.TimeoutError:
+            idle_for = time.monotonic() - last_event_time
+            if idle_for >= HEARTBEAT_THRESHOLD_SECONDS:
+                idle_ticks += 1
+                print(f"  ·· {label} [idle {int(idle_for)}s]", flush=True)
+                TRACE.log("subagent_idle", label=label, idle_ms=int(idle_for * 1000),
+                          idle_ticks=idle_ticks)
+            continue
+        last_event_time = time.monotonic()
         for _, node_output in event.items():
             for msg in node_output.get("messages", []):
                 if getattr(msg, "tool_calls", None):
