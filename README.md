@@ -29,7 +29,7 @@ START → model → tools → [router] → model | END
 - **Patch-based file editor**: `view_file` (line-numbered), `str_replace` (unique-match required), `create_file` (errors if exists). No `write_file` — full-file overwrites were the worst pathology in the previous design.
 - **Structured plan in state** (v2 schema): requirements + architecture (`stack` / `file_tree` / `data_model` / `key_decisions`, or `summary` for non-coding tasks) + tasks. Plan re-renders into the system message every turn. Builder mutates tasks via `update_plan_item` / `add_plan_item` and can flag architecture changes for planner review via `propose_architecture_change` (queues to a `pending_proposals` list — planner accepts/rejects on next iteration). Capped at `MAX_REPLANS=2` builder-triggered replans per task.
 - **Step budget** rendered into every model turn (`Step 14 of 50, 36 tool calls remaining`), escalating to BUDGET WARNING and FINAL STEP.
-- **Verification gate**: builder cannot exit by trailing off — must call `mark_done(verify_command, claim)` which actually runs the verify command and only exits on exit code 0. Two other clean exits: `request_user_help`, `give_up`.
+- **Verification gate**: builder cannot exit by trailing off — must call `mark_done(verify_command, claim, verification_token)` which actually runs the verify command and only exits on exit code 0. The `verification_token` comes from a mandatory upstream `verify_completion(task_summary, evidence, verify_command)` call that routes the builder's evidence (plus the original task, locked architecture, current plan state, and recent verify-command stdout) to a Sonnet **advisor** for an external sanity check. Only a `done` verdict mints a single-use UUID token. Two caps: 3 advisor verdicts per task (cap reached → `give_up`, planner takes over) and a separate 2 advisor errors (Anthropic outage / unparseable response — `request_user_help`). Errors don't burn the verdict cap. Two other clean exits unchanged: `request_user_help`, `give_up`.
 - **Stuck detector** — three heuristics (edit churn, build-error stagnation, tool repetition) with thresholds named at the top of `graph.py`.
 - **Per-edit syntax check** for `.py` (`py_compile`) and `.js/.cjs/.mjs` (`node --check`). TS/TSX deferred — single-file checks aren't meaningful for cross-file imports.
 - **Smart truncation** (head + tail with byte-elision marker) on shell output.
@@ -125,6 +125,10 @@ MODEL_RETRY_RETRYABLE_STATUS = {500, 502, 503, 504, 529}
 
 CHECKPOINT_SCHEMA_VERSION = 1     # bump when State/BuilderState TypedDict changes
 RESUME_FRESHNESS_HOURS = 24       # checkpoints older than this aren't offered
+
+VERIFY_COMPLETION_CAP = 3         # advisor verdicts per task before forced give_up
+VERIFY_COMPLETION_ERROR_CAP = 2   # advisor errors (separate budget; doesn't burn verdict cap)
+SHELL_HISTORY_FOR_VERIFY = 10     # ring buffer of recent shell outputs surfaced to advisor
 ```
 
 Tune from real validation runs (the trace logs are designed for this).

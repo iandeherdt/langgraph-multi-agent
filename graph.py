@@ -26,6 +26,7 @@ import re
 import socket
 import subprocess
 import time
+import uuid
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -120,10 +121,26 @@ CHECKPOINT_DB_PATH = TRACE_DIR / "checkpoints.db"
 CHECKPOINT_SCHEMA_VERSION = 1
 RESUME_FRESHNESS_HOURS = 24  # checkpoints older than this are not offered for resume
 
+# Completion-verification advisor. Before mark_done, the builder must call verify_completion,
+# which routes to a stronger model (Sonnet) for an external sanity check. Two separate caps:
+# verdict-returning calls (done/not_done) bound exploration; advisor-error calls (unreachable
+# / unparseable) bound retry on broken backends without burning the verdict budget.
+ADVISOR_MODEL = os.environ.get("ADVISOR_MODEL", "claude-sonnet-4-6")
+VERIFY_COMPLETION_CAP = 3            # verdicts (done | not_done) per task
+VERIFY_COMPLETION_ERROR_CAP = 2      # advisor errors per task; doesn't burn verdict cap
+SHELL_HISTORY_FOR_VERIFY = 10        # ring buffer of recent shell outputs for the advisor
+ADVISOR_OUTPUT_CHARS = 4000          # clip recent verify output to this many chars in the advisor message
+
 # File editor
-FILE_VIEW_DEFAULT_MAX_LINES = 400     # if file ≤ this, return whole file by default
-FILE_VIEW_TRUNCATE_TO = 200           # if file > default, return first N lines unless start/end specified
+FILE_VIEW_DEFAULT_MAX_LINES = 800     # if file ≤ this, return whole file by default (was 400 — too aggressive for code; ~95% of source files <800 lines)
+FILE_VIEW_TRUNCATE_TO = 400           # if file > default, return first N lines unless start/end specified (was 200)
 FILE_READ_HARD_CAP_BYTES = 200_000    # absolute max bytes returnable from one view_file call
+
+# Truncation-marker envelope. Used by view_file (line-based) and _truncate_head_tail (byte-based)
+# so a single str_replace guard catches both. The [<<< ... >>>] envelope is syntactically illegal
+# in JS/TS/Python/JSON outside string/comment context, so it can't false-positive on real code.
+# The marker text itself tells the model how to recover (call view_file with explicit range).
+TRUNCATION_MARKER_SENTINEL = "[<<< ELIDED"  # substring-checked in str_replace
 
 # Per-edit syntax check.
 # TS/TSX intentionally excluded: tsc --noEmit on a single file either errors on every cross-file
@@ -244,12 +261,20 @@ def _resolve(path: str) -> Path:
 
 
 def _truncate_head_tail(s: str, head_bytes: int, tail_bytes: int) -> str:
-    """Smart truncation: keep both head AND tail, with byte-elision marker between."""
+    """Smart truncation: keep both head AND tail, with byte-elision marker between.
+
+    Marker uses the same [<<< ELIDED ... >>>] envelope as view_file so str_replace can detect
+    it via a single substring check if it leaks into model args.
+    """
     total_max = head_bytes + tail_bytes
     if len(s) <= total_max:
         return s
     elided = len(s) - head_bytes - tail_bytes
-    return f"{s[:head_bytes]}\n\n[... {elided} bytes elided ...]\n\n{s[-tail_bytes:]}"
+    marker = (
+        f"[<<< ELIDED {elided} bytes. "
+        f"Re-run with grep/head/tail to focus on what you need. >>>]"
+    )
+    return f"{s[:head_bytes]}\n\n{marker}\n\n{s[-tail_bytes:]}"
 
 
 def _truncate_simple(s: str, n: int = 300) -> str:
@@ -853,6 +878,14 @@ def shell(command: str) -> str:
         f"\n[TIMEOUT after {SHELL_COMMAND_TIMEOUT_SECONDS}s, sent SIGINT]"
         if timed_out else f"\n[exit code: {exit_code}]"
     )
+    # Push to the verify-output ring buffer so verify_completion can show the advisor what
+    # the build/test actually produced. Bounded by SHELL_HISTORY_FOR_VERIFY.
+    _shell_output_history.append({
+        "command": command, "exit_code": exit_code,
+        "output": truncated, "timed_out": timed_out, "step": TRACE.step,
+    })
+    if len(_shell_output_history) > SHELL_HISTORY_FOR_VERIFY:
+        _shell_output_history.pop(0)
     TRACE.log(
         "tool_result", tool="shell",
         ok=(exit_code == 0), exit_code=exit_code, timed_out=timed_out,
@@ -946,11 +979,29 @@ def view_file(path: str, start: int = 1, end: int | None = None) -> str:
         f"[showing lines {start}-{end} of {total}]\n"
         if (start > 1 or end < total) else f"[file: {total} lines total]\n"
     )
+    # Append explicit elision markers for any unshown ranges, with the recovery instruction
+    # baked into the marker itself. Two possible elisions: lines before `start` and lines after
+    # `end`. Self-documenting markers cut down on the model inventing its own `...` placeholders
+    # and pasting them into str_replace.
+    head_marker = ""
+    if start > 1:
+        elided = start - 1
+        head_marker = (
+            f"[<<< ELIDED lines 1-{start - 1} ({elided} lines). "
+            f"Use view_file(start=1, end={start - 1}) to read this range. >>>]\n"
+        )
+    tail_marker = ""
+    if end < total:
+        elided = total - end
+        tail_marker = (
+            f"\n[<<< ELIDED lines {end + 1}-{total} ({elided} lines). "
+            f"Use view_file(start={end + 1}, end={total}) to read this range. >>>]"
+        )
     TRACE.log(
         "tool_result", tool="view_file", ok=True,
         path=path, lines_shown=(end - start + 1), total_lines=total,
     )
-    return header + body
+    return header + head_marker + body + tail_marker
 
 
 @tool
@@ -975,6 +1026,24 @@ def str_replace(path: str, old_str: str, new_str: str) -> str:
         content = p.read_text()
     except Exception as e:
         return f"ERROR: {type(e).__name__}: {e}"
+
+    # Truncation-marker guard. If the model copied a [<<< ELIDED ... >>>] marker from a prior
+    # view_file/shell call into its args, that marker is never in the real file — searching
+    # would no_match and the model might loop. Detect early and return a specific recovery
+    # instruction. Substring check on TRUNCATION_MARKER_SENTINEL is unambiguous (the envelope
+    # is syntactically illegal in real source).
+    for arg_name, arg_val in (("old_str", old_str), ("new_str", new_str)):
+        if TRUNCATION_MARKER_SENTINEL in arg_val:
+            TRACE.log("tool_result", tool="str_replace", ok=False, path=path,
+                      error="truncation_marker_in_args", arg=arg_name)
+            return (
+                f"ERROR: your `{arg_name}` contains a truncation marker "
+                f"(`[<<< ELIDED ... >>>]`). These markers indicate elided content from a "
+                f"previous view_file or shell call — they are NOT part of the file. "
+                f"Re-read the file with `view_file(path, start=N, end=M)` covering the exact "
+                f"lines you want to edit, then construct `{arg_name}` from the real source. "
+                f"Never paste a truncation marker as if it were file content."
+            )
 
     # Identical-args guard. Looping on this is a common failure mode: the model thinks an
     # edit hasn't landed and retries it, but old_str == new_str means there's no actual
@@ -1378,13 +1447,239 @@ def _reset_exit() -> None:
     _exit_holder["payload"] = {}
 
 
+# Completion-verification state. verify_completion writes a token here on a "done" verdict;
+# mark_done validates and consumes it. Two counters: verdict_count (bounds exploration),
+# error_count (bounds retries against a broken advisor). Reset per builder iteration.
+_verification_holder: dict = {
+    "issued_token": None,        # most recent token issued by a "done" verdict
+    "consumed_tokens": set(),    # single-use enforcement
+    "verdict_count": 0,          # incremented on done | not_done
+    "error_count": 0,            # incremented on advisor error | unparseable
+    "last_verdict": None,        # full advisor response, kept for diagnostics
+}
+
+
+def _reset_verification() -> None:
+    _verification_holder["issued_token"] = None
+    _verification_holder["consumed_tokens"] = set()
+    _verification_holder["verdict_count"] = 0
+    _verification_holder["error_count"] = 0
+    _verification_holder["last_verdict"] = None
+
+
+# Recent shell outputs, in-memory ring buffer scoped to the current builder iteration. The
+# verify_completion tool pulls from here to surface the most recent verify_command output
+# to the advisor. Not in the trace JSONL because shell output isn't logged there today —
+# augmenting the trace is a separate cost/PII conversation.
+_shell_output_history: list[dict] = []
+
+
+def _find_recent_verify_output(verify_command: str) -> dict | None:
+    """Most recent shell call whose command matches verify_command (loose).
+
+    Loose match handles the common 'cd subdir && <cmd>' vs '<cmd>' variation: either string
+    being a substring of the other counts as a match.
+    """
+    target = verify_command.strip()
+    if not target:
+        return None
+    for entry in reversed(_shell_output_history):
+        cmd = entry["command"].strip()
+        if target in cmd or cmd in target:
+            return entry
+    return None
+
+
+def _build_advisor_user_message(
+    task: str, plan_doc: dict, task_summary: str, evidence: list[str], verify_command: str,
+) -> str:
+    """Render the advisor's user message verbatim per skills/verifying/SKILL.md template."""
+    arch = _render_architecture(plan_doc.get("architecture", {}))
+    reqs = _render_requirements(plan_doc.get("requirements", []))
+    tasks_render = _render_tasks(plan_doc.get("tasks", []))
+    evidence_block = "\n".join(f"{i}. {e}" for i, e in enumerate(evidence, start=1)) \
+        if evidence else "(no evidence provided)"
+
+    recent = _find_recent_verify_output(verify_command)
+    if recent is None:
+        recent_block = (
+            "NO MATCHING SHELL OUTPUT FOUND in the current iteration. The builder may not "
+            "have actually run this command, or ran it before the current iteration started. "
+            "Treat any \"exit 0\" or \"passed\" claims in the evidence as UNVERIFIED — if a "
+            "claim depends on running this command, downgrade your verdict accordingly."
+        )
+    else:
+        clip = recent["output"][:ADVISOR_OUTPUT_CHARS]
+        truncated_note = "" if len(recent["output"]) <= ADVISOR_OUTPUT_CHARS else \
+            f"\n[output clipped to {ADVISOR_OUTPUT_CHARS} chars]"
+        timeout_marker = ", TIMED OUT" if recent.get("timed_out") else ""
+        recent_block = (
+            f"Match found at step {recent.get('step', '?')} "
+            f"(exit code {recent['exit_code']}{timeout_marker}):\n"
+            f"```\n{clip}{truncated_note}\n```"
+        )
+
+    return (
+        f"# ORIGINAL TASK\n{task}\n\n"
+        f"# ARCHITECTURE (locked for this run)\n{arch}\n\n"
+        f"# CURRENT PLAN STATE\n## Requirements\n{reqs}\n## Tasks\n{tasks_render}\n\n"
+        f"# BUILDER'S SUMMARY\n{task_summary}\n\n"
+        f"# BUILDER'S EVIDENCE\n{evidence_block}\n\n"
+        f"# INTENDED VERIFY COMMAND\n{verify_command}\n\n"
+        f"# RECENT VERIFY OUTPUT\n{recent_block}\n\n"
+        f"Decide."
+    )
+
+
+def _parse_advisor_response(text: str) -> dict:
+    """Parse the advisor's JSON object. Raises ValueError on missing fields, json.JSONDecodeError
+    on bad JSON. The advisor is instructed to return ONLY the JSON object — but be tolerant of
+    leading/trailing whitespace or stray prose by extracting the first {...} block.
+    """
+    if not text:
+        raise ValueError("empty advisor response")
+    # Try direct parse first; fall back to extracting the first balanced {...} block.
+    try:
+        parsed = json.loads(text.strip())
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            raise
+        parsed = json.loads(m.group(0))
+    if not isinstance(parsed, dict):
+        raise ValueError(f"advisor returned non-object: {type(parsed).__name__}")
+    for required_field in ("verdict", "missing", "next_action", "confidence"):
+        if required_field not in parsed:
+            raise ValueError(f"advisor response missing required field: {required_field}")
+    if parsed["verdict"] not in ("done", "not_done"):
+        raise ValueError(f"advisor verdict must be done|not_done, got {parsed['verdict']!r}")
+    if not isinstance(parsed["missing"], list):
+        raise ValueError(f"advisor 'missing' must be a list, got {type(parsed['missing']).__name__}")
+    return parsed
+
+
 @tool
-def mark_done(verify_command: str, claim: str) -> str:
-    """Mark the task complete. Plan must be resolved; runs verify_command first.
+async def verify_completion(
+    task_summary: str,
+    evidence: list[str],
+    verify_command: str,
+) -> str:
+    """REQUIRED before mark_done. Routes to a stronger model for an external sanity check.
+
+    Returns a JSON object with verdict, missing, next_action, confidence, and (only if
+    verdict is "done") verification_token. Pass that token to mark_done.
+
+    task_summary: 1-3 sentence description of what the task is and what you built.
+    evidence: list of concrete factual claims that prove completion. Each entry should be a
+        short statement like "next build exited 0 (verified at step 27)" or
+        "all 11 plan tasks marked done". Avoid vague claims like "the app works".
+    verify_command: the build/test command mark_done will run (e.g. 'cd cms && npm run build').
+
+    Caps:
+    - 3 verdicts (done | not_done) per task. Hitting the cap → call give_up; the planner takes over.
+    - 2 advisor errors (unreachable / unparseable) per task. Separate budget; doesn't burn the verdict cap.
+    """
+    vcount = _verification_holder["verdict_count"]
+    ecount = _verification_holder["error_count"]
+    # Cap checks BEFORE calling the advisor — refuse loudly without burning API cost.
+    if vcount >= VERIFY_COMPLETION_CAP:
+        TRACE.log("verify_completion_call", verdict="cap_exceeded_verdicts",
+                  verdict_count=vcount, error_count=ecount,
+                  verdict_cap=VERIFY_COMPLETION_CAP, error_cap=VERIFY_COMPLETION_ERROR_CAP)
+        return (
+            f"ERROR: verify_completion verdict cap reached "
+            f"({VERIFY_COMPLETION_CAP} advisor verdicts already returned). Call give_up with a "
+            f"one-line summary of the advisor's last missing-list. This is the intended "
+            f"escalation; the next iteration's planner will see the verdict."
+        )
+    if ecount >= VERIFY_COMPLETION_ERROR_CAP:
+        TRACE.log("verify_completion_call", verdict="cap_exceeded_errors",
+                  verdict_count=vcount, error_count=ecount,
+                  verdict_cap=VERIFY_COMPLETION_CAP, error_cap=VERIFY_COMPLETION_ERROR_CAP)
+        return (
+            f"ERROR: verify_completion error cap reached (advisor failed to respond "
+            f"{VERIFY_COMPLETION_ERROR_CAP} times). The advisor is unreachable. Call "
+            f"request_user_help — the human needs to know."
+        )
+
+    # Pull authoritative state from the holders the harness syncs at the top of builder_node.
+    plan_doc = _get_plan_doc()
+    task = _plan_holder.get("task", "")
+    user_msg = _build_advisor_user_message(task, plan_doc, task_summary, evidence, verify_command)
+
+    start = time.monotonic()
+    try:
+        response = await _ainvoke_streaming(
+            advisor_llm,
+            [SystemMessage(content=ADVISOR_SYSTEM_PROMPT), HumanMessage(content=user_msg)],
+            label="advisor",
+        )
+        raw = response.content if isinstance(response.content, str) else str(response.content)
+    except _MODEL_RETRY_EXCEPTIONS as e:
+        _verification_holder["error_count"] += 1
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        TRACE.log("verify_completion_call", verdict="error",
+                  error_type=type(e).__name__, error=str(e)[:500],
+                  verdict_count=_verification_holder["verdict_count"],
+                  error_count=_verification_holder["error_count"],
+                  verdict_cap=VERIFY_COMPLETION_CAP, error_cap=VERIFY_COMPLETION_ERROR_CAP,
+                  elapsed_ms=elapsed_ms, advisor_model=ADVISOR_MODEL)
+        return (
+            f"ERROR: advisor unreachable ({type(e).__name__}: {str(e)[:200]}). This counts "
+            f"toward the error cap (now {_verification_holder['error_count']}/"
+            f"{VERIFY_COMPLETION_ERROR_CAP}); does NOT burn your verdict cap "
+            f"({_verification_holder['verdict_count']}/{VERIFY_COMPLETION_CAP}). You may retry "
+            f"or call request_user_help."
+        )
+
+    elapsed_ms = int((time.monotonic() - start) * 1000)
+    try:
+        parsed = _parse_advisor_response(raw)
+    except (json.JSONDecodeError, ValueError, KeyError) as e:
+        _verification_holder["error_count"] += 1
+        TRACE.log("verify_completion_call", verdict="unparseable",
+                  error_type=type(e).__name__, error=str(e)[:500],
+                  verdict_count=_verification_holder["verdict_count"],
+                  error_count=_verification_holder["error_count"],
+                  verdict_cap=VERIFY_COMPLETION_CAP, error_cap=VERIFY_COMPLETION_ERROR_CAP,
+                  elapsed_ms=elapsed_ms, advisor_model=ADVISOR_MODEL)
+        raw_clip = raw.strip()[:1000]
+        return (
+            f"ERROR: advisor response was unparseable ({type(e).__name__}: {e}). Counts "
+            f"toward the error cap (now {_verification_holder['error_count']}/"
+            f"{VERIFY_COMPLETION_ERROR_CAP}). Raw response (clipped):\n{raw_clip}"
+        )
+
+    # Genuine verdict — increment verdict counter, issue token if done.
+    _verification_holder["verdict_count"] += 1
+    _verification_holder["last_verdict"] = parsed
+    verdict = parsed["verdict"]
+    token: str | None = None
+    if verdict == "done":
+        token = str(uuid.uuid4())
+        _verification_holder["issued_token"] = token
+        parsed["verification_token"] = token
+
+    TRACE.log("verify_completion_call", verdict=verdict,
+              confidence=parsed.get("confidence"),
+              missing_count=len(parsed.get("missing") or []),
+              token_issued=bool(token),
+              verdict_count=_verification_holder["verdict_count"],
+              error_count=_verification_holder["error_count"],
+              verdict_cap=VERIFY_COMPLETION_CAP, error_cap=VERIFY_COMPLETION_ERROR_CAP,
+              elapsed_ms=elapsed_ms, advisor_model=ADVISOR_MODEL)
+    return json.dumps(parsed, indent=2)
+
+
+@tool
+def mark_done(verify_command: str, claim: str, verification_token: str) -> str:
+    """Mark the task complete. REQUIRES verification_token from a successful verify_completion.
 
     verify_command: the build/test command that proves the work is correct
         (e.g., 'cd cms-agency && npm run build').
     claim: short summary of what you accomplished.
+    verification_token: the UUID returned by verify_completion when its verdict was "done".
+        Tokens are single-use; if verify_command later fails, you must re-verify to get a new one.
 
     Plan resolution rules (enforced before verify):
     - Items in 'doing' state cause an error: resolve them via update_plan_item first.
@@ -1394,6 +1689,35 @@ def mark_done(verify_command: str, claim: str) -> str:
     If verify_command's exit code != 0, the failure is returned and the loop continues —
     you CANNOT exit until verification passes (or you call request_user_help / give_up).
     """
+    # Token gate. Validated and consumed before any other work — if the token's bad we don't
+    # want to run the (potentially slow) verify_command or mutate the plan.
+    issued = _verification_holder.get("issued_token")
+    consumed = _verification_holder.get("consumed_tokens", set())
+    if not verification_token:
+        return (
+            "ERROR: mark_done requires verification_token. Call verify_completion first; "
+            "if its verdict is 'done', it returns a token. mark_done cannot be called without one."
+        )
+    if verification_token in consumed:
+        TRACE.log("verification_token_rejected", reason="reused",
+                  token_prefix=str(verification_token)[:8])
+        return (
+            "ERROR: this verification_token has already been used. Each token is single-use. "
+            "Call verify_completion again to get a fresh one."
+        )
+    if verification_token != issued:
+        TRACE.log("verification_token_rejected", reason="mismatch",
+                  token_prefix=str(verification_token)[:8])
+        return (
+            "ERROR: verification_token does not match the most-recent issued token. "
+            "Call verify_completion again and pass back the token from THAT response."
+        )
+    # Consume on entry — even if verify_command later fails, the token is burned. Re-verify
+    # forces the advisor to re-evaluate against the new state (which may now be 'not_done').
+    consumed.add(verification_token)
+    _verification_holder["issued_token"] = None
+    TRACE.log("verification_token_consumed", token_prefix=verification_token[:8])
+
     tasks = _get_tasks()
     doing_ids = [it["id"] for it in tasks if it["status"] == "doing"]
     if doing_ids:
@@ -1562,6 +1886,12 @@ planner_llm = ChatAnthropic(
     model=os.environ.get("PLANNER_MODEL", "claude-sonnet-4-6"),
     max_tokens=8000,
 )
+# Separate Anthropic client so the advisor model can be tuned/swapped independently of the
+# planner. Same Anthropic key. Smaller max_tokens — the advisor returns one JSON object.
+advisor_llm = ChatAnthropic(
+    model=ADVISOR_MODEL,
+    max_tokens=2000,
+)
 builder_llm = _openrouter_llm(os.environ.get("BUILDER_MODEL", "qwen/qwen3-coder-next"))
 evaluator_llm = _openrouter_llm(os.environ.get("EVAL_MODEL", "qwen/qwen3.6-27b"))
 
@@ -1570,6 +1900,7 @@ evaluator_llm = _openrouter_llm(os.environ.get("EVAL_MODEL", "qwen/qwen3.6-27b")
 
 
 PLANNER_PROMPT = _load_skill("planning")
+ADVISOR_SYSTEM_PROMPT = _load_skill("verifying")
 
 BUILDER_BASE_SYSTEM_PROMPT = _load_skill("building")
 
@@ -1615,7 +1946,7 @@ def _builder_tools() -> list:
         serve_in_background, stop_servers,
         view_plan, update_plan_item, add_plan_item,
         view_architecture, propose_architecture_change,
-        mark_done, request_user_help, give_up, revise_plan,
+        verify_completion, mark_done, request_user_help, give_up, revise_plan,
     ]
 
 
@@ -1832,6 +2163,8 @@ async def builder_node(outer_state: State, config: RunnableConfig | None = None)
     print(f"\n━━━ BUILDER (iteration {outer_state['iteration']}) ━━━")
     TRACE.log("builder_start", iteration=outer_state["iteration"])
     _reset_exit()
+    _reset_verification()
+    _shell_output_history.clear()
 
     # Sync holder so plan-mutating tools and mark_done can persist with the right task/replan_count.
     plan_doc = outer_state.get("plan") or _empty_plan_doc()
