@@ -1,0 +1,45 @@
+services:
+  langgraph:
+    build: .
+    env_file: .env
+    depends_on:
+      - playwright-mcp
+    volumes:
+      - .:/app:ro
+      - ./workspace:/workspace
+    ports:
+      # Expose Next.js dev server (or any builder-spawned server) to the host browser.
+      - "3000:3000"
+    stdin_open: true
+    tty: true
+
+  # Playwright MCP server — gives the evaluator browser_navigate / browser_take_screenshot etc.
+  # The langgraph container reaches it via service DNS (http://playwright-mcp:8931/sse).
+  playwright-mcp:
+    image: mcr.microsoft.com/playwright:v1.49.0-jammy
+    command: >
+      sh -c "npx -y @playwright/mcp@latest --transport sse --port 8931 --host 0.0.0.0 --headless"
+    ports:
+      - "8931:8931"
+
+  # Local Qwen3.6 via llama.cpp. Enable with: docker compose --profile local up -d llama-cpp
+  llama-cpp:
+    profiles: [local]
+    image: ghcr.io/ggml-org/llama.cpp:server-vulkan
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./models:/models
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+    command: >
+      -m /models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+      --host 0.0.0.0
+      --port 8080
+      -c 32768
+      -ngl 999
+      --jinja
+      --alias qwen3.6
