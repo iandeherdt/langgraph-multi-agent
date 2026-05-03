@@ -97,9 +97,14 @@ SKILLS_DIR = Path(__file__).parent / "skills"
 
 # Plan persistence
 CURRENT_PLAN_PATH = TRACE_DIR / "current-plan.json"
-CURRENT_PLAN_VERSION = 1
+CURRENT_PLAN_VERSION = 2              # v2: requirements + architecture + tasks (was: items)
 MAX_REPLANS = 2                       # cap on builder-triggered revise_plan calls per task
 STALE_PLAN_HOURS = 24                 # v1 — expected to change after usage data; bump as needed
+
+# Architecture sub-section names (in canonical render order). "summary" is the non-coding-task
+# variant — emitted alone, no other sub-sections. The renderer handles missing sub-sections.
+ARCHITECTURE_SUBSECTIONS = ("stack", "file_tree", "data_model", "key_decisions")
+NON_CODING_SUBSECTION = "summary"
 
 
 # ────────────────────────── trace logger ──────────────────────────
@@ -214,8 +219,9 @@ def _hash_short(s: str) -> str:
 
 
 def _extract_section(text: str, name: str) -> str:
-    pattern = rf"#+\s*{name}\s*\n(.*?)(?=\n#+\s|\Z)"
-    m = re.search(pattern, text, re.DOTALL)
+    """Extract content under a LEVEL-1 # header. Stops at the next level-1 header (not at ##)."""
+    pattern = rf"^#\s+{re.escape(name)}\s*\n(.*?)(?=^#\s|\Z)"
+    m = re.search(pattern, text, re.MULTILINE | re.DOTALL)
     return m.group(1).strip() if m else ""
 
 
@@ -229,8 +235,8 @@ def _extract_notes(text: str) -> str:
     return m.group(1).strip() if m else ""
 
 
-def _parse_plan(plan_text: str) -> list[dict]:
-    """Parse a markdown checklist into PlanItem dicts.
+def _parse_tasks(plan_text: str) -> list[dict]:
+    """Parse a markdown checklist into TaskItem dicts.
 
     Accepts: '- [ ] text', '- [x] text', '- text', '* text', '1. text'.
     Returns: [{id, text, status: 'todo'|'done', notes: ''}, ...]
@@ -258,9 +264,9 @@ def _parse_plan(plan_text: str) -> list[dict]:
     return items
 
 
-def _render_plan(items: list[dict]) -> str:
+def _render_tasks(items: list[dict]) -> str:
     if not items:
-        return "(no plan items)"
+        return "(no tasks)"
     out = []
     sym = {"todo": "[ ]", "doing": "[~]", "done": "[x]", "blocked": "[!]"}
     for it in items:
@@ -270,6 +276,140 @@ def _render_plan(items: list[dict]) -> str:
             line += f"  ({it['notes']})"
         out.append(line)
     return "\n".join(out)
+
+
+def _parse_requirements(text: str) -> list[str]:
+    """Parse a bullet list from REQUIREMENTS section text. Returns list of strings."""
+    out = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        m = re.match(r"^[-*]\s+(.+)$", line)
+        if m:
+            out.append(m.group(1).strip())
+    return out
+
+
+def _render_requirements(reqs: list[str]) -> str:
+    if not reqs:
+        return "(none)"
+    return "\n".join(f"- {r}" for r in reqs)
+
+
+_KNOWN_ARCH_SUBNAMES = "|".join(ARCHITECTURE_SUBSECTIONS + (NON_CODING_SUBSECTION,))
+
+
+def _parse_architecture(text: str) -> dict[str, str]:
+    """Parse ARCHITECTURE text into a sub-section dict.
+
+    Recognises only the canonical sub-section names (stack/file_tree/data_model/key_decisions
+    for coding tasks; summary for non-coding). Each sub-section value is the raw markdown
+    content under that ## header, stripped. Missing sub-sections are simply absent from the dict.
+    """
+    if not text or not text.strip():
+        return {}
+    arch = {}
+    pattern = re.compile(
+        rf"^\s*##\s+({_KNOWN_ARCH_SUBNAMES})\s*\n(.*?)(?=^\s*##\s+(?:{_KNOWN_ARCH_SUBNAMES})\b|\Z)",
+        re.MULTILINE | re.DOTALL | re.IGNORECASE,
+    )
+    for m in pattern.finditer(text):
+        subname = m.group(1).strip().lower()
+        content = m.group(2).strip()
+        arch[subname] = content
+    return arch
+
+
+def _render_architecture(arch: dict[str, str]) -> str:
+    """Render architecture dict back to markdown sub-sections in canonical order.
+
+    Handles missing sub-sections gracefully: only emits what's present. Coding sub-sections
+    in canonical order, then summary if present.
+    """
+    if not arch:
+        return "(no architecture specified)"
+    parts = []
+    for name in ARCHITECTURE_SUBSECTIONS:
+        if name in arch:
+            parts.append(f"## {name}\n{arch[name]}")
+    if NON_CODING_SUBSECTION in arch:
+        parts.append(f"## {NON_CODING_SUBSECTION}\n{arch[NON_CODING_SUBSECTION]}")
+    return "\n\n".join(parts) if parts else "(no architecture specified)"
+
+
+def _render_proposals(proposals: list[dict]) -> str:
+    """Render pending proposals as a numbered list (for builder context AND planner review input)."""
+    if not proposals:
+        return "(none pending)"
+    out = []
+    for i, p in enumerate(proposals, start=1):
+        out.append(
+            f'{i}. [section={p.get("section", "?")}] '
+            f'change="{p.get("change", "?")}" '
+            f'rationale="{p.get("rationale", "?")}"'
+        )
+    return "\n".join(out)
+
+
+def _render_plan_doc(doc: dict) -> str:
+    """Render the full plan document for the builder system message.
+
+    Layout: # REQUIREMENTS / # ARCHITECTURE / # TASKS / # PENDING ARCHITECTURE PROPOSALS (if any).
+    """
+    parts = []
+    parts.append("# REQUIREMENTS\n" + _render_requirements(doc.get("requirements", [])))
+    parts.append("\n# ARCHITECTURE\n" + _render_architecture(doc.get("architecture", {})))
+    parts.append("\n# TASKS\n" + _render_tasks(doc.get("tasks", [])))
+    pending = doc.get("pending_proposals", [])
+    if pending:
+        parts.append(
+            "\n# PENDING ARCHITECTURE PROPOSALS (awaiting planner review)\n"
+            + _render_proposals(pending)
+        )
+    return "\n".join(parts)
+
+
+def _parse_proposal_review(text: str) -> list[dict]:
+    """Parse # PROPOSAL_REVIEW entries.
+
+    Format: '1. accepted: rationale' or '1. rejected: rationale'. Returns list of
+    {index, decision, rationale} dicts (1-based index). Missing entries are NOT filled
+    here — caller detects skips by comparing to the proposal count.
+    """
+    if not text:
+        return []
+    entries = []
+    pattern = re.compile(
+        r"^\s*(\d+)\.\s+(accepted|rejected)\s*:\s*(.+?)"
+        r"(?=^\s*\d+\.\s+(?:accepted|rejected)\s*:|\Z)",
+        re.MULTILINE | re.DOTALL | re.IGNORECASE,
+    )
+    for m in pattern.finditer(text):
+        entries.append({
+            "index": int(m.group(1)),
+            "decision": m.group(2).lower(),
+            "rationale": m.group(3).strip(),
+        })
+    return entries
+
+
+def _upconvert_v1_to_v2(payload: dict) -> dict:
+    """Convert a v1 plan to v2 schema.
+
+    v1 'items' becomes v2 'tasks'; requirements + architecture are empty placeholders.
+    The planner sees `_upconverted_from: 1` on next entry and fills them in.
+    """
+    return {
+        "version": 2,
+        "task": payload.get("task", ""),
+        "updated_at": payload.get("updated_at"),
+        "trace_file": payload.get("trace_file"),
+        "replan_count": payload.get("replan_count", 0),
+        "requirements": [],
+        "architecture": {},
+        "tasks": payload.get("items", []),
+        "pending_proposals": [],
+        "_upconverted_from": 1,
+    }
 
 
 def _is_build_command(cmd: str) -> bool:
@@ -697,34 +837,59 @@ def stop_servers() -> str:
 
 # LangChain @tool functions can't easily access LangGraph state; use a module-level holder
 # that the planner/builder populate before invoking tools and read back after.
-# Holds: items (the live plan), task (current outer task), replan_count (cap tracking).
-_plan_holder: dict = {"items": [], "task": "", "replan_count": 0}
+# Holds: doc (the v2 plan document), task (current outer task), replan_count (cap tracking).
+_plan_holder: dict = {"doc": None, "task": "", "replan_count": 0}
 
 
-def _set_plan(items: list[dict]) -> None:
-    _plan_holder["items"] = items
+def _empty_plan_doc() -> dict:
+    """Canonical empty v2 plan doc. Used as initial state and as a None-coalescing default."""
+    return {
+        "requirements": [],
+        "architecture": {},
+        "tasks": [],
+        "pending_proposals": [],
+    }
 
 
-def _get_plan() -> list[dict]:
-    return _plan_holder["items"]
+def _set_plan_doc(doc: dict) -> None:
+    _plan_holder["doc"] = doc
 
 
-def _set_plan_context(task: str, items: list[dict], replan_count: int) -> None:
+def _get_plan_doc() -> dict:
+    doc = _plan_holder.get("doc")
+    return doc if doc is not None else _empty_plan_doc()
+
+
+def _get_tasks() -> list[dict]:
+    return _get_plan_doc().get("tasks", [])
+
+
+def _set_tasks(tasks: list[dict]) -> None:
+    doc = _get_plan_doc()
+    doc["tasks"] = tasks
+    _plan_holder["doc"] = doc
+
+
+def _set_plan_context(task: str, doc: dict, replan_count: int) -> None:
     """Sync the holder with the current outer-task context. Called from planner_node and builder_node."""
     _plan_holder["task"] = task
-    _plan_holder["items"] = items
+    _plan_holder["doc"] = doc
     _plan_holder["replan_count"] = replan_count
 
 
-def _persist_plan(task: str, items: list[dict], replan_count: int) -> None:
-    """Atomic write to CURRENT_PLAN_PATH. tmp + rename so a crash mid-write doesn't corrupt."""
+def _persist_plan(task: str, doc: dict, replan_count: int) -> None:
+    """Atomic write of the v2 plan to CURRENT_PLAN_PATH. tmp + rename so a crash mid-write
+    doesn't corrupt."""
     payload = {
         "version": CURRENT_PLAN_VERSION,
         "task": task,
-        "items": items,
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "trace_file": TRACE.path.name if TRACE.path else None,
         "replan_count": replan_count,
+        "requirements": doc.get("requirements", []),
+        "architecture": doc.get("architecture", {}),
+        "tasks": doc.get("tasks", []),
+        "pending_proposals": doc.get("pending_proposals", []),
     }
     CURRENT_PLAN_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = CURRENT_PLAN_PATH.with_suffix(".json.tmp")
@@ -736,7 +901,7 @@ def _persist_current_plan() -> None:
     """Persist using the current _plan_holder. Called from plan-mutating tools."""
     _persist_plan(
         _plan_holder.get("task", ""),
-        _plan_holder.get("items", []),
+        _get_plan_doc(),
         _plan_holder.get("replan_count", 0),
     )
 
@@ -745,8 +910,12 @@ def _load_persisted_plan() -> dict | None:
     """Load the prior plan, if any. Always emits a plan_load_failed trace event for any
     non-OK outcome (missing | corrupt | version_mismatch | stale).
 
-    Note: stale plans are still RETURNED (with _stale=True) so the planner can reason about
-    them as advisory context — only missing/corrupt/version_mismatch return None.
+    v1 payloads are upconverted to v2 in-flight (logs `plan_upconvert_v1_to_v2`); the returned
+    doc carries `_upconverted_from: 1` and empty REQUIREMENTS / ARCHITECTURE which the planner
+    skill knows to fill in on next entry.
+
+    Stale plans are still RETURNED (with _stale=True) so the planner can reason about them as
+    advisory context — only missing/corrupt/unknown-version return None.
     """
     if not CURRENT_PLAN_PATH.exists():
         TRACE.log("plan_load_failed", reason="missing")
@@ -756,22 +925,26 @@ def _load_persisted_plan() -> dict | None:
     except (json.JSONDecodeError, OSError) as e:
         TRACE.log("plan_load_failed", reason="corrupt", error=str(e))
         return None
-    if payload.get("version") != CURRENT_PLAN_VERSION:
-        TRACE.log("plan_load_failed", reason="version_mismatch",
-                  found_version=payload.get("version"))
+    found_version = payload.get("version")
+    if found_version == 1:
+        TRACE.log("plan_upconvert_v1_to_v2", item_count=len(payload.get("items", [])))
+        payload = _upconvert_v1_to_v2(payload)
+    elif found_version != CURRENT_PLAN_VERSION:
+        TRACE.log("plan_load_failed", reason="version_mismatch", found_version=found_version)
         return None
     try:
-        updated = datetime.fromisoformat(payload["updated_at"])
+        updated = datetime.fromisoformat(payload["updated_at"]) if payload.get("updated_at") else None
     except (KeyError, ValueError) as e:
         TRACE.log("plan_load_failed", reason="corrupt", error=f"updated_at: {e}")
         return None
-    age = datetime.now(timezone.utc) - updated
-    if age > timedelta(hours=STALE_PLAN_HOURS):
-        TRACE.log("plan_load_failed", reason="stale",
-                  age_hours=round(age.total_seconds() / 3600, 1))
-        payload["_stale"] = True
-        # fall through — still return; planner uses it as advisory
-    payload["_age_hours"] = round(age.total_seconds() / 3600, 2)
+    if updated is not None:
+        age = datetime.now(timezone.utc) - updated
+        if age > timedelta(hours=STALE_PLAN_HOURS):
+            TRACE.log("plan_load_failed", reason="stale",
+                      age_hours=round(age.total_seconds() / 3600, 1))
+            payload["_stale"] = True
+            # fall through — still return; planner uses it as advisory
+        payload["_age_hours"] = round(age.total_seconds() / 3600, 2)
     return payload
 
 
@@ -787,16 +960,16 @@ def _extract_decision_rationale(decision_text: str) -> str:
 
 @tool
 def view_plan() -> str:
-    """View the current plan with item statuses."""
-    return _render_plan(_get_plan())
+    """View the full plan: REQUIREMENTS, ARCHITECTURE, TASKS, and any pending architecture proposals."""
+    return _render_plan_doc(_get_plan_doc())
 
 
 @tool
 def update_plan_item(id: int, status: str, notes: str = "") -> str:
-    """Update a plan item. status: todo | doing | done | blocked. notes optional (e.g., why blocked)."""
+    """Update a TASKS item. status: todo | doing | done | blocked. notes optional (e.g., why blocked)."""
     if status not in ("todo", "doing", "done", "blocked"):
         return "ERROR: status must be one of: todo, doing, done, blocked"
-    for it in _get_plan():
+    for it in _get_tasks():
         if it["id"] == id:
             it["status"] = status
             if notes:
@@ -809,22 +982,79 @@ def update_plan_item(id: int, status: str, notes: str = "") -> str:
 
 @tool
 def add_plan_item(text: str, after_id: int | None = None) -> str:
-    """Append a new plan item, or insert after the given id. Returns the new id."""
-    items = _get_plan()
-    new_id = max((it["id"] for it in items), default=0) + 1
+    """Append a new TASKS item, or insert after the given id. Returns the new id."""
+    tasks = _get_tasks()
+    new_id = max((it["id"] for it in tasks), default=0) + 1
     new_item = {"id": new_id, "text": text, "status": "todo", "notes": ""}
     if after_id is None:
-        items.append(new_item)
+        tasks.append(new_item)
     else:
-        for i, it in enumerate(items):
+        for i, it in enumerate(tasks):
             if it["id"] == after_id:
-                items.insert(i + 1, new_item)
+                tasks.insert(i + 1, new_item)
                 break
         else:
             return f"ERROR: no plan item with id={after_id}"
+    _set_tasks(tasks)
     TRACE.log("plan_add", id=new_id, text=text[:200])
     _persist_current_plan()
     return f"added item {new_id}"
+
+
+_VALID_PROPOSAL_SECTIONS = ARCHITECTURE_SUBSECTIONS  # stack | file_tree | data_model | key_decisions
+
+
+@tool
+def view_architecture() -> str:
+    """View the ARCHITECTURE section of the plan (read-only).
+
+    Returns the planner's locked architecture decisions: stack, file_tree, data_model,
+    key_decisions (or summary, for non-coding tasks). To request a change, call
+    propose_architecture_change — you cannot edit ARCHITECTURE directly.
+    """
+    arch = _get_plan_doc().get("architecture", {})
+    return _render_architecture(arch)
+
+
+@tool
+def propose_architecture_change(section: str, change: str, rationale: str) -> str:
+    """Record a proposed change to ARCHITECTURE for the planner's next review.
+
+    section: one of stack | file_tree | data_model | key_decisions
+    change: concrete description of what should change (and to what)
+    rationale: why the current architecture decision is wrong here
+
+    Does NOT replan immediately. Keep working under the current architecture; the planner
+    sees pending proposals on the next iteration and either accepts (incorporates the change)
+    or rejects (architecture stays). For an immediate replan, use revise_plan instead.
+    """
+    section = (section or "").strip().lower()
+    if section not in _VALID_PROPOSAL_SECTIONS:
+        return (
+            f"ERROR: section must be one of {list(_VALID_PROPOSAL_SECTIONS)} "
+            f"(got '{section}'). For non-architecture concerns, use revise_plan or "
+            f"request_user_help."
+        )
+    change = (change or "").strip()
+    rationale = (rationale or "").strip()
+    if not change or not rationale:
+        return "ERROR: both 'change' and 'rationale' are required and must be non-empty."
+
+    doc = _get_plan_doc()
+    proposals = list(doc.get("pending_proposals", []))
+    proposals.append({"section": section, "change": change, "rationale": rationale})
+    doc["pending_proposals"] = proposals
+    _set_plan_doc(doc)
+    _persist_current_plan()
+    TRACE.log(
+        "architecture_proposal",
+        section=section, change=change[:500], rationale=rationale[:500],
+        proposal_count=len(proposals),
+    )
+    return (
+        f"proposal recorded (#{len(proposals)}, section={section}). The planner will review "
+        f"on the next iteration; continue working under the current architecture for now."
+    )
 
 
 # ────────────────────────── tools: exit signals ──────────────────────────
@@ -856,8 +1086,8 @@ def mark_done(verify_command: str, claim: str) -> str:
     If verify_command's exit code != 0, the failure is returned and the loop continues —
     you CANNOT exit until verification passes (or you call request_user_help / give_up).
     """
-    plan = _get_plan()
-    doing_ids = [it["id"] for it in plan if it["status"] == "doing"]
+    tasks = _get_tasks()
+    doing_ids = [it["id"] for it in tasks if it["status"] == "doing"]
     if doing_ids:
         return (
             f"ERROR: cannot mark_done while plan items {doing_ids} are still in 'doing' state. "
@@ -873,16 +1103,16 @@ def mark_done(verify_command: str, claim: str) -> str:
     if exit_code == 0:
         # Promote todo → done and persist ONLY after verify passes — otherwise a failed verify
         # would leave the persisted plan claiming completion the work doesn't actually have.
-        for it in plan:
+        for it in tasks:
             if it["status"] == "todo":
                 it["status"] = "done"
-        _set_plan(plan)
+        _set_tasks(tasks)
         _persist_current_plan()
         _exit_holder["signal"] = "done"
         _exit_holder["payload"] = {"claim": claim, "verify_command": verify_command}
         TRACE.log("builder_exit", reason="done",
                   verify_command=verify_command, claim=claim[:500], elapsed_ms=elapsed_ms)
-        TRACE.log("task_completed_with_plan", items=plan, claim=claim[:500])
+        TRACE.log("task_completed_with_plan", tasks=tasks, claim=claim[:500])
         return f"VERIFIED: {verify_command} passed (exit 0, {elapsed_ms}ms). Builder exiting as 'done'."
 
     truncated = _truncate_head_tail(output, SHELL_OUTPUT_HEAD_BYTES, SHELL_OUTPUT_TAIL_BYTES)
@@ -1030,7 +1260,7 @@ EVALUATOR_SYSTEM_PROMPT = _load_skill("evaluating")
 class State(TypedDict):
     task: str
     iteration: int
-    plan: list  # list of PlanItem dicts
+    plan: dict  # v2 plan doc: {requirements, architecture, tasks, pending_proposals}
     builder_instructions: str
     evaluator_instructions: str
     builder_summary: str
@@ -1046,7 +1276,7 @@ class State(TypedDict):
 
 class BuilderState(TypedDict):
     messages: Annotated[list, add_messages]
-    plan: list
+    plan: dict  # v2 plan doc
     step: int
     max_steps: int
     edit_history: list  # [{file, fingerprint, step}]
@@ -1062,6 +1292,7 @@ def _builder_tools() -> list:
         shell, shell_reset, list_dir,
         serve_in_background, stop_servers,
         view_plan, update_plan_item, add_plan_item,
+        view_architecture, propose_architecture_change,
         mark_done, request_user_help, give_up, revise_plan,
     ]
 
@@ -1071,7 +1302,7 @@ def _render_builder_system(state: BuilderState) -> str:
     max_steps = state["max_steps"]
     remaining = max_steps - step
     parts = [BUILDER_BASE_SYSTEM_PROMPT]
-    parts.append("\n# CURRENT PLAN\n" + _render_plan(state["plan"]))
+    parts.append("\n" + _render_plan_doc(state["plan"]))
     parts.append(f"\n# STEP BUDGET\nStep {step + 1} of {max_steps}. {remaining} tool calls remaining.")
     if remaining <= 1:
         parts.append("FINAL STEP. Either call mark_done with a passing verify_command, request_user_help, or give_up.")
@@ -1136,7 +1367,7 @@ async def builder_tools_node(state: BuilderState) -> dict:
     tools_by_name = {t.name: t for t in _builder_tools()}
 
     # Inject current plan into holder so plan tools can read/mutate it
-    _set_plan(state["plan"])
+    _set_plan_doc(state["plan"])
 
     new_messages: list = []
     new_edits = list(state.get("edit_history", []))
@@ -1200,7 +1431,7 @@ async def builder_tools_node(state: BuilderState) -> dict:
 
     return {
         "messages": new_messages,
-        "plan": _get_plan(),
+        "plan": _get_plan_doc(),
         "edit_history": new_edits,
         "shell_history": new_shells,
         "tool_history": new_tools,
@@ -1255,9 +1486,9 @@ def _format_builder_summary(state: BuilderState, exit_signal: str, exit_payload:
         parts.append(_truncate_simple(exit_payload.get("final_text", ""), 500))
     elif exit_signal == "budget_exhausted":
         parts.append(f"Budget of {state['max_steps']} steps exhausted before mark_done.")
-    plan = state["plan"]
-    done = sum(1 for p in plan if p["status"] == "done")
-    parts.append(f"Plan progress: {done}/{len(plan)} items done.")
+    tasks = state["plan"].get("tasks", []) if isinstance(state["plan"], dict) else []
+    done = sum(1 for t in tasks if t["status"] == "done")
+    parts.append(f"Plan progress: {done}/{len(tasks)} tasks done.")
     return "\n".join(parts)
 
 
@@ -1267,16 +1498,17 @@ async def builder_node(outer_state: State) -> dict:
     _reset_exit()
 
     # Sync holder so plan-mutating tools and mark_done can persist with the right task/replan_count.
+    plan_doc = outer_state.get("plan") or _empty_plan_doc()
     _set_plan_context(
         outer_state["task"],
-        outer_state["plan"],
+        plan_doc,
         outer_state.get("replan_count", 0),
     )
 
     initial_messages: list = [HumanMessage(content=outer_state["builder_instructions"])]
     builder_state: BuilderState = {
         "messages": initial_messages,
-        "plan": outer_state["plan"],
+        "plan": plan_doc,
         "step": 0,
         "max_steps": MAX_BUILDER_STEPS,
         "edit_history": [],
@@ -1307,6 +1539,122 @@ async def builder_node(outer_state: State) -> dict:
 # ────────────────────────── planner ──────────────────────────
 
 
+def _apply_planner_merge(
+    prior_doc: dict | None,
+    path: str,
+    new_requirements: list[str],
+    new_architecture: dict[str, str],
+    new_tasks: list[dict],
+    rationale: str,
+) -> tuple[list[str], dict[str, str], list[dict]]:
+    """Apply the # DECISION path's merge rules. Returns final (requirements, architecture, tasks).
+
+    - continued: REQUIREMENTS append (log requirement_duplicate per exact-text repeat, no dedupe);
+      ARCHITECTURE replaces per emitted sub-section, keeps unemitted sub-sections;
+      TASKS append (log task_duplicate per exact-text repeat, no dedupe), renumbered after prior.
+    - replaced: prior is discarded; new sections become the plan. Logs prior_plan_abandoned for
+      any non-done prior tasks.
+    - fresh (or anomalous fallback): new sections become the plan; no merge.
+    """
+    if path == "continued" and prior_doc:
+        prior_reqs = list(prior_doc.get("requirements", []))
+        merged_requirements = list(prior_reqs)
+        prior_req_set = set(prior_reqs)
+        for r in new_requirements:
+            if r in prior_req_set:
+                TRACE.log("requirement_duplicate", text=r[:200])
+            merged_requirements.append(r)
+
+        merged_architecture = dict(prior_doc.get("architecture", {}))
+        for subname, content in new_architecture.items():
+            merged_architecture[subname] = content  # replace per sub-section
+
+        prior_tasks = prior_doc.get("tasks", [])
+        prior_task_texts = {t["text"] for t in prior_tasks}
+        for nt in new_tasks:
+            if nt["text"] in prior_task_texts:
+                TRACE.log("task_duplicate", text=nt["text"][:200])
+        base_id = max((t["id"] for t in prior_tasks), default=0)
+        renumbered = [{**t, "id": base_id + i + 1} for i, t in enumerate(new_tasks)]
+        merged_tasks = prior_tasks + renumbered
+        return merged_requirements, merged_architecture, merged_tasks
+
+    if path == "replaced" and prior_doc:
+        abandoned = [t for t in prior_doc.get("tasks", []) if t["status"] != "done"]
+        if abandoned:
+            TRACE.log("prior_plan_abandoned", abandoned_items=abandoned, count=len(abandoned))
+        TRACE.log("planner_replaced", rationale=rationale[:500])
+
+    return list(new_requirements), dict(new_architecture), list(new_tasks)
+
+
+def _apply_proposal_review(
+    prior_doc: dict | None,
+    path: str,
+    proposal_review_text: str,
+) -> None:
+    """Emit proposal_review trace events for every pending proposal.
+
+    Skill-level rules:
+    - replaced path → all pending proposals implicitly rejected (architecture being replaced).
+    - continued path → must have # PROPOSAL_REVIEW; if section missing, log
+      proposal_review_section_missing and reject all; per-entry skips → proposal_review_missing
+      and reject that one.
+    - fresh path → no prior, no proposals (nothing to do).
+
+    pending_proposals is cleared from the final doc by the caller regardless — proposals do not
+    carry over across planner runs.
+    """
+    pending = (prior_doc or {}).get("pending_proposals", [])
+    if not pending:
+        return
+
+    if path == "replaced":
+        for i, p in enumerate(pending, start=1):
+            TRACE.log(
+                "proposal_review", index=i, accepted=False,
+                section=p.get("section"),
+                rationale="auto-reject: prior architecture replaced (path=replaced)",
+            )
+        return
+
+    if path != "continued":
+        # fresh with no prior → pending is empty (handled above). Anomalous: log + reject all.
+        TRACE.log("proposal_review_section_missing",
+                  proposal_count=len(pending), note=f"unexpected path={path} with pending proposals")
+        for i, p in enumerate(pending, start=1):
+            TRACE.log("proposal_review", index=i, accepted=False,
+                      section=p.get("section"),
+                      rationale=f"auto-reject: unexpected path={path} with pending proposals")
+        return
+
+    # path == "continued": PROPOSAL_REVIEW is required
+    if not (proposal_review_text or "").strip():
+        TRACE.log("proposal_review_section_missing", proposal_count=len(pending))
+        for i, p in enumerate(pending, start=1):
+            TRACE.log("proposal_review", index=i, accepted=False,
+                      section=p.get("section"),
+                      rationale="auto-reject: PROPOSAL_REVIEW section missing from planner output")
+        return
+
+    entries = _parse_proposal_review(proposal_review_text)
+    by_index = {e["index"]: e for e in entries}
+    for i, p in enumerate(pending, start=1):
+        e = by_index.get(i)
+        if e is None:
+            TRACE.log("proposal_review_missing", index=i, section=p.get("section"))
+            TRACE.log("proposal_review", index=i, accepted=False,
+                      section=p.get("section"),
+                      rationale="auto-reject: missing from PROPOSAL_REVIEW section")
+        else:
+            TRACE.log(
+                "proposal_review", index=i,
+                accepted=(e["decision"] == "accepted"),
+                section=p.get("section"),
+                rationale=e["rationale"][:500],
+            )
+
+
 async def planner_node(state: State) -> dict:
     iteration = state.get("iteration", 0) + 1
     task = state["task"]
@@ -1319,9 +1667,29 @@ async def planner_node(state: State) -> dict:
     if came_from_revise:
         replan_count += 1
 
-    # On the first iteration of a new outer task, attempt to load the persisted prior plan.
-    # On in-PBE iterations (replan from evaluator or builder), state already carries the plan.
-    prior = _load_persisted_plan() if iteration == 1 else None
+    # Determine prior_doc to merge against:
+    # - iteration 1: load from disk (cross-task continuation)
+    # - iteration > 1: take from state (in-PBE replan; same task, evolving plan)
+    if iteration == 1:
+        prior = _load_persisted_plan()
+        prior_doc = prior  # may be None
+    else:
+        prior = None
+        prior_doc = state.get("plan")
+        if not prior_doc or not isinstance(prior_doc, dict):
+            prior_doc = None
+
+    pending_proposals = (prior_doc or {}).get("pending_proposals", [])
+
+    # Section list to request: include PROPOSAL_REVIEW when prior had pending proposals.
+    sections_to_emit = ["# DECISION"]
+    if pending_proposals:
+        sections_to_emit.append("# PROPOSAL_REVIEW (required if path=continued)")
+    sections_to_emit += [
+        "# REQUIREMENTS", "# ARCHITECTURE", "# TASKS",
+        "# BUILDER_INSTRUCTIONS", "# EVALUATOR_INSTRUCTIONS",
+    ]
+    sections_clause = ", ".join(sections_to_emit)
 
     # Build the user-message content
     if iteration == 1:
@@ -1333,24 +1701,37 @@ async def planner_node(state: State) -> dict:
                     f"(_age_hours={prior['_age_hours']}). Treat as ADVISORY ONLY: default to "
                     f"'replaced' unless the new task explicitly references the prior work.]\n"
                 )
+            upconvert_block = ""
+            if prior.get("_upconverted_from") == 1:
+                upconvert_block = (
+                    "\n[NOTE: prior plan was upconverted from v1; REQUIREMENTS and ARCHITECTURE "
+                    "are empty. Even on 'continued', fill them in by deriving from prior tasks "
+                    "and the new user task.]\n"
+                )
+            prior_doc_view = {
+                "requirements": prior.get("requirements", []),
+                "architecture": prior.get("architecture", {}),
+                "tasks": prior.get("tasks", []),
+                "pending_proposals": prior.get("pending_proposals", []),
+            }
             prior_block = (
                 f"\n\n# PRIOR PLAN CONTEXT\n"
                 f"Prior task: {prior['task']}\n"
-                f"Prior updated_at: {prior['updated_at']}\n"
-                f"_age_hours: {prior['_age_hours']}\n"
+                f"Prior updated_at: {prior.get('updated_at')}\n"
+                f"_age_hours: {prior.get('_age_hours')}\n"
                 f"_stale: {prior.get('_stale', False)}\n"
-                f"Prior items:\n```json\n{json.dumps(prior['items'], indent=2)}\n```"
-                f"{stale_block}"
+                f"_upconverted_from: {prior.get('_upconverted_from', 0)}\n"
+                f"Prior plan:\n```json\n{json.dumps(prior_doc_view, indent=2)}\n```"
+                f"{stale_block}{upconvert_block}"
             )
         else:
             prior_block = "\n\n# PRIOR PLAN CONTEXT\n(no prior plan exists)"
         msg = (
             f"USER TASK:\n{task}{prior_block}\n\n"
-            f"Decide path (fresh | continued | replaced), then emit # DECISION, # PLAN, "
-            f"# BUILDER_INSTRUCTIONS, # EVALUATOR_INSTRUCTIONS."
+            f"Decide path (fresh | continued | replaced), then emit {sections_clause}."
         )
     else:
-        plan_render = _render_plan(state["plan"]) if state.get("plan") else "(none)"
+        plan_render = _render_plan_doc(prior_doc) if prior_doc else "(none)"
         revise_block = ""
         if came_from_revise:
             revise_block = (
@@ -1367,8 +1748,7 @@ async def planner_node(state: State) -> dict:
             f"PRIOR EVALUATOR VERDICT: {state.get('eval_verdict', 'continue')}\n"
             f"PRIOR EVALUATOR NOTES:\n{state.get('eval_notes', '(none)')}\n\n"
             f"Write the revised plan and instructions for iteration {iteration}. "
-            f"Emit # DECISION (path: continued | replaced), # PLAN, "
-            f"# BUILDER_INSTRUCTIONS, # EVALUATOR_INSTRUCTIONS."
+            f"Emit {sections_clause} (path: continued | replaced)."
         )
 
     print(f"\n━━━ PLANNER (iteration {iteration}) ━━━")
@@ -1378,67 +1758,82 @@ async def planner_node(state: State) -> dict:
     ])
     text = response.content if isinstance(response.content, str) else str(response.content)
 
+    # Parse all sections
     decision_text = _extract_section(text, "DECISION")
-    path = _extract_decision_path(decision_text) or ("fresh" if prior is None else "replaced")
+    parsed_path = _extract_decision_path(decision_text)
     rationale = _extract_decision_rationale(decision_text) or "(none provided)"
 
-    plan_text = _extract_section(text, "PLAN")
-    new_items = _parse_plan(plan_text)
+    proposal_review_text = _extract_section(text, "PROPOSAL_REVIEW")
+    requirements_text = _extract_section(text, "REQUIREMENTS")
+    architecture_text = _extract_section(text, "ARCHITECTURE")
+    tasks_text = _extract_section(text, "TASKS")
     bi = _extract_section(text, "BUILDER_INSTRUCTIONS")
     ei = _extract_section(text, "EVALUATOR_INSTRUCTIONS")
 
-    # Apply path. Only relevant when prior was loaded (iteration == 1 path); replans during a
-    # task always take the new items as the revised plan (planner already saw the prior in state).
-    if iteration == 1 and prior is not None:
-        if path == "continued":
-            base_id = max((it["id"] for it in prior["items"]), default=0)
-            renumbered = [{**it, "id": base_id + i + 1} for i, it in enumerate(new_items)]
-            final_items = prior["items"] + renumbered
-        elif path == "replaced":
-            abandoned = [it for it in prior["items"] if it["status"] != "done"]
-            if abandoned:
-                TRACE.log("prior_plan_abandoned", abandoned_items=abandoned, count=len(abandoned))
-            TRACE.log("planner_replaced", rationale=rationale[:500],
-                      prior_plan=prior["items"], new_plan=new_items)
-            final_items = new_items
-        else:  # path == "fresh" but a prior existed — anomalous, treat as replaced
-            TRACE.log("planner_decision_anomaly",
-                      note=f"path='fresh' but prior plan existed; treating as replaced")
-            abandoned = [it for it in prior["items"] if it["status"] != "done"]
-            if abandoned:
-                TRACE.log("prior_plan_abandoned", abandoned_items=abandoned, count=len(abandoned))
-            final_items = new_items
-    elif iteration == 1 and prior is None:
-        if path != "fresh":
-            TRACE.log("planner_decision_anomaly",
-                      note=f"path='{path}' but no prior plan existed; treating as fresh")
-        final_items = new_items
+    new_requirements = _parse_requirements(requirements_text)
+    new_architecture = _parse_architecture(architecture_text)
+    new_tasks = _parse_tasks(tasks_text)
+
+    # Determine effective path. Anomaly cases: 'fresh' with prior → treat as replaced;
+    # non-fresh with no prior → treat as fresh.
+    if parsed_path is None:
+        path = "fresh" if prior_doc is None else "continued"
+        TRACE.log("planner_decision_anomaly",
+                  note=f"missing or unparseable path; defaulting to {path}")
+    elif parsed_path == "fresh" and prior_doc is not None:
+        TRACE.log("planner_decision_anomaly",
+                  note="path='fresh' but prior plan existed; treating as replaced")
+        path = "replaced"
+    elif parsed_path != "fresh" and prior_doc is None:
+        TRACE.log("planner_decision_anomaly",
+                  note=f"path='{parsed_path}' but no prior plan existed; treating as fresh")
+        path = "fresh"
     else:
-        # In-PBE iteration: take new items as the revised plan
-        final_items = new_items
+        path = parsed_path
+
+    # Apply merge + emit proposal_review trace
+    final_requirements, final_architecture, final_tasks = _apply_planner_merge(
+        prior_doc, path, new_requirements, new_architecture, new_tasks, rationale,
+    )
+    _apply_proposal_review(prior_doc, path, proposal_review_text)
+
+    # pending_proposals is always cleared after planner review.
+    final_doc: dict = {
+        "requirements": final_requirements,
+        "architecture": final_architecture,
+        "tasks": final_tasks,
+        "pending_proposals": [],
+    }
 
     TRACE.log(
         "planner_decision",
         path=path,
         rationale=rationale[:500],
-        prior_existed=prior is not None,
+        prior_existed=prior_doc is not None,
         prior_stale=bool(prior and prior.get("_stale")),
         prior_age_hours=prior["_age_hours"] if prior else None,
-        prior_items=len(prior["items"]) if prior else 0,
-        new_items=len(new_items),
-        final_items=len(final_items),
+        prior_tasks=len((prior_doc or {}).get("tasks", [])),
+        prior_requirements=len((prior_doc or {}).get("requirements", [])),
+        prior_pending_proposals=len(pending_proposals),
+        new_tasks=len(new_tasks),
+        new_requirements=len(new_requirements),
+        new_architecture_subsections=sorted(new_architecture.keys()),
+        final_tasks=len(final_tasks),
+        final_requirements=len(final_requirements),
+        final_architecture_subsections=sorted(final_architecture.keys()),
     )
-    print(f"Plan ({len(final_items)} items, path={path}):\n"
-          f"{_truncate_simple(_render_plan(final_items), 800)}\n")
-    TRACE.log("planner_done", items=len(final_items), plan_text=plan_text[:1000], path=path)
+    print(f"Plan ({len(final_tasks)} tasks, {len(final_requirements)} reqs, "
+          f"path={path}):\n{_truncate_simple(_render_plan_doc(final_doc), 800)}\n")
+    TRACE.log("planner_done",
+              items=len(final_tasks), tasks_text=tasks_text[:1000], path=path)
 
     # Persist + sync the holder so plan-mutating tools and mark_done can find task/replan_count
-    _set_plan_context(task, final_items, replan_count)
-    _persist_plan(task, final_items, replan_count)
+    _set_plan_context(task, final_doc, replan_count)
+    _persist_plan(task, final_doc, replan_count)
 
     return {
         "iteration": iteration,
-        "plan": final_items,
+        "plan": final_doc,
         "builder_instructions": bi,
         "evaluator_instructions": ei,
         "replan_count": replan_count,
@@ -1501,11 +1896,17 @@ async def evaluator_node(state: State) -> dict:
     print(f"\n━━━ EVALUATOR (iteration {state['iteration']}) ━━━")
     TRACE.log("evaluator_start", iteration=state["iteration"])
 
-    plan_render = _render_plan(state.get("plan", []))
+    plan_doc = state.get("plan") or _empty_plan_doc()
+    plan_render = _render_plan_doc(plan_doc)
+    requirements_render = _render_requirements(plan_doc.get("requirements", []))
     prompt = (
-        f"PLAN (current state):\n{plan_render}\n\n"
-        f"YOUR VERIFICATION INSTRUCTIONS:\n{state['evaluator_instructions']}\n\n"
-        f"BUILDER SUMMARY:\n{state['builder_summary']}\n\n"
+        f"REQUIREMENTS (load-bearing contract — verify EACH one is satisfied):\n"
+        f"{requirements_render}\n\n"
+        f"PLAN (current state, includes ARCHITECTURE and TASKS):\n{plan_render}\n\n"
+        f"YOUR VERIFICATION INSTRUCTIONS (planner's specific asks for this iteration):\n"
+        f"{state['evaluator_instructions']}\n\n"
+        f"BUILDER SUMMARY (claim is a starting point, NOT evidence — verify by observation):\n"
+        f"{state['builder_summary']}\n\n"
         f"Verify the work and emit your verdict block at the end."
     )
     text = await _stream_subagent(_evaluator_holder["agent"], prompt, "eval", EVAL_RECURSION_LIMIT)
@@ -1595,7 +1996,7 @@ async def main():
 
         try:
             final = await graph.ainvoke(
-                {"task": user_input, "iteration": 0, "plan": [], "replan_count": 0},
+                {"task": user_input, "iteration": 0, "plan": _empty_plan_doc(), "replan_count": 0},
                 config={"recursion_limit": 200},
             )
             TRACE.end_task(reason="completed", final_iter=final.get("iteration"),
