@@ -23,6 +23,7 @@ import json
 import os
 import pickle
 import re
+import signal
 import socket
 import subprocess
 import time
@@ -44,6 +45,7 @@ from langchain_core.tools import tool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 
@@ -1163,6 +1165,23 @@ def serve_in_background(command: str, port: int, cwd: str = ".") -> str:
     if not work.is_dir():
         return f"ERROR: cwd '{cwd}' is not a directory"
 
+    # Pre-check: refuse if port is already bound. Without this, the post-spawn connect-loop
+    # below would succeed against the existing listener and we'd report a phantom success
+    # (returning the freshly-spawned PID, which is actually crashing with EADDRINUSE in the
+    # background). Make the contract explicit: this function starts a NEW server.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.5)
+        try:
+            probe.connect(("127.0.0.1", port))
+            TRACE.log("tool_result", tool="serve_in_background", ok=False, port=port,
+                      error="port_already_bound")
+            return (
+                f"ERROR: port {port} is already bound by another process. Call stop_servers "
+                f"first to clear it (or pick a different port). Did NOT start a new server."
+            )
+        except (ConnectionRefusedError, socket.timeout, OSError):
+            pass  # port is free, proceed
+
     log_dir = WORKSPACE / ".servers"
     log_dir.mkdir(exist_ok=True)
     log_path = log_dir / f"{port}.log"
@@ -1200,13 +1219,70 @@ def serve_in_background(command: str, port: int, cwd: str = ".") -> str:
     )
 
 
+_STOP_SERVERS_PATTERNS = ("next dev", "next start", "npm run", "node server.js")
+
+
+def _list_processes_matching(patterns: tuple[str, ...]) -> list[tuple[int, str]]:
+    """Walk /proc and return (pid, cmdline) for processes whose cmdline matches any pattern.
+
+    Pure Python — no dependency on procps/pkill, which isn't installed in slim images. /proc
+    is always present in Linux containers; on non-Linux this returns empty.
+    """
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return []
+    own_pid = os.getpid()
+    matches: list[tuple[int, str]] = []
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == own_pid:
+            continue  # never target the harness itself
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except (OSError, FileNotFoundError):
+            continue  # process exited between iterdir and read
+        cmdline = raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+        if not cmdline:
+            continue
+        if any(p in cmdline for p in patterns):
+            matches.append((pid, cmdline))
+    return matches
+
+
 @tool
 def stop_servers() -> str:
-    """Kill all background dev servers in this container."""
-    for pat in ("next dev", "next start", "npm run", "node server.js"):
-        subprocess.run(["pkill", "-f", pat], capture_output=True)
-    TRACE.log("tool_result", tool="stop_servers", ok=True)
-    return "killed background dev servers"
+    """Kill all background dev servers in this container.
+
+    Targets: next dev / next start / npm run / node server.js. SIGTERM first, brief grace
+    period, SIGKILL stragglers. Pure Python — does NOT shell out to pkill (which isn't
+    installed in the slim base image).
+    """
+    matches = _list_processes_matching(_STOP_SERVERS_PATTERNS)
+    sigtermed: list[tuple[int, str]] = []
+    for pid, cmdline in matches:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            sigtermed.append((pid, cmdline))
+        except (ProcessLookupError, PermissionError):
+            pass  # process already gone or not ours
+
+    if sigtermed:
+        time.sleep(0.5)  # grace period for clean shutdown
+        # SIGKILL anything still alive
+        for pid, _ in sigtermed:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    TRACE.log("tool_result", tool="stop_servers", ok=True,
+              killed_count=len(sigtermed), pids=[p for p, _ in sigtermed])
+    if not sigtermed:
+        return "no matching server processes found"
+    summary = "\n".join(f"  pid={p}: {c[:120]}" for p, c in sigtermed)
+    return f"killed {len(sigtermed)} server process(es):\n{summary}"
 
 
 # ────────────────────────── tools: plan management ──────────────────────────
@@ -1671,12 +1747,40 @@ async def verify_completion(
     return json.dumps(parsed, indent=2)
 
 
+def _wrap_verify_with_npm_install(verify_command: str) -> str:
+    """If the verify command runs in a directory containing a package.json, do a clean
+    `npm install` first so dependency-graph problems (ERESOLVE, missing peer deps) surface
+    HERE — during the agent's own loop — instead of on the user's host after handoff.
+
+    The install runs in the SAME directory as the verify_command. We extract a leading
+    `cd <dir> && ...` (or `cd <dir>; ...`) prefix if present so the install lands in the
+    project root; otherwise the persistent shell's cwd is used.
+
+    No-op for non-Node projects (the `[ ! -f package.json ]` guard exits cleanly).
+    """
+    cmd = verify_command.strip()
+    install_check = (
+        "{ [ ! -f package.json ] || "
+        "{ echo '[harness] npm install (validating dependency graph)' && "
+        "npm install --no-fund --no-audit --no-progress; }; }"
+    )
+    m = re.match(r"^(cd\s+\S+\s*(?:&&|;)\s*)(.+)$", cmd, re.DOTALL)
+    if m:
+        cd_prefix, rest = m.group(1), m.group(2)
+        return f"{cd_prefix}{install_check} && {rest}"
+    return f"{install_check} && {cmd}"
+
+
 @tool
 def mark_done(verify_command: str, claim: str, verification_token: str) -> str:
     """Mark the task complete. REQUIRES verification_token from a successful verify_completion.
 
     verify_command: the build/test command that proves the work is correct
-        (e.g., 'cd cms-agency && npm run build').
+        (e.g., 'cd cms-agency && npm run build'). For Node projects (package.json present),
+        the harness automatically runs `npm install` first as part of verification — so
+        ERESOLVE / peer-dep / missing-package errors fail HERE during your loop, not on the
+        user's host. The install uses the same directory as the verify_command (extracted
+        from any leading `cd`).
     claim: short summary of what you accomplished.
     verification_token: the UUID returned by verify_completion when its verdict was "done".
         Tokens are single-use; if verify_command later fails, you must re-verify to get a new one.
@@ -1727,7 +1831,8 @@ def mark_done(verify_command: str, claim: str, verification_token: str) -> str:
         )
 
     sh = _get_shell()
-    result = sh.run(verify_command, timeout=SHELL_COMMAND_TIMEOUT_SECONDS)
+    wrapped = _wrap_verify_with_npm_install(verify_command)
+    result = sh.run(wrapped, timeout=SHELL_COMMAND_TIMEOUT_SECONDS)
     output = result["output"]
     exit_code = result["exit_code"]
     elapsed_ms = result["elapsed_ms"]
@@ -2543,7 +2648,7 @@ async def build_evaluator_subagent():
         mcp_tools = []
     return create_agent(
         evaluator_llm,
-        tools=[view_file, list_dir, run_shell_oneshot, serve_in_background] + mcp_tools,
+        tools=[view_file, list_dir, run_shell_oneshot, serve_in_background, stop_servers] + mcp_tools,
         **{_AGENT_PROMPT_KWARG: EVALUATOR_SYSTEM_PROMPT},
     )
 
@@ -2605,7 +2710,39 @@ async def evaluator_node(state: State) -> dict:
         f"{state['builder_summary']}\n\n"
         f"Verify the work and emit your verdict block at the end."
     )
-    text = await _stream_subagent(_evaluator_holder["agent"], prompt, "eval", EVAL_RECURSION_LIMIT)
+    try:
+        text = await _stream_subagent(_evaluator_holder["agent"], prompt, "eval", EVAL_RECURSION_LIMIT)
+    except GraphRecursionError:
+        # Eval ran out of internal-step budget without producing a verdict. Don't crash the
+        # whole run — return 'continue' with explanatory notes so the next planner can react
+        # (typically by narrowing eval instructions or addressing whatever the eval got stuck on).
+        TRACE.log("evaluator_recursion_limit", limit=EVAL_RECURSION_LIMIT)
+        print(f"\n  EVALUATOR RECURSION LIMIT ({EVAL_RECURSION_LIMIT}) — returning 'continue'.")
+        notes = (
+            f"Evaluator hit its recursion limit of {EVAL_RECURSION_LIMIT} steps without producing "
+            f"a verdict. Likely a debugging loop the eval couldn't escape (e.g. server-restart "
+            f"loop, repeated curl against an unhealthy endpoint). Treat as 'unable to verify'; "
+            f"the next planner should narrow the eval instructions or address obstacles the eval "
+            f"couldn't get past on its own."
+        )
+        print(f"  NOTES: {_truncate_simple(notes, 400)}")
+        return {"eval_verdict": "continue", "eval_notes": notes}
+    except Exception as e:
+        # Defense in depth: any other escape from the eval subagent (tool crash, MCP failure,
+        # langchain internal error) shouldn't kill the whole run. Convert to 'continue' with
+        # the exception summary in notes; full traceback goes to the trace for debugging.
+        # Grep with: jq -c 'select(.kind == "evaluator_exception")' workspace/.trace/*.jsonl
+        import traceback
+        tb = traceback.format_exc()
+        TRACE.log("evaluator_exception", error_type=type(e).__name__,
+                  error=str(e)[:500], traceback=tb[-2000:])
+        print(f"\n  EVALUATOR CRASH ({type(e).__name__}: {str(e)[:200]}) — returning 'continue'.")
+        notes = (
+            f"Evaluator crashed with {type(e).__name__}: {str(e)[:300]}. Treat as 'unable to "
+            f"verify'; the next planner should narrow the eval instructions or check whether "
+            f"a harness tool needs fixing (full traceback in trace as evaluator_exception)."
+        )
+        return {"eval_verdict": "continue", "eval_notes": notes}
     verdict = _extract_verdict(text)
     notes = _extract_notes(text) or text
     print(f"\n  VERDICT: {verdict}")

@@ -46,10 +46,16 @@ NOTES rules:
 
 CROSS-CONTAINER REACHABILITY:
 
+The dev server runs in the langgraph container. You have tools in two containers, and they reach the server by DIFFERENT hostnames. Get this right or you'll waste eval steps chasing phantom failures.
+
+- **`run_shell_oneshot` runs IN the langgraph container.** Use `http://localhost:<port>` (or `127.0.0.1`). Do NOT use `http://langgraph:<port>` — Docker Compose's embedded DNS doesn't resolve a service's own name back to itself, so this fails with `Could not resolve host: langgraph`.
+- **`browser_navigate` (and other Playwright MCP tools) run in the playwright-mcp SIBLING container.** Use `http://langgraph:<port>`. Do NOT use `localhost` or `127.0.0.1` — those resolve to the playwright-mcp container itself, where there's no dev server.
+
+The dev server must also be bound to `0.0.0.0`, not `localhost`, for Playwright to reach it. Next.js needs `-H 0.0.0.0`. If the builder ran `npx next dev` without `-H 0.0.0.0`, `run_shell_oneshot curl http://localhost:3000` works (loopback inside the container) but `browser_navigate http://langgraph:3000` fails (bridge network).
+
 If `browser_navigate` fails to connect (timeout, ECONNREFUSED, "no response"), DO NOT shrug and emit a verdict. Diagnose first:
 
-- The dev server runs in the langgraph container; you (Playwright) are in a sibling container. The URL must be `http://langgraph:<port>`, NOT `localhost` or `127.0.0.1`.
-- The server must be bound to `0.0.0.0`, not `localhost`. Next.js needs `-H 0.0.0.0`. If the builder ran `npx next dev` without `-H 0.0.0.0`, the port is open inside the container but not on the bridge network.
-- The builder may have forgotten to call `serve_in_background` at all — the build compiled but no server is running. Use `run_shell_oneshot` to check (e.g., `ss -tlnp` or `curl -sS http://langgraph:3000`) to confirm.
+- Check from inside langgraph: `run_shell_oneshot curl -sS http://localhost:<port>`. If THIS works, the server is up — the issue is bind address (needs `-H 0.0.0.0`).
+- If `localhost` ALSO fails, the builder may have forgotten to call `serve_in_background`. Check with `run_shell_oneshot ss -tlnp` (look for the port in LISTEN state).
 
 When you diagnose a reachability failure, that's a `continue` with NOTES naming the specific fix the builder needs ("server is not bound to 0.0.0.0; restart with `npx next dev -H 0.0.0.0 -p 3000` via serve_in_background"). It is not a `replan` — the architecture is fine, the builder just misconfigured the server.
