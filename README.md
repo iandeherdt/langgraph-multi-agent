@@ -25,14 +25,15 @@ planner → builder → [router] → evaluator → [router] → planner | END
 START → model → tools → [router] → model | END
 ```
 
-- **Persistent bash session** via `pexpect` — `cd`, `export`, venv activations all survive across `shell()` calls.
+- **Persistent bash session** via `pexpect` — `cd`, `export`, venv activations all survive across `shell()` calls. Spawned with a noninteractive env (`CI=true`, `npm_config_yes=true`, `NEXT_TELEMETRY_DISABLED=1`, etc.) so npm/npx/prisma never reach a prompt. Timeouts trigger an escalating kill (SIGINT → SIGQUIT → respawn) and unconditional reset, so the next call always sees a clean session.
 - **Patch-based file editor**: `view_file` (line-numbered), `str_replace` (unique-match required), `create_file` (errors if exists). No `write_file` — full-file overwrites were the worst pathology in the previous design.
-- **Structured plan in state** with `view_plan` / `update_plan_item` / `add_plan_item` tools. Plan re-renders into the system message every turn — never gets crowded out of context.
+- **Structured plan in state** (v2 schema): requirements + architecture (`stack` / `file_tree` / `data_model` / `key_decisions`, or `summary` for non-coding tasks) + tasks. Plan re-renders into the system message every turn. Builder mutates tasks via `update_plan_item` / `add_plan_item` and can flag architecture changes for planner review via `propose_architecture_change` (queues to a `pending_proposals` list — planner accepts/rejects on next iteration). Capped at `MAX_REPLANS=2` builder-triggered replans per task.
 - **Step budget** rendered into every model turn (`Step 14 of 50, 36 tool calls remaining`), escalating to BUDGET WARNING and FINAL STEP.
 - **Verification gate**: builder cannot exit by trailing off — must call `mark_done(verify_command, claim)` which actually runs the verify command and only exits on exit code 0. Two other clean exits: `request_user_help`, `give_up`.
 - **Stuck detector** — three heuristics (edit churn, build-error stagnation, tool repetition) with thresholds named at the top of `graph.py`.
 - **Per-edit syntax check** for `.py` (`py_compile`) and `.js/.cjs/.mjs` (`node --check`). TS/TSX deferred — single-file checks aren't meaningful for cross-file imports.
 - **Smart truncation** (head + tail with byte-elision marker) on shell output.
+- **Live progress** while things are running: planner and builder token-stream their output to stdout under `[planner]` / `[builder]` prefixes; long-running tools emit heartbeat ticks every 20s (`·· shell [40s, 4096B, +1024, last: "Downloading next@14..."]`), with `STUCK` flagged when stdout-bytes don't grow between ticks. All ticks also land in the trace as `tool_progress` events.
 
 **Trace logging:** every tool call, tool result, state transition, stuck-detector firing, plan update, and exit reason is written as one line of JSONL to `workspace/.trace/<UTC>-<slug>.jsonl`. Without this you can't tell if harness changes actually helped.
 
@@ -75,6 +76,7 @@ All of these are named constants at the top of `graph.py`:
 MAX_PBE_ITERATIONS = 5
 MAX_BUILDER_STEPS = 50
 BUILDER_BUDGET_WARNING_THRESHOLD = 10
+MAX_REPLANS = 2
 
 STUCK_EDIT_REPEAT_THRESHOLD = 3
 STUCK_EDIT_WINDOW = 10
@@ -83,8 +85,14 @@ STUCK_BUILD_HISTORY = 3
 STUCK_TOOL_REPEAT = 2
 STUCK_INJECTION_CAP = 3
 
+SHELL_COMMAND_TIMEOUT_SECONDS = 300
 SHELL_OUTPUT_HEAD_BYTES = 2000
 SHELL_OUTPUT_TAIL_BYTES = 5000
+SHELL_KILL_SIGINT_WAIT = 3      # before escalating to SIGQUIT
+SHELL_KILL_SIGQUIT_WAIT = 2     # before escalating to respawn
+
+HEARTBEAT_THRESHOLD_SECONDS = 10  # don't tick on fast tools
+HEARTBEAT_INTERVAL_SECONDS = 20   # tick cadence after threshold
 ```
 
 Tune from real validation runs (the trace logs are designed for this).
