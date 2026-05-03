@@ -26,7 +26,7 @@ import socket
 import subprocess
 import time
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Literal
 from typing_extensions import TypedDict
@@ -41,9 +41,11 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 
 try:
-    from langchain.agents import create_agent  # V1 (langchain>=1.0)
+    from langchain.agents import create_agent  # V1 (langchain>=1.0): kwarg is `system_prompt`
+    _AGENT_PROMPT_KWARG = "system_prompt"
 except ImportError:
-    from langgraph.prebuilt import create_react_agent as create_agent  # fallback
+    from langgraph.prebuilt import create_react_agent as create_agent  # legacy: kwarg is `prompt`
+    _AGENT_PROMPT_KWARG = "prompt"
 
 
 # ────────────────────────── constants ──────────────────────────
@@ -85,9 +87,19 @@ STUCK_BUILD_ERROR_REPEAT = 2          # same build-error fingerprint in ≥ this
 STUCK_BUILD_HISTORY = 3               # K = window for build-error comparison
 STUCK_TOOL_REPEAT = 2                 # identical (tool, args) consecutively ≥ this → fire
 STUCK_INJECTION_CAP = 3               # max stuck-injection messages before forced exit
+NO_TOOL_CALL_REMINDER_CAP = 2         # consecutive no-tool-call turns before exit_signal=abandoned
 
 # Background server
 SERVER_PORT_LISTEN_TIMEOUT_SECONDS = 30
+
+# Skill files (system prompts live in skills/<name>/SKILL.md, loaded at import).
+SKILLS_DIR = Path(__file__).parent / "skills"
+
+# Plan persistence
+CURRENT_PLAN_PATH = TRACE_DIR / "current-plan.json"
+CURRENT_PLAN_VERSION = 1
+MAX_REPLANS = 2                       # cap on builder-triggered revise_plan calls per task
+STALE_PLAN_HOURS = 24                 # v1 — expected to change after usage data; bump as needed
 
 
 # ────────────────────────── trace logger ──────────────────────────
@@ -153,6 +165,18 @@ TRACE = TraceLogger(TRACE_DIR)
 
 
 # ────────────────────────── helpers ──────────────────────────
+
+
+def _load_skill(name: str) -> str:
+    """Load skills/<name>/SKILL.md verbatim. Read at module import; restart to reload.
+
+    System prompts live as markdown files (diffable, editable as docs) instead of triple-quoted
+    Python literals. The harness only loads them — content authority lives in the .md file.
+    """
+    p = SKILLS_DIR / name / "SKILL.md"
+    if not p.exists():
+        raise FileNotFoundError(f"Skill not found: {p}")
+    return p.read_text()
 
 
 def _resolve(path: str) -> Path:
@@ -672,8 +696,9 @@ def stop_servers() -> str:
 
 
 # LangChain @tool functions can't easily access LangGraph state; use a module-level holder
-# that the builder graph populates before invoking tools and reads back after.
-_plan_holder: dict = {"items": []}
+# that the planner/builder populate before invoking tools and read back after.
+# Holds: items (the live plan), task (current outer task), replan_count (cap tracking).
+_plan_holder: dict = {"items": [], "task": "", "replan_count": 0}
 
 
 def _set_plan(items: list[dict]) -> None:
@@ -682,6 +707,82 @@ def _set_plan(items: list[dict]) -> None:
 
 def _get_plan() -> list[dict]:
     return _plan_holder["items"]
+
+
+def _set_plan_context(task: str, items: list[dict], replan_count: int) -> None:
+    """Sync the holder with the current outer-task context. Called from planner_node and builder_node."""
+    _plan_holder["task"] = task
+    _plan_holder["items"] = items
+    _plan_holder["replan_count"] = replan_count
+
+
+def _persist_plan(task: str, items: list[dict], replan_count: int) -> None:
+    """Atomic write to CURRENT_PLAN_PATH. tmp + rename so a crash mid-write doesn't corrupt."""
+    payload = {
+        "version": CURRENT_PLAN_VERSION,
+        "task": task,
+        "items": items,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "trace_file": TRACE.path.name if TRACE.path else None,
+        "replan_count": replan_count,
+    }
+    CURRENT_PLAN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CURRENT_PLAN_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2))
+    tmp.replace(CURRENT_PLAN_PATH)
+
+
+def _persist_current_plan() -> None:
+    """Persist using the current _plan_holder. Called from plan-mutating tools."""
+    _persist_plan(
+        _plan_holder.get("task", ""),
+        _plan_holder.get("items", []),
+        _plan_holder.get("replan_count", 0),
+    )
+
+
+def _load_persisted_plan() -> dict | None:
+    """Load the prior plan, if any. Always emits a plan_load_failed trace event for any
+    non-OK outcome (missing | corrupt | version_mismatch | stale).
+
+    Note: stale plans are still RETURNED (with _stale=True) so the planner can reason about
+    them as advisory context — only missing/corrupt/version_mismatch return None.
+    """
+    if not CURRENT_PLAN_PATH.exists():
+        TRACE.log("plan_load_failed", reason="missing")
+        return None
+    try:
+        payload = json.loads(CURRENT_PLAN_PATH.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        TRACE.log("plan_load_failed", reason="corrupt", error=str(e))
+        return None
+    if payload.get("version") != CURRENT_PLAN_VERSION:
+        TRACE.log("plan_load_failed", reason="version_mismatch",
+                  found_version=payload.get("version"))
+        return None
+    try:
+        updated = datetime.fromisoformat(payload["updated_at"])
+    except (KeyError, ValueError) as e:
+        TRACE.log("plan_load_failed", reason="corrupt", error=f"updated_at: {e}")
+        return None
+    age = datetime.now(timezone.utc) - updated
+    if age > timedelta(hours=STALE_PLAN_HOURS):
+        TRACE.log("plan_load_failed", reason="stale",
+                  age_hours=round(age.total_seconds() / 3600, 1))
+        payload["_stale"] = True
+        # fall through — still return; planner uses it as advisory
+    payload["_age_hours"] = round(age.total_seconds() / 3600, 2)
+    return payload
+
+
+def _extract_decision_path(decision_text: str) -> str | None:
+    m = re.search(r"path:\s*(fresh|continued|replaced)", decision_text, re.IGNORECASE)
+    return m.group(1).lower() if m else None
+
+
+def _extract_decision_rationale(decision_text: str) -> str:
+    m = re.search(r"rationale:\s*(.+?)(?=\n[a-z_]+:|\Z)", decision_text, re.DOTALL | re.IGNORECASE)
+    return m.group(1).strip() if m else ""
 
 
 @tool
@@ -701,6 +802,7 @@ def update_plan_item(id: int, status: str, notes: str = "") -> str:
             if notes:
                 it["notes"] = notes
             TRACE.log("plan_update", id=id, status=status, notes=notes[:200])
+            _persist_current_plan()
             return f"updated item {id}: {status}"
     return f"ERROR: no plan item with id={id}"
 
@@ -721,6 +823,7 @@ def add_plan_item(text: str, after_id: int | None = None) -> str:
         else:
             return f"ERROR: no plan item with id={after_id}"
     TRACE.log("plan_add", id=new_id, text=text[:200])
+    _persist_current_plan()
     return f"added item {new_id}"
 
 
@@ -739,15 +842,28 @@ def _reset_exit() -> None:
 
 @tool
 def mark_done(verify_command: str, claim: str) -> str:
-    """Mark the task complete. RUNS verify_command in the persistent shell first.
+    """Mark the task complete. Plan must be resolved; runs verify_command first.
 
     verify_command: the build/test command that proves the work is correct
         (e.g., 'cd cms-agency && npm run build').
     claim: short summary of what you accomplished.
 
+    Plan resolution rules (enforced before verify):
+    - Items in 'doing' state cause an error: resolve them via update_plan_item first.
+    - Items in 'todo' state are auto-promoted to 'done' (you're claiming the task is complete).
+    - Items in 'blocked' state stay blocked.
+
     If verify_command's exit code != 0, the failure is returned and the loop continues —
     you CANNOT exit until verification passes (or you call request_user_help / give_up).
     """
+    plan = _get_plan()
+    doing_ids = [it["id"] for it in plan if it["status"] == "doing"]
+    if doing_ids:
+        return (
+            f"ERROR: cannot mark_done while plan items {doing_ids} are still in 'doing' state. "
+            f"Update them to 'done' or 'blocked' first via update_plan_item."
+        )
+
     sh = _get_shell()
     result = sh.run(verify_command, timeout=SHELL_COMMAND_TIMEOUT_SECONDS)
     output = result["output"]
@@ -755,10 +871,18 @@ def mark_done(verify_command: str, claim: str) -> str:
     elapsed_ms = result["elapsed_ms"]
 
     if exit_code == 0:
+        # Promote todo → done and persist ONLY after verify passes — otherwise a failed verify
+        # would leave the persisted plan claiming completion the work doesn't actually have.
+        for it in plan:
+            if it["status"] == "todo":
+                it["status"] = "done"
+        _set_plan(plan)
+        _persist_current_plan()
         _exit_holder["signal"] = "done"
         _exit_holder["payload"] = {"claim": claim, "verify_command": verify_command}
         TRACE.log("builder_exit", reason="done",
                   verify_command=verify_command, claim=claim[:500], elapsed_ms=elapsed_ms)
+        TRACE.log("task_completed_with_plan", items=plan, claim=claim[:500])
         return f"VERIFIED: {verify_command} passed (exit 0, {elapsed_ms}ms). Builder exiting as 'done'."
 
     truncated = _truncate_head_tail(output, SHELL_OUTPUT_HEAD_BYTES, SHELL_OUTPUT_TAIL_BYTES)
@@ -791,6 +915,19 @@ def give_up(reason: str) -> str:
     _exit_holder["payload"] = {"reason": reason}
     TRACE.log("builder_exit", reason="give_up", explanation=reason[:500])
     return "giving up. builder exiting."
+
+
+@tool
+def revise_plan(rationale: str) -> str:
+    """Trigger a replan: exit the builder loop and route back to the planner with rationale.
+
+    Use when you discover the plan is fundamentally wrong (missing requirements, wrong
+    framework, etc.). Capped at 2 replans per task to prevent loops.
+    """
+    _exit_holder["signal"] = "replan"
+    _exit_holder["payload"] = {"rationale": rationale}
+    TRACE.log("builder_exit", reason="replan", rationale=rationale[:500])
+    return f"replan signal sent. rationale: {rationale}"
 
 
 # ────────────────────────── stuck detector ──────────────────────────
@@ -880,94 +1017,11 @@ evaluator_llm = _openrouter_llm(os.environ.get("EVAL_MODEL", "qwen/qwen3.6-27b")
 # ────────────────────────── prompts ──────────────────────────
 
 
-PLANNER_PROMPT = """You are the PLANNER in a multi-stage AI coding system. You write the plan AND the explicit prompts for two downstream models that will execute it.
+PLANNER_PROMPT = _load_skill("planning")
 
-DOWNSTREAM MODELS:
-- BUILDER (Qwen3-Coder-Next, custom StateGraph): coding agent with tools:
-  - shell(command): bash, PERSISTENT session (cwd, env, venv survive across calls)
-  - shell_reset(): reset the bash session
-  - view_file(path, start, end): line-numbered file reads
-  - str_replace(path, old_str, new_str): unique-match patch edit (use this for ALL edits to existing files)
-  - create_file(path, content): new files only
-  - list_dir(path)
-  - serve_in_background(command, port, cwd): detached dev server
-  - stop_servers()
-  - view_plan, update_plan_item, add_plan_item: structured plan management
-  - mark_done(verify_command, claim): EXIT — runs verify_command, only exits if exit code 0
-  - request_user_help(reason, what_you_tried): EXIT for human input
-  - give_up(reason): EXIT for infeasible tasks
-  Step budget per iteration is 50 tool calls. Stuck detector watches for repeat-edit / build-error / tool-repeat patterns.
+BUILDER_BASE_SYSTEM_PROMPT = _load_skill("building")
 
-- EVALUATOR (Qwen3.6-27B, vision-capable, ReAct): with read-only file tools (view_file, list_dir, run_shell_oneshot) + Playwright MCP browser tools (browser_navigate, browser_take_screenshot, browser_snapshot, browser_click, ...). Verifies builder output via BOTH code inspection and screenshot review.
-
-ARCHITECTURE: builder spawns dev servers inside the langgraph container. Playwright runs in a sibling container. The evaluator browses to http://langgraph:3000 (or whichever port). Dev servers MUST bind to 0.0.0.0 for cross-container reachability.
-
-Output strictly with these section headers:
-
-# PLAN
-A markdown checklist of concrete steps. Format each as `- text`. The builder will see them as structured items it can mark done/blocked.
-
-# BUILDER_INSTRUCTIONS
-A self-contained prompt for the builder. Cover:
-- exactly what to build/fix this iteration
-- relevant file paths and conventions
-- explicit reminders: --yes/-y for npm/npx; bind dev server to 0.0.0.0; non-interactive only
-- IMPORTANT: tell the builder to call mark_done(verify_command='<the actual build command>', claim='...') when finished — this is REQUIRED to exit
-- if the workspace already has prior work, instruct it to inspect with list_dir/view_file first
-
-# EVALUATOR_INSTRUCTIONS
-A self-contained prompt for the evaluator. Cover:
-- shell commands to run for code verification (e.g. `cd /workspace/cms-agency && npm run build` and check exit 0)
-- which files to inspect
-- which URLs to browse via browser_navigate, then browser_take_screenshot
-- explicit visual criteria
-- the criteria for done / continue / replan
-
-If you have prior eval feedback, factor it in. Don't repeat builder steps that already succeeded — focus on what's still broken or missing."""
-
-BUILDER_BASE_SYSTEM_PROMPT = """You are the BUILDER. The PLANNER has given you instructions for THIS iteration only.
-
-TOOLS:
-- shell(command): bash with PERSISTENT state — cwd, env, venv survive between calls. ALWAYS pass --yes / -y for npm/npx.
-- shell_reset(): only when state is corrupted.
-- view_file(path, start=1, end=None): line-numbered reads. Use BEFORE editing to confirm exact text.
-- str_replace(path, old_str, new_str): unique-match patch. old_str MUST match exactly once. THIS IS THE PRIMARY EDIT TOOL. Never recreate a file just to fix a few lines.
-- create_file(path, content): NEW files only. Errors if file exists.
-- list_dir(path): list directory.
-- serve_in_background(command, port, cwd): detached dev server. For Next.js: `npx next dev -H 0.0.0.0 -p 3000`.
-- stop_servers().
-- view_plan / update_plan_item(id, status, notes) / add_plan_item(text, after_id): work the structured plan.
-- mark_done(verify_command, claim): EXIT — runs verify_command and ONLY exits if exit 0. This is the only "done" path.
-- request_user_help(reason, what_you_tried): EXIT for human input.
-- give_up(reason): EXIT for infeasible tasks.
-
-RUNTIMES: python 3.12, node 22, npm, git.
-
-WORKFLOW:
-1. view_plan to see what needs doing.
-2. If workspace has prior work, list_dir / view_file to understand it BEFORE editing.
-3. Mark items in_progress with update_plan_item, do them, mark done.
-4. When everything in the plan is done, call mark_done with the project's actual verify command (e.g., `cd <project> && npm run build`).
-5. NEVER fabricate success. If a command fails, surface the error verbatim. If you can't make progress, call request_user_help."""
-
-EVALUATOR_SYSTEM_PROMPT = """You are the EVALUATOR. The PLANNER gave you specific verification instructions; the BUILDER just finished.
-
-TOOLS (read-only):
-- view_file, list_dir, run_shell_oneshot — code verification.
-- Playwright MCP: browser_navigate, browser_take_screenshot, browser_snapshot, browser_click, etc. — visual verification. You have vision; you CAN inspect the screenshots.
-
-WORKFLOW:
-1. Run the code verifications the planner specified.
-2. browser_navigate to the URLs, browser_take_screenshot, judge them against the criteria.
-3. End your response with EXACTLY this verdict block:
-
-VERDICT: done|continue|replan
-NOTES: <one paragraph of specific feedback. State what works, what doesn't, what's missing. Reference specific files / build errors / visual defects.>
-
-Definitions:
-- done: all planner-specified criteria met (code AND visual).
-- continue: most criteria met, specific things still need work.
-- replan: builder followed the plan correctly but the result is fundamentally off-target. Sparingly."""
+EVALUATOR_SYSTEM_PROMPT = _load_skill("evaluating")
 
 
 # ────────────────────────── outer state ──────────────────────────
@@ -984,6 +1038,7 @@ class State(TypedDict):
     builder_exit_payload: dict
     eval_verdict: str
     eval_notes: str
+    replan_count: int  # how many times the builder has triggered revise_plan in this task
 
 
 # ────────────────────────── builder state graph ──────────────────────────
@@ -998,6 +1053,7 @@ class BuilderState(TypedDict):
     shell_history: list  # [{cmd, exit_code, error_fingerprint, is_build, step}]
     tool_history: list  # [(tool_name, args_hash)]
     stuck_injections: int
+    no_tool_call_streak: int  # consecutive turns where the model produced text but no tool call
 
 
 def _builder_tools() -> list:
@@ -1006,7 +1062,7 @@ def _builder_tools() -> list:
         shell, shell_reset, list_dir,
         serve_in_background, stop_servers,
         view_plan, update_plan_item, add_plan_item,
-        mark_done, request_user_help, give_up,
+        mark_done, request_user_help, give_up, revise_plan,
     ]
 
 
@@ -1051,11 +1107,31 @@ async def builder_tools_node(state: BuilderState) -> dict:
     """Dispatch tool calls; update edit/shell/tool history for stuck detection."""
     last = state["messages"][-1]
     if not getattr(last, "tool_calls", None):
-        # Model produced text without a tool call — treat as abandonment.
-        _exit_holder["signal"] = "abandoned"
-        _exit_holder["payload"] = {"final_text": str(last.content or "")[:1000]}
-        TRACE.log("builder_exit", reason="abandoned", final_text=str(last.content or "")[:500])
-        return {}
+        # Model produced text without a tool call. Standard ReAct would exit here, but we have
+        # explicit exit tools (mark_done / request_user_help / give_up) the model is supposed to
+        # call. Inject a reminder and let the loop continue; only exit after enough consecutive
+        # text-only turns to know the model isn't going to engage.
+        streak = state.get("no_tool_call_streak", 0) + 1
+        if streak >= NO_TOOL_CALL_REMINDER_CAP:
+            _exit_holder["signal"] = "abandoned"
+            _exit_holder["payload"] = {
+                "final_text": str(last.content or "")[:1000],
+                "no_tool_call_streak": streak,
+            }
+            TRACE.log("builder_exit", reason="abandoned",
+                      final_text=str(last.content or "")[:500], streak=streak)
+            return {"no_tool_call_streak": streak}
+        TRACE.log("no_tool_call_reminder", streak=streak)
+        reminder = SystemMessage(content=(
+            "REMINDER: you produced text but no tool call. You MUST call one of the exit tools "
+            "to end the loop:\n"
+            "- mark_done(verify_command, claim): if the work is complete (runs verify_command; "
+            "only succeeds on exit code 0)\n"
+            "- request_user_help(reason, what_you_tried): if you're stuck and need human input\n"
+            "- give_up(reason): if the task is infeasible as specified\n\n"
+            "Otherwise, continue working: call the appropriate tool for your next concrete step."
+        ))
+        return {"messages": [reminder], "no_tool_call_streak": streak}
 
     tools_by_name = {t.name: t for t in _builder_tools()}
 
@@ -1129,6 +1205,7 @@ async def builder_tools_node(state: BuilderState) -> dict:
         "shell_history": new_shells,
         "tool_history": new_tools,
         "step": step + 1,
+        "no_tool_call_streak": 0,  # reset: model engaged with tools this turn
     }
 
 
@@ -1189,6 +1266,13 @@ async def builder_node(outer_state: State) -> dict:
     TRACE.log("builder_start", iteration=outer_state["iteration"])
     _reset_exit()
 
+    # Sync holder so plan-mutating tools and mark_done can persist with the right task/replan_count.
+    _set_plan_context(
+        outer_state["task"],
+        outer_state["plan"],
+        outer_state.get("replan_count", 0),
+    )
+
     initial_messages: list = [HumanMessage(content=outer_state["builder_instructions"])]
     builder_state: BuilderState = {
         "messages": initial_messages,
@@ -1199,6 +1283,7 @@ async def builder_node(outer_state: State) -> dict:
         "shell_history": [],
         "tool_history": [],
         "stuck_injections": 0,
+        "no_tool_call_streak": 0,
     }
 
     final = await _builder_graph.ainvoke(
@@ -1228,18 +1313,62 @@ async def planner_node(state: State) -> dict:
     TRACE.set_iter(iteration)
     TRACE.set_step(0)
 
+    # Increment replan_count when entering after a builder revise_plan signal
+    replan_count = state.get("replan_count", 0)
+    came_from_revise = state.get("builder_exit_signal") == "replan"
+    if came_from_revise:
+        replan_count += 1
+
+    # On the first iteration of a new outer task, attempt to load the persisted prior plan.
+    # On in-PBE iterations (replan from evaluator or builder), state already carries the plan.
+    prior = _load_persisted_plan() if iteration == 1 else None
+
+    # Build the user-message content
     if iteration == 1:
-        msg = f"USER TASK:\n{task}\n\nWrite the plan and instructions for iteration 1."
+        if prior is not None:
+            stale_block = ""
+            if prior.get("_stale"):
+                stale_block = (
+                    f"\n[NOTE: prior plan is older than {STALE_PLAN_HOURS}h "
+                    f"(_age_hours={prior['_age_hours']}). Treat as ADVISORY ONLY: default to "
+                    f"'replaced' unless the new task explicitly references the prior work.]\n"
+                )
+            prior_block = (
+                f"\n\n# PRIOR PLAN CONTEXT\n"
+                f"Prior task: {prior['task']}\n"
+                f"Prior updated_at: {prior['updated_at']}\n"
+                f"_age_hours: {prior['_age_hours']}\n"
+                f"_stale: {prior.get('_stale', False)}\n"
+                f"Prior items:\n```json\n{json.dumps(prior['items'], indent=2)}\n```"
+                f"{stale_block}"
+            )
+        else:
+            prior_block = "\n\n# PRIOR PLAN CONTEXT\n(no prior plan exists)"
+        msg = (
+            f"USER TASK:\n{task}{prior_block}\n\n"
+            f"Decide path (fresh | continued | replaced), then emit # DECISION, # PLAN, "
+            f"# BUILDER_INSTRUCTIONS, # EVALUATOR_INSTRUCTIONS."
+        )
     else:
         plan_render = _render_plan(state["plan"]) if state.get("plan") else "(none)"
+        revise_block = ""
+        if came_from_revise:
+            revise_block = (
+                f"\nBUILDER CALLED revise_plan WITH RATIONALE:\n"
+                f"{state.get('builder_exit_payload', {}).get('rationale', '?')}\n"
+                f"(Replan count after this iteration: {replan_count}/{MAX_REPLANS})\n"
+            )
         msg = (
             f"USER TASK:\n{task}\n\n"
             f"PRIOR ITERATION ({iteration - 1}) PLAN:\n{plan_render}\n\n"
             f"PRIOR BUILDER SUMMARY:\n{state.get('builder_summary', '(none)')}\n\n"
             f"PRIOR BUILDER EXIT SIGNAL: {state.get('builder_exit_signal', '?')}\n"
+            f"{revise_block}"
             f"PRIOR EVALUATOR VERDICT: {state.get('eval_verdict', 'continue')}\n"
             f"PRIOR EVALUATOR NOTES:\n{state.get('eval_notes', '(none)')}\n\n"
-            f"Write the revised plan and instructions for iteration {iteration}."
+            f"Write the revised plan and instructions for iteration {iteration}. "
+            f"Emit # DECISION (path: continued | replaced), # PLAN, "
+            f"# BUILDER_INSTRUCTIONS, # EVALUATOR_INSTRUCTIONS."
         )
 
     print(f"\n━━━ PLANNER (iteration {iteration}) ━━━")
@@ -1248,18 +1377,71 @@ async def planner_node(state: State) -> dict:
         HumanMessage(content=msg),
     ])
     text = response.content if isinstance(response.content, str) else str(response.content)
+
+    decision_text = _extract_section(text, "DECISION")
+    path = _extract_decision_path(decision_text) or ("fresh" if prior is None else "replaced")
+    rationale = _extract_decision_rationale(decision_text) or "(none provided)"
+
     plan_text = _extract_section(text, "PLAN")
-    plan_items = _parse_plan(plan_text)
+    new_items = _parse_plan(plan_text)
     bi = _extract_section(text, "BUILDER_INSTRUCTIONS")
     ei = _extract_section(text, "EVALUATOR_INSTRUCTIONS")
 
-    print(f"Plan ({len(plan_items)} items):\n{_truncate_simple(_render_plan(plan_items), 800)}\n")
-    TRACE.log("planner_done", items=len(plan_items), plan_text=plan_text[:1000])
+    # Apply path. Only relevant when prior was loaded (iteration == 1 path); replans during a
+    # task always take the new items as the revised plan (planner already saw the prior in state).
+    if iteration == 1 and prior is not None:
+        if path == "continued":
+            base_id = max((it["id"] for it in prior["items"]), default=0)
+            renumbered = [{**it, "id": base_id + i + 1} for i, it in enumerate(new_items)]
+            final_items = prior["items"] + renumbered
+        elif path == "replaced":
+            abandoned = [it for it in prior["items"] if it["status"] != "done"]
+            if abandoned:
+                TRACE.log("prior_plan_abandoned", abandoned_items=abandoned, count=len(abandoned))
+            TRACE.log("planner_replaced", rationale=rationale[:500],
+                      prior_plan=prior["items"], new_plan=new_items)
+            final_items = new_items
+        else:  # path == "fresh" but a prior existed — anomalous, treat as replaced
+            TRACE.log("planner_decision_anomaly",
+                      note=f"path='fresh' but prior plan existed; treating as replaced")
+            abandoned = [it for it in prior["items"] if it["status"] != "done"]
+            if abandoned:
+                TRACE.log("prior_plan_abandoned", abandoned_items=abandoned, count=len(abandoned))
+            final_items = new_items
+    elif iteration == 1 and prior is None:
+        if path != "fresh":
+            TRACE.log("planner_decision_anomaly",
+                      note=f"path='{path}' but no prior plan existed; treating as fresh")
+        final_items = new_items
+    else:
+        # In-PBE iteration: take new items as the revised plan
+        final_items = new_items
+
+    TRACE.log(
+        "planner_decision",
+        path=path,
+        rationale=rationale[:500],
+        prior_existed=prior is not None,
+        prior_stale=bool(prior and prior.get("_stale")),
+        prior_age_hours=prior["_age_hours"] if prior else None,
+        prior_items=len(prior["items"]) if prior else 0,
+        new_items=len(new_items),
+        final_items=len(final_items),
+    )
+    print(f"Plan ({len(final_items)} items, path={path}):\n"
+          f"{_truncate_simple(_render_plan(final_items), 800)}\n")
+    TRACE.log("planner_done", items=len(final_items), plan_text=plan_text[:1000], path=path)
+
+    # Persist + sync the holder so plan-mutating tools and mark_done can find task/replan_count
+    _set_plan_context(task, final_items, replan_count)
+    _persist_plan(task, final_items, replan_count)
+
     return {
         "iteration": iteration,
-        "plan": plan_items,
+        "plan": final_items,
         "builder_instructions": bi,
         "evaluator_instructions": ei,
+        "replan_count": replan_count,
     }
 
 
@@ -1278,13 +1460,16 @@ async def build_evaluator_subagent():
         mcp_tools = await client.get_tools()
         print(f"  Loaded {len(mcp_tools)} Playwright MCP tools")
     except Exception as e:
-        print(f"  WARN: failed to connect to Playwright MCP at {mcp_url}: {e}")
+        print(f"  WARN: failed to connect to Playwright MCP at {mcp_url}: {type(e).__name__}: {e}")
+        # asyncio.TaskGroup wraps real causes; surface them so we know what to fix.
+        for sub in getattr(e, "exceptions", ()):
+            print(f"    cause: {type(sub).__name__}: {sub}")
         print("  WARN: evaluator will run with code-only tools (no screenshots).")
         mcp_tools = []
     return create_agent(
         evaluator_llm,
         tools=[view_file, list_dir, run_shell_oneshot, serve_in_background] + mcp_tools,
-        prompt=EVALUATOR_SYSTEM_PROMPT,
+        **{_AGENT_PROMPT_KWARG: EVALUATOR_SYSTEM_PROMPT},
     )
 
 
@@ -1340,6 +1525,12 @@ def route_after_builder(state: State) -> Literal["evaluator", "planner", "__end_
     if sig in ("help", "give_up"):
         print(f"\n━━━ Builder exited '{sig}': ending task. ━━━")
         return END
+    if sig == "replan":
+        if state.get("replan_count", 0) >= MAX_REPLANS:
+            print(f"\n━━━ Stopped: max replans ({MAX_REPLANS}) reached. ━━━")
+            TRACE.log("replan_capped", replan_count=state.get("replan_count", 0))
+            return END
+        return "planner"
     if state["iteration"] >= MAX_PBE_ITERATIONS:
         print(f"\n━━━ Stopped: max PBE iterations ({MAX_PBE_ITERATIONS}) reached. ━━━")
         return END
@@ -1404,7 +1595,7 @@ async def main():
 
         try:
             final = await graph.ainvoke(
-                {"task": user_input, "iteration": 0, "plan": []},
+                {"task": user_input, "iteration": 0, "plan": [], "replan_count": 0},
                 config={"recursion_limit": 200},
             )
             TRACE.end_task(reason="completed", final_iter=final.get("iteration"),
