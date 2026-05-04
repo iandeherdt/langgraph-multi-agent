@@ -3376,7 +3376,55 @@ async def _maybe_resume(saver: AsyncSqliteSaver) -> dict | None:
 # ────────────────────────── main loop ──────────────────────────
 
 
+def _check_service_alias_or_warn() -> None:
+    """If we're inside a docker compose run container without --use-aliases, the service-name
+    DNS alias `langgraph` won't be registered on the project network, and the playwright-mcp
+    sibling can't reach the dev server the builder spawns (browser_navigate fails with
+    NS_ERROR_UNKNOWN_HOST). Detect and warn loudly at startup so the user fixes the
+    invocation before sinking minutes into a doomed run.
+
+    Detection: try resolving our own service name. If it resolves to our own IP, --use-aliases
+    was used (or the user is running outside docker entirely). If it doesn't resolve at all
+    OR resolves to a different IP, the alias is missing.
+    """
+    import socket
+    try:
+        own_hostname = socket.gethostname()
+        own_ips = {info[4][0] for info in socket.getaddrinfo(own_hostname, None)}
+    except Exception:
+        return  # don't break startup on weird hostname configs
+    try:
+        alias_ips = {info[4][0] for info in socket.getaddrinfo("langgraph", None)}
+    except socket.gaierror:
+        # `langgraph` doesn't resolve at all → either we're outside docker (fine, the user
+        # is running locally) or we're in a compose-run container without the alias.
+        # Distinguish by checking for /.dockerenv.
+        if Path("/.dockerenv").exists():
+            print(
+                "\n  ⚠  WARNING: docker compose run started this container WITHOUT the\n"
+                "     `langgraph` service-name DNS alias. The playwright-mcp sibling will\n"
+                "     not be able to reach this container by service name, so\n"
+                "     browser_navigate('http://langgraph:<port>/...') will fail with\n"
+                "     NS_ERROR_UNKNOWN_HOST. Re-run with `--use-aliases`:\n"
+                "         docker compose run --rm --use-aliases langgraph\n"
+                "     or use the wrapper:  ./run.sh\n",
+                flush=True,
+            )
+        return
+    if not (alias_ips & own_ips):
+        # `langgraph` resolves but to a different IP — there's another container with the
+        # alias on this network. Almost certainly a stale `compose up` container. Warn.
+        print(
+            f"\n  ⚠  WARNING: `langgraph` DNS alias resolves to {alias_ips} but our own IP\n"
+            f"     is {own_ips}. Another container is claiming the service alias; the\n"
+            f"     evaluator's browser_navigate calls will hit the wrong container.\n"
+            f"     Run `docker compose down` and start fresh with `./run.sh`.\n",
+            flush=True,
+        )
+
+
 async def main():
+    _check_service_alias_or_warn()
     print(f"Planner:   {planner_llm.model}  (Anthropic)")
     print(f"Builder:   {builder_llm.model_name}  (via {builder_llm.openai_api_base})")
     print(f"Evaluator: {evaluator_llm.model_name}  (via {evaluator_llm.openai_api_base})")
