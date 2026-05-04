@@ -20,4 +20,24 @@ FROM mcr.microsoft.com/playwright:v1.49.0-jammy
 #   1. Run `docker run --rm <image> playwright-mcp --help` and confirm flags still match
 #      (--port, --host, --headless, --browser, --allowed-hosts).
 #   2. Rebuild and verify the langgraph container can curl the /sse endpoint.
+#   3. Re-run the firefox install step below — the MCP's bundled Playwright pins a specific
+#      browser revision, so the version that gets installed will follow the MCP version.
 RUN npm install -g @playwright/mcp@0.0.73
+
+# Install the Firefox revision the MCP's bundled Playwright actually wants.
+#
+# Why this is needed: the base image (Playwright v1.49) ships Firefox revision 1466. But
+# @playwright/mcp@0.0.73 depends on a Playwright pre-release (1.60.0-alpha-...) that
+# expects Firefox revision 1515. Mismatch → runtime error "Browser firefox is not installed
+# at /ms-playwright/firefox-1515/firefox/firefox" the first time the MCP tries to launch a
+# page. We install the right revision at build time so the container boots ready.
+#
+# Why we shell into the MCP's node_modules: /usr/bin/playwright-mcp's `playwright-core`
+# resolves to the alpha version. Running cli.js from there picks up that version's browser
+# registry; running `npx playwright` at the system level would use whatever older
+# playwright-core sits in $PATH and download the wrong revision.
+#
+# This also cleans up the unused chromium / webkit / older firefox bundles that came with
+# the base image — saves ~700MB. The MCP only uses Firefox.
+RUN cd /usr/lib/node_modules/@playwright/mcp \
+    && node node_modules/playwright-core/cli.js install firefox

@@ -82,6 +82,28 @@ EVAL_MIN_SCREENSHOT_CALLS = 1   # browser_take_screenshot calls
 EVAL_MIN_CLICK_CALLS = 2        # browser_click calls (1 menu + 1 admin minimum)
 EVAL_INSUFFICIENT_EVIDENCE_RETRY_CAP = 2  # max re-eval rounds before accepting whatever we got
 
+# Eval exception → verdict="incomplete" mapping. When the evaluator subagent crashes with
+# an MCP / Playwright / browser-launch error, that is NOT a "the work is wrong, try again"
+# signal — it's an infrastructure failure the builder cannot fix. Mapping these to verdict=
+# continue (the previous default) caused infinite loops where the builder kept producing
+# work and the evaluator kept failing on the same broken MCP. verdict=incomplete short-
+# circuits to END with a diagnostic so the operator fixes the infrastructure.
+# Case-insensitive substring match against str(exception). Patterns are chosen to match the
+# actual error strings we've seen (e.g. `Browser "firefox" is not installed` — note the
+# embedded browser name, which is why the pattern is "is not installed" not "browser is
+# not installed").
+EVAL_INCOMPLETE_EXCEPTION_PATTERNS = [
+    "Playwright",
+    "is not installed",          # Browser "<name>" is not installed at /ms-playwright/...
+    "ConnectError",
+    "Cannot find module 'playwright",
+    "MCP server",
+    "launching browser",         # Error launching browser
+    "browser launch",
+    "playwright-mcp",            # transport URL or generic mention
+    "ms-playwright",             # bundled-browser path mention in errors
+]
+
 # Shell (both persistent and one-shot)
 SHELL_COMMAND_TIMEOUT_SECONDS = 300
 SHELL_OUTPUT_HEAD_BYTES = 2000        # head of head+tail truncation
@@ -3058,16 +3080,43 @@ async def evaluator_node(state: State) -> dict:
             return {"eval_verdict": "continue", "eval_notes": notes}
         except Exception as e:
             # Defense in depth: any other escape from the eval subagent (tool crash, MCP failure,
-            # langchain internal error) shouldn't kill the whole run. Convert to 'continue' with
-            # the exception summary in notes; full traceback goes to the trace for debugging.
+            # langchain internal error) shouldn't kill the whole run. Two paths:
+            #   1. MCP / Playwright / browser-launch failure (infrastructure) → verdict=incomplete.
+            #      The builder can't fix this; route_after_eval terminates the run with a
+            #      diagnostic so the operator rebuilds containers / checks the MCP transport.
+            #   2. Anything else → verdict=continue (existing behavior).
             # Grep with: jq -c 'select(.kind == "evaluator_exception")' workspace/.trace/*.jsonl
             import traceback
             tb = traceback.format_exc()
+            err_str = str(e)
+            err_lc = err_str.lower()
+            matched = next(
+                (p for p in EVAL_INCOMPLETE_EXCEPTION_PATTERNS if p.lower() in err_lc),
+                None,
+            )
             TRACE.log("evaluator_exception", error_type=type(e).__name__,
-                      error=str(e)[:500], traceback=tb[-2000:])
-            print(f"\n  EVALUATOR CRASH ({type(e).__name__}: {str(e)[:200]}) — returning 'continue'.")
+                      error=err_str[:500], traceback=tb[-2000:])
+            if matched:
+                TRACE.log("evaluator_verdict_incomplete_due_to_infrastructure",
+                          matched_pattern=matched,
+                          error_type=type(e).__name__,
+                          error=err_str[:1000])
+                print(f"\n  EVALUATOR CRASH ({type(e).__name__}: {err_str[:200]}) — "
+                      f"verdict='incomplete' (infrastructure failure: {matched!r}).")
+                notes = (
+                    f"Evaluator could not produce a verdict because of an INFRASTRUCTURE "
+                    f"failure (matched pattern {matched!r}): {type(e).__name__}: "
+                    f"{err_str[:600]}. The builder cannot fix this — it's an MCP / Playwright / "
+                    f"browser issue outside the app under test. The harness will terminate the "
+                    f"run; the operator must repair the infrastructure (rebuild playwright-mcp, "
+                    f"check MCP transport, confirm Firefox is installed at the version the MCP "
+                    f"expects) before re-running. The builder's last work is preserved in the "
+                    f"workspace."
+                )
+                return {"eval_verdict": "incomplete", "eval_notes": notes}
+            print(f"\n  EVALUATOR CRASH ({type(e).__name__}: {err_str[:200]}) — returning 'continue'.")
             notes = (
-                f"Evaluator crashed with {type(e).__name__}: {str(e)[:300]}. Treat as 'unable to "
+                f"Evaluator crashed with {type(e).__name__}: {err_str[:300]}. Treat as 'unable to "
                 f"verify'; the next planner should narrow the eval instructions or check whether "
                 f"a harness tool needs fixing (full traceback in trace as evaluator_exception)."
             )
@@ -3174,6 +3223,19 @@ def route_after_eval(state: State) -> Literal["planner", "builder", "__end__"]:
         return END
     if verdict == "replan":
         return "planner"
+    if verdict == "incomplete":
+        # Infrastructure failure — Playwright MCP unreachable, browser not installed, etc.
+        # The builder cannot fix this; sending it back loops the same crash. Terminate with
+        # a diagnostic the operator can act on. Builder's work is preserved in the workspace.
+        notes = str(state.get("eval_notes", "(no notes)"))
+        print(f"\n━━━ Verification incomplete ━━━")
+        print(f"The work could not be verified because of infrastructure issues:")
+        print(f"  {_truncate_simple(notes, 600)}")
+        print(f"Fix the infrastructure (rebuild playwright-mcp, check MCP transport) and "
+              f"re-run.")
+        print(f"The builder's last work is preserved. You may continue from this state once "
+              f"verification is possible.")
+        return END
     return "builder"
 
 
