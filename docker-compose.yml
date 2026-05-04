@@ -45,6 +45,12 @@ services:
       - playwright-mcp:8931,localhost:8931
     ports:
       - "8931:8931"
+    # Expose the MCP's screenshot / console-log workspace to the host so the user can
+    # inspect what the evaluator saw. Playwright MCP writes screenshots, console-message
+    # dumps, and snapshot YAML files to /tmp/.playwright-mcp inside the container; this
+    # bind mount surfaces them at workspace/.playwright-mcp on the host.
+    volumes:
+      - ./workspace/.playwright-mcp:/tmp/.playwright-mcp
 
   # Local Qwen3.6 via llama.cpp. Enable with: docker compose --profile local up -d llama-cpp
   llama-cpp:
