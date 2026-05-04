@@ -72,6 +72,16 @@ BUILDER_BUDGET_WARNING_THRESHOLD = 10  # remaining ≤ this → "BUDGET WARNING"
 # Evaluator loop cap
 EVAL_RECURSION_LIMIT = 40
 
+# Eval evidence enforcement (Layer 2: harness-level rejection of thin verdicts).
+# A verdict of "done" on a web-app task without observable interaction evidence (browse +
+# screenshot + clicks) is rubber-stamping. The harness counts MCP browser tool calls during
+# eval and rejects "done" verdicts that didn't actually interact with the running app.
+# The evaluator gets injected back with a corrective system message; capped to prevent loops.
+EVAL_MIN_NAVIGATE_CALLS = 1     # browser_navigate calls
+EVAL_MIN_SCREENSHOT_CALLS = 1   # browser_take_screenshot calls
+EVAL_MIN_CLICK_CALLS = 2        # browser_click calls (1 menu + 1 admin minimum)
+EVAL_INSUFFICIENT_EVIDENCE_RETRY_CAP = 2  # max re-eval rounds before accepting whatever we got
+
 # Shell (both persistent and one-shot)
 SHELL_COMMAND_TIMEOUT_SECONDS = 300
 SHELL_OUTPUT_HEAD_BYTES = 2000        # head of head+tail truncation
@@ -113,6 +123,11 @@ SHELL_HEARTBEAT_TAIL_BYTES = 200
 # parsing + provider-aware throttling, which is a separate problem (TODO).
 MODEL_RETRY_MAX_ATTEMPTS = 3
 MODEL_RETRY_BASE_DELAY = 2  # seconds; doubled per attempt → 2, 4, 8
+# How long to wait for the next streaming chunk before treating the connection as stalled.
+# OpenRouter sometimes accepts the request and never dispatches it; default langchain timeout
+# is 120s, which compounds across MODEL_RETRY_MAX_ATTEMPTS=3 to ~6 minutes of dead waiting.
+# 60s catches the stall faster while still tolerating typical cold-start latency.
+STREAM_CHUNK_TIMEOUT_SECONDS = int(os.environ.get("STREAM_CHUNK_TIMEOUT_SECONDS", "60"))
 MODEL_RETRY_RETRYABLE_STATUS = {500, 502, 503, 504, 529}
 
 # Checkpointing: persist outer + inner graph state to .trace/checkpoints.db so a crash
@@ -120,8 +135,14 @@ MODEL_RETRY_RETRYABLE_STATUS = {500, 502, 503, 504, 529}
 # or BuilderState TypedDict changes shape — old checkpoints will be rejected (load fails
 # loudly with checkpoint_schema_mismatch trace event) and the run starts fresh.
 CHECKPOINT_DB_PATH = TRACE_DIR / "checkpoints.db"
-CHECKPOINT_SCHEMA_VERSION = 1
+CHECKPOINT_SCHEMA_VERSION = 2  # bumped from 1: State gained `planner_path` field
 RESUME_FRESHNESS_HOURS = 24  # checkpoints older than this are not offered for resume
+
+# Trivial continuation inputs that carry no new requirements. The planner short-circuits
+# to path="already_complete" when input matches AND the prior task was verified-complete.
+# Conservative whitelist — anything else (e.g. "continue and add search") is treated as
+# new explicit work and falls through to the normal continued/replaced path.
+_CONTINUATION_INPUTS = {"continue", "continue.", "go", "go on", "proceed", "resume", ""}
 
 # Completion-verification advisor. Before mark_done, the builder must call verify_completion,
 # which routes to a stronger model (Sonnet) for an external sanity check. Two separate caps:
@@ -1411,6 +1432,73 @@ def _extract_decision_rationale(decision_text: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+def _detect_verified_completion(prior: dict | None, task_input: str) -> dict | None:
+    """If the prior task is verified-complete and the new input is a trivial continuation,
+    return a dict describing the prior completion. Otherwise None.
+
+    Six gates, all-must-pass. Each failure is a quiet `return None` — the planner falls
+    through to existing continued/replaced logic. Conservative by design: a false positive
+    here means the user can't extend a finished task with a one-word "continue", but they
+    can always rephrase. A false negative here costs nothing — we just call the planner.
+
+    Returns: {prior_completion_ts, prior_claim, reason} on detection; None otherwise.
+    """
+    if prior is None:
+        return None
+    # Gate A: trivial input (no new requirements expressible)
+    if task_input.strip().lower() not in _CONTINUATION_INPUTS:
+        return None
+    # Gate B: pending_proposals must be empty (unresolved architecture proposals = work to do)
+    if prior.get("pending_proposals"):
+        return None
+    # Gate C: prior trace file must exist and be readable
+    trace_file = prior.get("trace_file")
+    if not trace_file:
+        return None
+    trace_path = TRACE_DIR / trace_file
+    if not trace_path.exists():
+        return None
+    try:
+        with open(trace_path, "r") as fh:
+            events = [json.loads(line) for line in fh if line.strip()]
+    except (OSError, json.JSONDecodeError):
+        return None
+    # Gate D: find the most recent verification_token_consumed
+    last_consumed_idx = None
+    for i in range(len(events) - 1, -1, -1):
+        if events[i].get("kind") == "verification_token_consumed":
+            last_consumed_idx = i
+            break
+    if last_consumed_idx is None:
+        return None
+    # Gate E: must be followed by a matching builder_exit reason="done"
+    matching_exit_idx = None
+    for j in range(last_consumed_idx + 1, len(events)):
+        ev = events[j]
+        if ev.get("kind") == "builder_exit" and ev.get("reason") == "done":
+            matching_exit_idx = j
+            break
+    if matching_exit_idx is None:
+        return None
+    matching_exit = events[matching_exit_idx]
+    # Gate F: no tool_result with ok=false OR non-zero exit_code AFTER that builder_exit.
+    # Eval crashes (evaluator_exception) and disagreements (verification_disagreement)
+    # deliberately do NOT count — those are informational under the verified-done contract.
+    for ev in events[matching_exit_idx + 1:]:
+        if ev.get("kind") != "tool_result":
+            continue
+        if ev.get("ok") is False:
+            return None
+        ec = ev.get("exit_code")
+        if isinstance(ec, int) and ec != 0:
+            return None
+    return {
+        "prior_completion_ts": events[last_consumed_idx].get("ts"),
+        "prior_claim": matching_exit.get("claim", ""),
+        "reason": "no_new_requirements",
+    }
+
+
 @tool
 def view_plan() -> str:
     """View the full plan: REQUIREMENTS, ARCHITECTURE, TASKS, and any pending architecture proposals."""
@@ -1983,6 +2071,7 @@ def _openrouter_llm(model: str) -> ChatOpenAI:
         model=model,
         base_url=base,
         api_key=os.environ.get("OPENAI_API_KEY", "sk-no-key-required"),
+        stream_chunk_timeout=STREAM_CHUNK_TIMEOUT_SECONDS,
         **extra,
     )
 
@@ -2027,6 +2116,7 @@ class State(TypedDict):
     eval_verdict: str
     eval_notes: str
     replan_count: int  # how many times the builder has triggered revise_plan in this task
+    planner_path: str  # "" | "fresh" | "continued" | "replaced" | "already_complete"
 
 
 # ────────────────────────── builder state graph ──────────────────────────
@@ -2258,6 +2348,11 @@ def _format_builder_summary(state: BuilderState, exit_signal: str, exit_payload:
         parts.append(_truncate_simple(exit_payload.get("final_text", ""), 500))
     elif exit_signal == "budget_exhausted":
         parts.append(f"Budget of {state['max_steps']} steps exhausted before mark_done.")
+    elif exit_signal == "model_unreachable":
+        parts.append(f"Model unreachable after retries ({exit_payload.get('error_type', '?')}: "
+                     f"{exit_payload.get('error', '?')[:300]}).")
+        parts.append("Builder did not exit on its own; this was a harness-level kill on "
+                     "infrastructure failure.")
     tasks = state["plan"].get("tasks", []) if isinstance(state["plan"], dict) else []
     done = sum(1 for t in tasks if t["status"] == "done")
     parts.append(f"Plan progress: {done}/{len(tasks)} tasks done.")
@@ -2298,14 +2393,30 @@ async def builder_node(outer_state: State, config: RunnableConfig | None = None)
     outer_thread_id = (config or {}).get("configurable", {}).get("thread_id", "default")
     inner_thread_id = f"{outer_thread_id}:builder:iter{outer_state['iteration']}"
     inner_graph = _graph_holder["builder"]
-    final = await inner_graph.ainvoke(
-        builder_state,
-        config={
-            "recursion_limit": MAX_BUILDER_STEPS * 4 + 20,
-            "configurable": {"thread_id": inner_thread_id},
-            "metadata": {"schema_version": CHECKPOINT_SCHEMA_VERSION},
-        },
-    )
+    try:
+        final = await inner_graph.ainvoke(
+            builder_state,
+            config={
+                "recursion_limit": MAX_BUILDER_STEPS * 4 + 20,
+                "configurable": {"thread_id": inner_thread_id},
+                "metadata": {"schema_version": CHECKPOINT_SCHEMA_VERSION},
+            },
+        )
+    except Exception as e:
+        # Defense in depth: any uncaught exception escaping the inner graph (model-retry
+        # exhaustion, MCP failure, langchain internal error) shouldn't kill the run. Convert
+        # to model_unreachable, which routes to END via route_after_builder. Full traceback
+        # to the trace as builder_exception. Mirrors evaluator_node's broad-catch posture.
+        # Grep with: jq -c 'select(.kind == "builder_exception")' workspace/.trace/*.jsonl
+        import traceback
+        tb = traceback.format_exc()
+        TRACE.log("builder_exception", error_type=type(e).__name__,
+                  error=str(e)[:500], traceback=tb[-2000:])
+        print(f"\n  BUILDER CRASH ({type(e).__name__}: {str(e)[:200]}) — routing to END.")
+        _exit_holder["signal"] = "model_unreachable"
+        _exit_holder["payload"] = {"error_type": type(e).__name__, "error": str(e)[:1000]}
+        # Synthesize a minimal final state so _format_builder_summary doesn't choke.
+        final = {**builder_state, "step": builder_state.get("step", 0)}
 
     exit_signal = _exit_holder["signal"] or "budget_exhausted"
     exit_payload = dict(_exit_holder["payload"])
@@ -2457,6 +2568,30 @@ async def planner_node(state: State) -> dict:
     if iteration == 1:
         prior = _load_persisted_plan()
         prior_doc = prior  # may be None
+        # Verified-completion short-circuit. Only at iteration 1 (cross-task continuation):
+        # if the prior trace shows verified done AND the user's input is a trivial
+        # continuation token, skip the planner LLM entirely and route to END. Stops the
+        # planner from inventing fictional new requirements on a working codebase.
+        already_complete = _detect_verified_completion(prior, task)
+        if already_complete:
+            TRACE.log("planner_already_complete",
+                      prior_completion_ts=already_complete["prior_completion_ts"],
+                      prior_claim=already_complete["prior_claim"][:500],
+                      task_input=task[:200],
+                      reason=already_complete["reason"])
+            print(f"\n━━━ Already complete ━━━")
+            print(f"  Prior task verified done at {already_complete['prior_completion_ts']}")
+            print(f"  Prior claim: {_truncate_simple(already_complete['prior_claim'], 300)}")
+            print(f"  Input {task!r} is a trivial continuation; no new work specified.")
+            print(f"  To start new work, provide a new task description or new requirements.")
+            return {
+                "iteration": iteration,
+                "plan": prior,
+                "builder_instructions": "",
+                "evaluator_instructions": "",
+                "replan_count": replan_count,
+                "planner_path": "already_complete",
+            }
     else:
         prior = None
         prior_doc = state.get("plan")
@@ -2622,6 +2757,7 @@ async def planner_node(state: State) -> dict:
         "builder_instructions": bi,
         "evaluator_instructions": ei,
         "replan_count": replan_count,
+        "planner_path": path,
     }
 
 
@@ -2653,7 +2789,14 @@ async def build_evaluator_subagent():
     )
 
 
-async def _stream_subagent(subagent, prompt: str, label: str, recursion_limit: int) -> str:
+async def _stream_subagent(subagent, prompt: str, label: str, recursion_limit: int,
+                           tool_counter: dict | None = None) -> str:
+    """Stream a subagent's tool calls/results to stdout + trace.
+
+    `tool_counter` (optional): dict that gets `tool_counter[tool_name] += 1` per tool call.
+    Used by evaluator_node to enforce browser-tool minimums on web-app tasks (Layer 2 evidence
+    enforcement). Caller passes a fresh dict each invocation; we never reset it.
+    """
     final_text = ""
     stream = subagent.astream(
         {"messages": [HumanMessage(content=prompt)]},
@@ -2682,6 +2825,8 @@ async def _stream_subagent(subagent, prompt: str, label: str, recursion_limit: i
                     for tc in msg.tool_calls:
                         print(f"  [{label}] {tc['name']}({_format_args(tc.get('args', {}))})")
                         TRACE.log("eval_tool_call", tool=tc["name"], args=tc.get("args", {}))
+                        if tool_counter is not None:
+                            tool_counter[tc["name"]] = tool_counter.get(tc["name"], 0) + 1
                 elif getattr(msg, "type", None) == "tool":
                     body = (msg.content or "").strip().replace("\n", "\\n")
                     print(f"  [{label}-result] {msg.name} -> {_truncate_simple(body)}")
@@ -2689,6 +2834,61 @@ async def _stream_subagent(subagent, prompt: str, label: str, recursion_limit: i
                 elif msg.content:
                     final_text = msg.content
     return final_text
+
+
+_WEB_APP_BUILDER_SIGNALS = (
+    "next build", "next dev", "npm run build", "npm run dev", "pnpm build",
+    "pnpm dev", "yarn build", "yarn dev", "vite build", "vite dev", "vite preview",
+    "serve_in_background", "localhost:3000", "0.0.0.0:3000",
+)
+_WEB_APP_STACK_KEYWORDS = (
+    "next.js", "nextjs", "next ", "react", "vue", "svelte", "remix", "astro",
+    "express", "fastify", "hono", "nuxt", "gatsby",
+)
+
+
+def _is_web_app_task(state: State, plan_doc: dict) -> bool:
+    """Decide whether this task delivers a web app that must be browser-verified.
+
+    Signals (any one is enough):
+    1. Builder ran a web-app build/dev/serve command (per builder_summary text)
+    2. Plan architecture.stack mentions a web framework
+    3. Plan requirements/tasks mention admin / page / login / dashboard / route
+
+    False positives are acceptable: an over-detection just forces the evaluator to attempt
+    browser tools, which is harmless on non-web tasks (the tool calls fail / are unused and
+    the harness eventually accepts whatever evidence the evaluator produced).
+    """
+    summary = (state.get("builder_summary") or "").lower()
+    if any(sig in summary for sig in _WEB_APP_BUILDER_SIGNALS):
+        return True
+    arch = plan_doc.get("architecture") or {}
+    stack_text = " ".join(str(arch.get(k, "")) for k in ("stack", "key_decisions", "summary")).lower()
+    if any(kw in stack_text for kw in _WEB_APP_STACK_KEYWORDS):
+        return True
+    # Last-resort signal: tasks/requirements mention web-app concepts
+    blob = " ".join([
+        " ".join(str(r) for r in plan_doc.get("requirements", [])),
+        " ".join(str(t.get("text", "")) for t in plan_doc.get("tasks", [])),
+    ]).lower()
+    if any(kw in blob for kw in (" admin ", "/admin", "login", "dashboard", "homepage", "page editor")):
+        return True
+    return False
+
+
+def _eval_evidence_shortfall(tool_counter: dict) -> list[str]:
+    """Return a list of human-readable shortfalls vs. EVAL_MIN_* thresholds. Empty = sufficient."""
+    nav = tool_counter.get("browser_navigate", 0)
+    snap = tool_counter.get("browser_take_screenshot", 0)
+    click = tool_counter.get("browser_click", 0)
+    short = []
+    if nav < EVAL_MIN_NAVIGATE_CALLS:
+        short.append(f"browser_navigate calls: {nav} < required {EVAL_MIN_NAVIGATE_CALLS}")
+    if snap < EVAL_MIN_SCREENSHOT_CALLS:
+        short.append(f"browser_take_screenshot calls: {snap} < required {EVAL_MIN_SCREENSHOT_CALLS}")
+    if click < EVAL_MIN_CLICK_CALLS:
+        short.append(f"browser_click calls: {click} < required {EVAL_MIN_CLICK_CALLS}")
+    return short
 
 
 async def evaluator_node(state: State) -> dict:
@@ -2700,7 +2900,8 @@ async def evaluator_node(state: State) -> dict:
     plan_doc = state.get("plan") or _empty_plan_doc()
     plan_render = _render_plan_doc(plan_doc)
     requirements_render = _render_requirements(plan_doc.get("requirements", []))
-    prompt = (
+    is_web_app = _is_web_app_task(state, plan_doc)
+    base_prompt = (
         f"REQUIREMENTS (load-bearing contract — verify EACH one is satisfied):\n"
         f"{requirements_render}\n\n"
         f"PLAN (current state, includes ARCHITECTURE and TASKS):\n{plan_render}\n\n"
@@ -2710,53 +2911,121 @@ async def evaluator_node(state: State) -> dict:
         f"{state['builder_summary']}\n\n"
         f"Verify the work and emit your verdict block at the end."
     )
-    try:
-        text = await _stream_subagent(_evaluator_holder["agent"], prompt, "eval", EVAL_RECURSION_LIMIT)
-    except GraphRecursionError:
-        # Eval ran out of internal-step budget without producing a verdict. Don't crash the
-        # whole run — return 'continue' with explanatory notes so the next planner can react
-        # (typically by narrowing eval instructions or addressing whatever the eval got stuck on).
-        TRACE.log("evaluator_recursion_limit", limit=EVAL_RECURSION_LIMIT)
-        print(f"\n  EVALUATOR RECURSION LIMIT ({EVAL_RECURSION_LIMIT}) — returning 'continue'.")
-        notes = (
-            f"Evaluator hit its recursion limit of {EVAL_RECURSION_LIMIT} steps without producing "
-            f"a verdict. Likely a debugging loop the eval couldn't escape (e.g. server-restart "
-            f"loop, repeated curl against an unhealthy endpoint). Treat as 'unable to verify'; "
-            f"the next planner should narrow the eval instructions or address obstacles the eval "
-            f"couldn't get past on its own."
-        )
-        print(f"  NOTES: {_truncate_simple(notes, 400)}")
-        return {"eval_verdict": "continue", "eval_notes": notes}
-    except Exception as e:
-        # Defense in depth: any other escape from the eval subagent (tool crash, MCP failure,
-        # langchain internal error) shouldn't kill the whole run. Convert to 'continue' with
-        # the exception summary in notes; full traceback goes to the trace for debugging.
-        # Grep with: jq -c 'select(.kind == "evaluator_exception")' workspace/.trace/*.jsonl
-        import traceback
-        tb = traceback.format_exc()
-        TRACE.log("evaluator_exception", error_type=type(e).__name__,
-                  error=str(e)[:500], traceback=tb[-2000:])
-        print(f"\n  EVALUATOR CRASH ({type(e).__name__}: {str(e)[:200]}) — returning 'continue'.")
-        notes = (
-            f"Evaluator crashed with {type(e).__name__}: {str(e)[:300]}. Treat as 'unable to "
-            f"verify'; the next planner should narrow the eval instructions or check whether "
-            f"a harness tool needs fixing (full traceback in trace as evaluator_exception)."
-        )
-        return {"eval_verdict": "continue", "eval_notes": notes}
-    verdict = _extract_verdict(text)
-    notes = _extract_notes(text) or text
+
+    # Layer 2 enforcement loop. On a web-app task, a verdict of "done" without browser
+    # interaction evidence (navigate + screenshot + at least 2 clicks) gets rejected and the
+    # evaluator is re-invoked with a corrective preamble. Capped to prevent infinite loops.
+    retry_round = 0
+    text = ""
+    verdict = "continue"
+    notes = ""
+    tool_counter: dict = {}
+    while True:
+        prompt = base_prompt
+        if retry_round > 0:
+            shortfall = _eval_evidence_shortfall(tool_counter)
+            prompt = (
+                f"⚠️  YOUR PRIOR VERDICT WAS REJECTED BY THE HARNESS (round {retry_round}/"
+                f"{EVAL_INSUFFICIENT_EVIDENCE_RETRY_CAP}).\n\n"
+                f"You declared verdict=done but did NOT actually exercise the running app:\n"
+                f"  - " + "\n  - ".join(shortfall) + "\n\n"
+                f"You MUST use Playwright MCP browser tools (browser_navigate, "
+                f"browser_take_screenshot, browser_click, browser_snapshot, "
+                f"browser_console_messages) to verify the running app on this round. HTTP 200 / "
+                f"build-passes / port-listening signals are NECESSARY but NOT SUFFICIENT. "
+                f"Take at least one screenshot, examine it (you have vision — describe what you "
+                f"see), click at least one menu item AND attempt the admin login flow. Re-emit "
+                f"your verdict with that evidence in NOTES.\n\n"
+                + base_prompt
+            )
+        try:
+            text = await _stream_subagent(
+                _evaluator_holder["agent"], prompt, "eval", EVAL_RECURSION_LIMIT,
+                tool_counter=tool_counter,
+            )
+        except GraphRecursionError:
+            # Eval ran out of internal-step budget without producing a verdict. Don't crash the
+            # whole run — return 'continue' with explanatory notes so the next planner can react
+            # (typically by narrowing eval instructions or addressing whatever the eval got stuck on).
+            TRACE.log("evaluator_recursion_limit", limit=EVAL_RECURSION_LIMIT)
+            print(f"\n  EVALUATOR RECURSION LIMIT ({EVAL_RECURSION_LIMIT}) — returning 'continue'.")
+            notes = (
+                f"Evaluator hit its recursion limit of {EVAL_RECURSION_LIMIT} steps without producing "
+                f"a verdict. Likely a debugging loop the eval couldn't escape (e.g. server-restart "
+                f"loop, repeated curl against an unhealthy endpoint). Treat as 'unable to verify'; "
+                f"the next planner should narrow the eval instructions or address obstacles the eval "
+                f"couldn't get past on its own."
+            )
+            print(f"  NOTES: {_truncate_simple(notes, 400)}")
+            return {"eval_verdict": "continue", "eval_notes": notes}
+        except Exception as e:
+            # Defense in depth: any other escape from the eval subagent (tool crash, MCP failure,
+            # langchain internal error) shouldn't kill the whole run. Convert to 'continue' with
+            # the exception summary in notes; full traceback goes to the trace for debugging.
+            # Grep with: jq -c 'select(.kind == "evaluator_exception")' workspace/.trace/*.jsonl
+            import traceback
+            tb = traceback.format_exc()
+            TRACE.log("evaluator_exception", error_type=type(e).__name__,
+                      error=str(e)[:500], traceback=tb[-2000:])
+            print(f"\n  EVALUATOR CRASH ({type(e).__name__}: {str(e)[:200]}) — returning 'continue'.")
+            notes = (
+                f"Evaluator crashed with {type(e).__name__}: {str(e)[:300]}. Treat as 'unable to "
+                f"verify'; the next planner should narrow the eval instructions or check whether "
+                f"a harness tool needs fixing (full traceback in trace as evaluator_exception)."
+            )
+            return {"eval_verdict": "continue", "eval_notes": notes}
+
+        verdict = _extract_verdict(text)
+        notes = _extract_notes(text) or text
+
+        # Layer 2: reject thin verdicts on web-app tasks. Non-done verdicts (continue/replan/
+        # incomplete) are accepted as-is — the loop is only protecting against false-done.
+        if (is_web_app
+                and verdict == "done"
+                and retry_round < EVAL_INSUFFICIENT_EVIDENCE_RETRY_CAP):
+            shortfall = _eval_evidence_shortfall(tool_counter)
+            if shortfall:
+                TRACE.log("evaluator_verdict_rejected_insufficient_evidence",
+                          retry_round=retry_round + 1,
+                          retry_cap=EVAL_INSUFFICIENT_EVIDENCE_RETRY_CAP,
+                          tool_counter=dict(tool_counter),
+                          shortfall=shortfall,
+                          rejected_verdict=verdict)
+                print(f"\n  REJECTED: 'done' verdict without interaction evidence "
+                      f"(round {retry_round + 1}/{EVAL_INSUFFICIENT_EVIDENCE_RETRY_CAP}).")
+                for s in shortfall:
+                    print(f"    - {s}")
+                retry_round += 1
+                continue
+        break
+
     print(f"\n  VERDICT: {verdict}")
     print(f"  NOTES: {_truncate_simple(notes, 400)}")
-    TRACE.log("verdict", verdict=verdict, notes=notes[:1000])
+    TRACE.log("verdict", verdict=verdict, notes=notes[:1000],
+              tool_counter=dict(tool_counter), is_web_app=is_web_app,
+              evidence_retry_rounds=retry_round)
     return {"eval_verdict": verdict, "eval_notes": notes}
 
 
 # ────────────────────────── outer routers + graph ──────────────────────────
 
 
+def route_after_planner(state: State) -> Literal["builder", "__end__"]:
+    """Short-circuit to END if the planner detected verified completion. Otherwise → builder.
+
+    Set by planner_node when the prior task's trace shows verification_token_consumed →
+    builder_exit reason="done" with no errors after, and the new input is a trivial
+    continuation. Stops the planner from inventing fictional new requirements on a
+    working codebase.
+    """
+    if state.get("planner_path") == "already_complete":
+        return END
+    return "builder"
+
+
 def route_after_builder(state: State) -> Literal["evaluator", "planner", "__end__"]:
     sig = state.get("builder_exit_signal")
-    if sig in ("help", "give_up"):
+    if sig in ("help", "give_up", "model_unreachable"):
         print(f"\n━━━ Builder exited '{sig}': ending task. ━━━")
         return END
     if sig == "replan":
@@ -2809,7 +3078,7 @@ def build_outer_graph(checkpointer=None):
     g.add_node("builder", builder_node)
     g.add_node("evaluator", evaluator_node)
     g.add_edge(START, "planner")
-    g.add_edge("planner", "builder")
+    g.add_conditional_edges("planner", route_after_planner, {"builder": "builder", END: END})
     g.add_conditional_edges("builder", route_after_builder, {
         "evaluator": "evaluator", "planner": "planner", END: END,
     })
@@ -2990,7 +3259,8 @@ async def main():
             }
             try:
                 final = await outer_graph.ainvoke(
-                    {"task": user_input, "iteration": 0, "plan": _empty_plan_doc(), "replan_count": 0},
+                    {"task": user_input, "iteration": 0, "plan": _empty_plan_doc(),
+                     "replan_count": 0, "planner_path": ""},
                     config=config,
                 )
                 TRACE.end_task(reason="completed", final_iter=final.get("iteration"),

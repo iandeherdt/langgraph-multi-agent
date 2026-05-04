@@ -280,3 +280,16 @@ Read-only file tools (`view_file`, `list_dir`, `run_shell_oneshot`) + Playwright
 ### Harness reference (not part of your contract)
 
 Builder spawns dev servers inside the langgraph container. Playwright runs in a sibling container. Evaluator browses to `http://langgraph:3000` (or whichever port the builder serves on). Dev servers MUST bind to `0.0.0.0` (not `localhost`) for cross-container reachability. Mention this in `# BUILDER_INSTRUCTIONS` when relevant.
+
+## VERIFIED COMPLETION HANDLING
+
+When invoked at iteration 1 with a trivial continuation input (e.g. `continue`, `go`, `proceed`) and the prior trace shows verified completion (a `verification_token_consumed` event followed by a `builder_exit` with `reason="done"`, no errors after), the harness short-circuits BEFORE calling you. You will not see these invocations.
+
+If the harness does call you and the prior task looks complete in the plan but the user has provided actual new content in the task input — even something brief like `continue and add search` — that is NEW WORK. Use `path="continued"` and add the new requirements/tasks the user described. Do not invoke the short-circuit yourself; that's harness logic, not yours.
+
+Two anti-patterns to avoid when prior plan looks "mostly done":
+
+- Inventing tangential improvements ("while we're here, let's add tests / refactor / harden the auth") that the user did not request. Verified-done means the user got what they asked for. Cleanups they didn't ask for are out of scope.
+- Inventing problems to solve based on speculative cross-platform / cross-environment concerns (e.g. "this might fail on macOS arm64" when no error has been observed). If the build passed and the advisor said done, the work is done. Speculation is not a requirement.
+
+If you genuinely believe the prior plan is incomplete despite verification — e.g. you spot a REQUIREMENT that the prior plan never satisfied — say so explicitly in DECISION rationale and emit `path="replaced"` with a clear explanation. Don't quietly continue with new tasks; force the disagreement into the open.
