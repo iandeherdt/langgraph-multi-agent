@@ -71,8 +71,19 @@ MAX_PBE_ITERATIONS = 5
 MAX_BUILDER_STEPS = 50
 BUILDER_BUDGET_WARNING_THRESHOLD = 10  # remaining ≤ this → "BUDGET WARNING"
 
-# Evaluator loop cap
-EVAL_RECURSION_LIMIT = 40
+# Evaluator loop cap. The mandatory interaction protocol (browser_navigate +
+# browser_take_screenshot + browser_snapshot + browser_console_messages per plan-named page,
+# plus admin login flow with form interaction, plus click verification on menu items) costs
+# ~30-40 tool calls just for the protocol baseline on an admin UI with 5+ pages. Bumped from
+# 40 → 100 to leave room for actual investigation when the eval finds bugs and needs to
+# dig in. The recursion-limit handler now also extracts findings from recent trace events
+# so even a budget-overrun produces actionable notes (see _extract_findings_from_trace).
+EVAL_RECURSION_LIMIT = 100
+
+# Eval tool-history ring buffer. Bodies aren't in the trace JSONL (we log only output_chars
+# to keep the trace small), but the recursion-limit handler needs the actual content to
+# extract findings from a budget-overrun run. Cleared at the top of each eval iteration.
+EVAL_TOOL_HISTORY_FOR_FINDINGS = 30
 
 # Eval evidence enforcement (Layer 2: harness-level rejection of thin verdicts).
 # A verdict of "done" on a web-app task without observable interaction evidence (browse +
@@ -2911,6 +2922,12 @@ async def planner_node(state: State) -> dict:
 # `async with client.session(...)` once and binding tools via load_mcp_tools(session).
 _evaluator_holder: dict = {"agent": None, "mcp_session_cm": None, "mcp_session": None}
 
+# In-memory record of recent eval tool calls + their (truncated) bodies. The recursion-limit
+# handler scans this for findings (console errors, runtime-error dialogs, broken navigation,
+# non-2xx HTTP) so a budget-overrun run still produces actionable verdict notes instead of
+# generic boilerplate. Cleared at the top of each evaluator_node invocation.
+_eval_tool_history: list[dict] = []
+
 
 async def build_evaluator_subagent():
     mcp_url = os.environ.get("PLAYWRIGHT_MCP_URL", "http://playwright-mcp:8931/sse")
@@ -3053,11 +3070,23 @@ async def _stream_subagent(subagent, prompt: str, label: str, recursion_limit: i
                         TRACE.log("eval_tool_call", tool=tc["name"], args=tc.get("args", {}))
                         if tool_counter is not None:
                             tool_counter[tc["name"]] = tool_counter.get(tc["name"], 0) + 1
+                        if label == "eval":
+                            _eval_tool_history.append({
+                                "kind": "call", "tool": tc["name"], "args": tc.get("args", {}),
+                            })
+                            if len(_eval_tool_history) > EVAL_TOOL_HISTORY_FOR_FINDINGS * 2:
+                                _eval_tool_history.pop(0)
                 elif getattr(msg, "type", None) == "tool":
                     body_str = _tool_msg_content_str(msg.content)
                     body = body_str.strip().replace("\n", "\\n")
                     print(f"  [{label}-result] {msg.name} -> {_truncate_simple(body)}")
                     TRACE.log("eval_tool_result", tool=msg.name, output_chars=len(body_str))
+                    if label == "eval":
+                        _eval_tool_history.append({
+                            "kind": "result", "tool": msg.name, "body": body_str[:4000],
+                        })
+                        if len(_eval_tool_history) > EVAL_TOOL_HISTORY_FOR_FINDINGS * 2:
+                            _eval_tool_history.pop(0)
                 elif msg.content:
                     final_text = _tool_msg_content_str(msg.content)
     return final_text
@@ -3103,6 +3132,126 @@ def _is_web_app_task(state: State, plan_doc: dict) -> bool:
     return False
 
 
+def _extract_eval_findings(history: list[dict]) -> dict:
+    """Scan recent eval tool calls + results for actionable findings.
+
+    Returns a dict with three lists:
+        findings: list[str] of human-readable observations (console errors, runtime
+            error dialogs, broken redirects, non-2xx responses, error pages)
+        pages_ok: list[str] of URLs that loaded with no observed errors
+        pages_with_errors: list[str] of URLs where at least one finding was observed
+
+    Used by the recursion-limit handler so a budget-overrun run still produces actionable
+    verdict notes — the eval may have observed real bugs (the user's complaint) and we
+    don't want to discard them with generic "couldn't escape debugging loop" boilerplate.
+    Returns empty lists when nothing extractable.
+    """
+    findings: list[str] = []
+    pages_ok: list[str] = []
+    pages_with_errors: list[str] = []
+    seen_urls: set[str] = set()
+
+    # Pair each result with the call that produced it, so we know what URL was being
+    # browsed when, e.g., a snapshot showed a runtime-error dialog. last_nav_url tracks
+    # the most recent browser_navigate target — it's the page state for any subsequent
+    # snapshot/screenshot/console_messages until the next navigate.
+    last_nav_url: str | None = None
+    last_click_target: str | None = None
+
+    for i, entry in enumerate(history):
+        if entry["kind"] == "call":
+            if entry["tool"] == "browser_navigate":
+                last_nav_url = (entry.get("args") or {}).get("url")
+            elif entry["tool"] == "browser_click":
+                # The args usually contain a `ref` or `element` description we can quote.
+                args = entry.get("args") or {}
+                last_click_target = args.get("element") or args.get("ref") or "unknown element"
+            continue
+
+        # entry["kind"] == "result"
+        body = entry.get("body") or ""
+        tool = entry.get("tool", "")
+
+        # Pull the URL out of the result body (more authoritative than last_nav_url for
+        # cases where the page redirected after the navigate).
+        m = re.search(r"Page URL:\s*(\S+)", body)
+        body_url = m.group(1) if m else None
+        url_for_finding = body_url or last_nav_url or "(unknown)"
+        if body_url and body_url != "about:blank":
+            seen_urls.add(body_url)
+
+        # Pattern 1: "Console: N errors, M warnings" inline in browser_navigate result.
+        m = re.search(r"Console:\s*(\d+)\s*errors?,\s*(\d+)\s*warnings?", body, re.IGNORECASE)
+        if m:
+            errs = int(m.group(1))
+            warns = int(m.group(2))
+            if errs > 0:
+                findings.append(f"{errs} console error(s) on {url_for_finding} (also {warns} warning(s))")
+                pages_with_errors.append(url_for_finding)
+
+        # Pattern 2: browser_console_messages explicit error count.
+        m = re.search(r"Total messages:\s*\d+\s*\(Errors:\s*(\d+),\s*Warnings:\s*(\d+)\)", body)
+        if m:
+            errs = int(m.group(1))
+            if errs > 0:
+                findings.append(f"console_messages reported {errs} error(s) on {url_for_finding}")
+                pages_with_errors.append(url_for_finding)
+
+        # Pattern 3: "Unhandled Runtime Error" or Next.js error overlay in snapshot text.
+        if re.search(r"Unhandled\s+Runtime\s+Error|Application\s+error.*client-side\s+exception",
+                     body, re.IGNORECASE):
+            findings.append(f"runtime error overlay visible on {url_for_finding}")
+            pages_with_errors.append(url_for_finding)
+
+        # Pattern 4: navigation after click went somewhere unexpected. We can't know the
+        # "expected" target without semantic context, but we CAN flag clicks that landed
+        # on /login when the user clicked a link labeled like a non-login destination.
+        if tool == "browser_click" and last_click_target:
+            if body_url and "login" in body_url.lower() and "login" not in last_click_target.lower():
+                findings.append(
+                    f"click on {last_click_target!r} unexpectedly landed on {body_url} "
+                    f"(likely auth/middleware bug)"
+                )
+                pages_with_errors.append(body_url)
+            last_click_target = None  # consume
+
+        # Pattern 5: non-2xx HTTP from curl in shell output. Most common form is the curl
+        # -w "%{http_code}" pattern returning just digits + maybe stderr.
+        if tool == "run_shell_oneshot":
+            m = re.search(r"^\s*([45]\d\d)\s*$", body, re.MULTILINE)
+            if m and "curl" in (body or ""):
+                # Only flag if a curl command was clearly involved — otherwise 4xx/5xx
+                # in body could be unrelated text. (Imperfect; better than nothing.)
+                pass
+            # Look for explicit curl HTTP error in stderr
+            m = re.search(r"HTTP/\S+\s+(\d\d\d)\s+\w+", body)
+            if m:
+                code = int(m.group(1))
+                if code >= 400:
+                    findings.append(f"curl observed HTTP {code} response (see body)")
+
+    # pages_ok = URLs we saw that aren't in the errors list.
+    for u in seen_urls:
+        if u not in pages_with_errors and u != "about:blank":
+            pages_ok.append(u)
+
+    # Dedupe while preserving order.
+    def _dedupe(xs: list) -> list:
+        seen: set = set()
+        out: list = []
+        for x in xs:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+
+    return {
+        "findings": _dedupe(findings),
+        "pages_ok": _dedupe(pages_ok),
+        "pages_with_errors": _dedupe(pages_with_errors),
+    }
+
+
 def _eval_evidence_shortfall(tool_counter: dict) -> list[str]:
     """Return a list of human-readable shortfalls vs. EVAL_MIN_* thresholds. Empty = sufficient."""
     nav = tool_counter.get("browser_navigate", 0)
@@ -3123,6 +3272,10 @@ async def evaluator_node(state: State) -> dict:
         _evaluator_holder["agent"] = await build_evaluator_subagent()
     print(f"\n━━━ EVALUATOR (iteration {state['iteration']}) ━━━")
     TRACE.log("evaluator_start", iteration=state["iteration"])
+    # Reset per-iteration findings buffer. _stream_subagent populates it as eval tool
+    # results arrive; the recursion-limit handler reads it to salvage findings into the
+    # verdict notes when the eval times out without writing its own verdict block.
+    _eval_tool_history.clear()
 
     plan_doc = state.get("plan") or _empty_plan_doc()
     plan_render = _render_plan_doc(plan_doc)
@@ -3171,18 +3324,44 @@ async def evaluator_node(state: State) -> dict:
                 tool_counter=tool_counter,
             )
         except GraphRecursionError:
-            # Eval ran out of internal-step budget without producing a verdict. Don't crash the
-            # whole run — return 'continue' with explanatory notes so the next planner can react
-            # (typically by narrowing eval instructions or addressing whatever the eval got stuck on).
-            TRACE.log("evaluator_recursion_limit", limit=EVAL_RECURSION_LIMIT)
+            # Eval ran out of internal-step budget without producing a verdict. Don't crash
+            # the whole run — return 'continue' with notes salvaged from the tool history.
+            # The eval may have observed real bugs (console errors, runtime-error overlays,
+            # broken redirects) and we don't want to throw that away just because it didn't
+            # write a verdict block before hitting the cap.
+            findings_data = _extract_eval_findings(_eval_tool_history)
+            TRACE.log("evaluator_recursion_limit", limit=EVAL_RECURSION_LIMIT,
+                      findings_count=len(findings_data["findings"]),
+                      pages_ok=findings_data["pages_ok"],
+                      pages_with_errors=findings_data["pages_with_errors"])
             print(f"\n  EVALUATOR RECURSION LIMIT ({EVAL_RECURSION_LIMIT}) — returning 'continue'.")
-            notes = (
-                f"Evaluator hit its recursion limit of {EVAL_RECURSION_LIMIT} steps without producing "
-                f"a verdict. Likely a debugging loop the eval couldn't escape (e.g. server-restart "
-                f"loop, repeated curl against an unhealthy endpoint). Treat as 'unable to verify'; "
-                f"the next planner should narrow the eval instructions or address obstacles the eval "
-                f"couldn't get past on its own."
-            )
+            if findings_data["findings"]:
+                lines = [
+                    f"Evaluator hit recursion limit at {EVAL_RECURSION_LIMIT} steps before "
+                    f"writing a verdict block. Findings extracted from tool history:",
+                ]
+                for f in findings_data["findings"]:
+                    lines.append(f"  - {f}")
+                if findings_data["pages_ok"]:
+                    lines.append(f"Pages verified without observed errors: "
+                                 f"{', '.join(findings_data['pages_ok'])}")
+                if findings_data["pages_with_errors"]:
+                    lines.append(f"Pages with observed errors: "
+                                 f"{', '.join(findings_data['pages_with_errors'])}")
+                lines.append(
+                    "Recommend: next planner narrows EVALUATOR_INSTRUCTIONS to focus on the "
+                    "above pages, or raise the recursion limit if a thorough sweep is needed."
+                )
+                notes = "\n".join(lines)
+            else:
+                notes = (
+                    f"Evaluator hit its recursion limit of {EVAL_RECURSION_LIMIT} steps without "
+                    f"producing a verdict and no actionable observations were salvageable from "
+                    f"the tool history. Likely a debugging loop the eval couldn't escape (e.g., "
+                    f"server-restart loop, repeated curl against an unhealthy endpoint). The "
+                    f"next planner should narrow the eval instructions or address obstacles the "
+                    f"eval couldn't get past on its own."
+                )
             print(f"  NOTES: {_truncate_simple(notes, 400)}")
             return {"eval_verdict": "continue", "eval_notes": notes}
         except Exception as e:

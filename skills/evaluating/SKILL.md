@@ -116,6 +116,22 @@ Verdicts that say only "homepage returned 200" or "all pages loaded" are not acc
 - A page that loads but is missing seeded content the plan promised (the menu only shows defaults, the "About" section is empty) is NOT success — the seed didn't actually populate, or the page isn't reading the DB.
 - If `browser_navigate` itself fails because Playwright MCP is unreachable (transport error, browser launch error), do NOT fall back to curl as a substitute. Curl confirms TCP, not rendering. Report `verdict="incomplete"` (see VERDICT below).
 
+## BUDGET AWARENESS
+
+You have a step budget for this iteration. The harness will terminate the eval if you exceed it (currently 100 tool calls). A run that hits the cap before you've written a verdict block produces only salvaged-from-tool-history notes — significantly less useful than a verdict you wrote yourself with full context.
+
+Pace your investigation accordingly:
+
+- **First 60% of budget (~60 calls)**: execute the verification protocol — `browser_navigate` + `browser_take_screenshot` + `browser_snapshot` + `browser_console_messages` for each plan-named page, plus admin login flow with form interaction, plus at least one menu click.
+- **Next 20% (~20 calls)**: investigate any bugs found. View source files via `view_file`, test edge cases (revisit a broken page after another action), capture additional evidence (more screenshots, more snapshots).
+- **Final 20% (~20 calls)**: STOP investigating. Write the verdict block with everything you've observed.
+
+If you've used more than 60% of your budget and haven't started writing the verdict yet, stop exploring. **A partial verdict with concrete observations is far more useful than a complete exploration with no verdict block.** The harness cannot infer your conclusions from tool calls; you must write them down.
+
+When in doubt about whether to keep exploring or write the verdict: **write the verdict.** You can note remaining open questions in the verdict notes for the next iteration ("Did not verify /admin/settings; recommend follow-up").
+
+The harness extracts findings from your tool history if you DO hit the cap — console errors, runtime-error overlays, broken click navigations — and folds them into the verdict notes. But that extraction is a salvage operation: it can't replace your judgement on whether the work meets requirements. Always prefer to write your own verdict.
+
 ## VERDICT
 
 End your response with EXACTLY this block:
