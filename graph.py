@@ -105,6 +105,14 @@ EVAL_INCOMPLETE_EXCEPTION_PATTERNS = [
     "NS_ERROR_UNKNOWN_HOST",     # Firefox couldn't resolve the target hostname (cross-container DNS)
     "browserBackend",            # MCP-side browser backend errors surface this token
     "ToolException",             # langchain wraps most MCP transport failures in ToolException
+    # Generic AttributeError isn't always infrastructure, but the eval subagent in our
+    # harness only loads MCP browser tools + a fixed set of code tools we control. An
+    # AttributeError raised inside the eval path is almost always an MCP response-shape
+    # regression (multimodal content list vs str, schema drift between MCP versions). Route
+    # to incomplete so a single shape change doesn't loop builder→eval→crash three times
+    # before give_up. Misroutes here are cheap (the operator inspects the trace, fixes
+    # the harness or pins the MCP version) and far cheaper than the loop.
+    "AttributeError",
 ]
 
 # Shell (both persistent and one-shot)
@@ -475,7 +483,11 @@ def _extract_section(text: str, name: str) -> str:
 
 
 def _extract_verdict(text: str) -> str:
-    m = re.search(r"VERDICT:\s*(done|continue|replan)", text, re.IGNORECASE)
+    # `incomplete` is documented in skills/evaluating/SKILL.md as a valid verdict for
+    # "verification could not be completed for infrastructure reasons" (MCP unreachable,
+    # browser launch failure, dev server not running). Without it here, an evaluator that
+    # correctly identifies the situation falls back to `continue` and the harness loops.
+    m = re.search(r"VERDICT:\s*(done|continue|replan|incomplete)", text, re.IGNORECASE)
     return m.group(1).lower() if m else "continue"
 
 
@@ -2912,6 +2924,42 @@ async def build_evaluator_subagent():
     )
 
 
+def _tool_msg_content_str(content) -> str:
+    """Normalize a langchain ToolMessage.content for display + logging.
+
+    LangChain's ToolMessage.content is either a string (legacy / simple text tools) or a
+    list of content blocks (multimodal — what MCP tools like browser_navigate /
+    browser_take_screenshot return on @playwright/mcp@0.0.73). The list contains dicts with
+    a "type" field ("text", "image", "image_url"). Calling .strip() on the list crashed the
+    evaluator with `AttributeError: 'list' object has no attribute 'strip'` and routed every
+    eval to verdict=continue, which produced builder→eval→crash→builder loops.
+
+    For text blocks: extract the text. For image blocks: emit "[image]" so we know one was
+    present without dumping base64 / URLs into the trace. Anything else: stringified, capped.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                t = item.get("type")
+                if t == "text":
+                    parts.append(str(item.get("text", "")))
+                elif t in ("image", "image_url"):
+                    parts.append("[image]")
+                else:
+                    parts.append(str(item)[:200])
+            else:
+                parts.append(str(item)[:200])
+        return "\n".join(parts)
+    return str(content)
+
+
 async def _stream_subagent(subagent, prompt: str, label: str, recursion_limit: int,
                            tool_counter: dict | None = None) -> str:
     """Stream a subagent's tool calls/results to stdout + trace.
@@ -2951,11 +2999,12 @@ async def _stream_subagent(subagent, prompt: str, label: str, recursion_limit: i
                         if tool_counter is not None:
                             tool_counter[tc["name"]] = tool_counter.get(tc["name"], 0) + 1
                 elif getattr(msg, "type", None) == "tool":
-                    body = (msg.content or "").strip().replace("\n", "\\n")
+                    body_str = _tool_msg_content_str(msg.content)
+                    body = body_str.strip().replace("\n", "\\n")
                     print(f"  [{label}-result] {msg.name} -> {_truncate_simple(body)}")
-                    TRACE.log("eval_tool_result", tool=msg.name, output_chars=len(msg.content or ""))
+                    TRACE.log("eval_tool_result", tool=msg.name, output_chars=len(body_str))
                 elif msg.content:
-                    final_text = msg.content
+                    final_text = _tool_msg_content_str(msg.content)
     return final_text
 
 
