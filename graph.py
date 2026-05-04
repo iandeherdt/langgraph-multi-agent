@@ -1719,7 +1719,29 @@ def _parse_advisor_response(text: str) -> dict:
         raise ValueError(f"advisor verdict must be done|not_done, got {parsed['verdict']!r}")
     if not isinstance(parsed["missing"], list):
         raise ValueError(f"advisor 'missing' must be a list, got {type(parsed['missing']).__name__}")
+    # next_actor is the harness routing signal. Tolerant: missing/unknown values default to
+    # builder_continue (the existing behavior — no routing change). Logged separately by the
+    # caller as advisor_response_malformed when we had to substitute, so we can grep for
+    # advisor-prompt drift later.
+    raw_actor = parsed.get("next_actor")
+    if parsed["verdict"] == "done":
+        parsed["next_actor"] = None
+        parsed["_actor_substituted"] = False
+    elif raw_actor in _ADVISOR_NEXT_ACTORS:
+        parsed["next_actor"] = raw_actor
+        parsed["_actor_substituted"] = False
+    else:
+        parsed["next_actor"] = "builder_continue"
+        parsed["_actor_substituted"] = True
+        parsed["_actor_substituted_from"] = repr(raw_actor)
     return parsed
+
+
+# Recognised next_actor values. Anything outside this set (or a missing field) gets
+# substituted to "builder_continue" by _parse_advisor_response (preserves existing behavior;
+# logs a warning). "needs_evaluator" routes the builder to evaluator with current evidence;
+# "builder_disagreement" routes to planner.
+_ADVISOR_NEXT_ACTORS = {"builder_continue", "needs_evaluator", "builder_disagreement"}
 
 
 @tool
@@ -1824,14 +1846,60 @@ async def verify_completion(
         _verification_holder["issued_token"] = token
         parsed["verification_token"] = token
 
+    next_actor = parsed.get("next_actor")
+    actor_substituted = parsed.pop("_actor_substituted", False)
+    actor_substituted_from = parsed.pop("_actor_substituted_from", None)
+    if actor_substituted:
+        TRACE.log("advisor_response_malformed",
+                  reason="next_actor_invalid_or_missing",
+                  raw_value=actor_substituted_from,
+                  substituted_to="builder_continue",
+                  verdict=verdict)
+
     TRACE.log("verify_completion_call", verdict=verdict,
               confidence=parsed.get("confidence"),
               missing_count=len(parsed.get("missing") or []),
               token_issued=bool(token),
+              next_actor=next_actor,
               verdict_count=_verification_holder["verdict_count"],
               error_count=_verification_holder["error_count"],
               verdict_cap=VERIFY_COMPLETION_CAP, error_cap=VERIFY_COMPLETION_ERROR_CAP,
               elapsed_ms=elapsed_ms, advisor_model=ADVISOR_MODEL)
+
+    # Route on next_actor. needs_evaluator and builder_disagreement short-circuit the builder
+    # loop; the outer router hands off to the appropriate next stage. builder_continue is the
+    # default — no exit, builder reads the rejection and keeps working.
+    if verdict == "not_done" and next_actor == "needs_evaluator":
+        # Hand off to evaluator with the builder's task_summary and evidence as the basis for
+        # the next eval round. Evaluator's mandatory-interaction protocol does the verification
+        # the builder cannot do alone.
+        _exit_holder["signal"] = "await_evaluator"
+        _exit_holder["payload"] = {
+            "task_summary": task_summary,
+            "evidence": list(evidence),
+            "verify_command": verify_command,
+            "advisor_missing": list(parsed.get("missing") or []),
+            "advisor_next_action": parsed.get("next_action", ""),
+        }
+        TRACE.log("advisor_routed_to_evaluator",
+                  missing=list(parsed.get("missing") or []),
+                  next_action=parsed.get("next_action", ""),
+                  evidence_count=len(evidence))
+    elif verdict == "not_done" and next_actor == "builder_disagreement":
+        # Hand off to planner. The advisor sees a fundamental approach problem; more builder
+        # iterations on the same plan won't fix it. Treat similarly to builder-initiated
+        # revise_plan but with advisor-supplied rationale.
+        _exit_holder["signal"] = "advisor_disagreement"
+        _exit_holder["payload"] = {
+            "rationale": parsed.get("next_action", "")
+            or "; ".join(parsed.get("missing") or [])
+            or "advisor flagged a fundamental approach problem with no specific rationale",
+            "advisor_missing": list(parsed.get("missing") or []),
+        }
+        TRACE.log("advisor_routed_to_planner",
+                  missing=list(parsed.get("missing") or []),
+                  next_action=parsed.get("next_action", ""))
+
     return json.dumps(parsed, indent=2)
 
 
@@ -2353,6 +2421,36 @@ def _format_builder_summary(state: BuilderState, exit_signal: str, exit_payload:
                      f"{exit_payload.get('error', '?')[:300]}).")
         parts.append("Builder did not exit on its own; this was a harness-level kill on "
                      "infrastructure failure.")
+    elif exit_signal == "await_evaluator":
+        # Advisor said: "code looks reasonable, but I need browser-based evidence I can't
+        # produce". Hand the builder's task_summary + evidence to the evaluator.
+        parts.append("Advisor (verify_completion) returned not_done with "
+                     "next_actor=needs_evaluator. Visual / interactive verification is "
+                     "required and the builder cannot produce it alone.")
+        parts.append(f"Task summary: {exit_payload.get('task_summary', '?')}")
+        ev = exit_payload.get("evidence") or []
+        if ev:
+            parts.append("Builder's evidence:")
+            for item in ev[:10]:
+                parts.append(f"  - {_truncate_simple(str(item), 200)}")
+        miss = exit_payload.get("advisor_missing") or []
+        if miss:
+            parts.append("Advisor's missing items (the evaluator must verify these):")
+            for item in miss[:10]:
+                parts.append(f"  - {_truncate_simple(str(item), 200)}")
+        if exit_payload.get("advisor_next_action"):
+            parts.append(f"Advisor's next_action: {exit_payload['advisor_next_action']}")
+    elif exit_signal == "advisor_disagreement":
+        # Advisor said: "wrong problem / wrong plan". Planner re-engages.
+        parts.append("Advisor (verify_completion) returned not_done with "
+                     "next_actor=builder_disagreement. The current approach does not satisfy "
+                     "a load-bearing requirement; planner should reconsider.")
+        parts.append(f"Rationale: {exit_payload.get('rationale', '?')}")
+        miss = exit_payload.get("advisor_missing") or []
+        if miss:
+            parts.append("Advisor's missing items (planner must address):")
+            for item in miss[:10]:
+                parts.append(f"  - {_truncate_simple(str(item), 200)}")
     tasks = state["plan"].get("tasks", []) if isinstance(state["plan"], dict) else []
     done = sum(1 for t in tasks if t["status"] == "done")
     parts.append(f"Plan progress: {done}/{len(tasks)} tasks done.")
@@ -3028,7 +3126,10 @@ def route_after_builder(state: State) -> Literal["evaluator", "planner", "__end_
     if sig in ("help", "give_up", "model_unreachable"):
         print(f"\n━━━ Builder exited '{sig}': ending task. ━━━")
         return END
-    if sig == "replan":
+    if sig == "replan" or sig == "advisor_disagreement":
+        # advisor_disagreement: verify_completion returned not_done with
+        # next_actor="builder_disagreement". Treat like replan (planner re-engages with the
+        # advisor's missing-list as input). Same cap.
         if state.get("replan_count", 0) >= MAX_REPLANS:
             print(f"\n━━━ Stopped: max replans ({MAX_REPLANS}) reached. ━━━")
             TRACE.log("replan_capped", replan_count=state.get("replan_count", 0))
@@ -3037,7 +3138,11 @@ def route_after_builder(state: State) -> Literal["evaluator", "planner", "__end_
     if state["iteration"] >= MAX_PBE_ITERATIONS:
         print(f"\n━━━ Stopped: max PBE iterations ({MAX_PBE_ITERATIONS}) reached. ━━━")
         return END
-    # done, budget_exhausted, stuck, abandoned → let evaluator judge
+    # done, budget_exhausted, stuck, abandoned, await_evaluator → let evaluator judge.
+    # await_evaluator specifically: verify_completion returned not_done with
+    # next_actor="needs_evaluator". The builder's evidence is in builder_exit_payload; the
+    # evaluator runs its mandatory-interaction protocol and judges whether the work meets
+    # the requirement, instead of the builder doing more code work it can't verify.
     return "evaluator"
 
 

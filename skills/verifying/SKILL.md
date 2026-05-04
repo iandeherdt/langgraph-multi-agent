@@ -75,8 +75,100 @@ Respond with ONLY a JSON object, no prose before or after, in this exact shape:
   "verdict": "done" | "not_done",
   "missing": ["concrete gap 1", "concrete gap 2"],
   "next_action": "single sentence telling the builder what to do next",
-  "confidence": "high" | "medium" | "low"
+  "confidence": "high" | "medium" | "low",
+  "next_actor": "builder_continue" | "needs_evaluator" | "builder_disagreement" | null
 }
 
 Keep "missing" empty when verdict is "done". Keep "next_action" specific and actionable
 (name files, plan items, or commands — not generic advice).
+
+### next_actor — who handles this next
+
+The harness routes the response based on this field. Pick deliberately; the wrong choice
+produces real cost (builder thrashing on evaluator work, or planner re-engagement when a
+small fix would have done it). Conservative default when unclear: `"builder_continue"` —
+that's the existing path and it's never wrong, just sometimes suboptimal.
+
+- **`null`** — only when verdict is "done". No further actor needed.
+
+- **`"builder_continue"`** — verdict is "not_done" and the missing items are concrete code-
+  level work the BUILDER can do directly. Build error, missing file, type error, missing
+  import, a plan task that's still in `todo` and maps to a stated requirement, a
+  configuration the builder can edit. The current state is wrong; builder fixes it; builder
+  calls verify_completion again.
+  Examples:
+  - "next build fails with type error in src/lib/db.ts:14" → builder_continue
+  - "plan task #7 (seed admin user) is still in todo" → builder_continue
+  - "Turso requirement says driver-adapter pattern but datasource still uses connection string" → builder_continue
+
+- **`"needs_evaluator"`** — verdict is "not_done" and the missing items are claims that
+  cannot be verified without browsing the running app. Visual / layout / interactive
+  / rendered-output / admin-flow claims. The CODE may be fine; what's missing is
+  EVIDENCE only the EVALUATOR can produce (Playwright MCP browser tools). The harness
+  short-circuits to the evaluator stage with the builder's evidence as input;
+  the evaluator runs the mandatory interaction protocol (browser_navigate +
+  browser_take_screenshot + browser_click) and reports actual findings.
+  Examples:
+  - "evidence claims 'menu no longer overlaps content' but contains no screenshot description" → needs_evaluator
+  - "evidence claims admin login works but lists no submit-and-redirect verification" → needs_evaluator
+  - "build passes and code change looks correct, but no evidence the visual fix actually fixed the visual" → needs_evaluator
+  CRITICAL: do NOT pick this when the work itself is incomplete. If the build is broken,
+  the evaluator can't help — that's `builder_continue`.
+
+- **`"builder_disagreement"`** — verdict is "not_done" and the work appears to be solving
+  the WRONG PROBLEM. The architecture or plan is mismatched against the requirements;
+  the builder changed files irrelevant to the stated goal; the builder ignored a load-
+  bearing requirement entirely. No amount of further builder iteration on the current plan
+  will get there. The harness routes to the planner for a fresh pass.
+  Examples:
+  - "user asked for Turso/libSQL, builder shipped plain SQLite with file:./dev.db" → builder_disagreement
+  - "user asked to fix admin overlap, builder modified the public homepage and never touched /admin" → builder_disagreement
+  - "REQUIREMENT specifies Vercel-deployable, ARCHITECTURE pins better-sqlite3 (incompatible with edge runtime)" → builder_disagreement
+
+### Example responses
+
+For each pattern, what the JSON looks like:
+
+builder_continue (most common rejection):
+```
+{
+  "verdict": "not_done",
+  "missing": ["next build fails: src/lib/db.ts:14 — Type 'string' is not assignable to type 'Client'"],
+  "next_action": "fix the type error in src/lib/db.ts (likely needs `new Client(url)` instead of bare string)",
+  "confidence": "high",
+  "next_actor": "builder_continue"
+}
+```
+
+needs_evaluator (visual/interactive verification gap):
+```
+{
+  "verdict": "not_done",
+  "missing": ["claim 'menu overlap fixed' has no screenshot evidence", "no description of admin sidebar after the fix"],
+  "next_action": "the evaluator should browse /admin and confirm the sidebar no longer overlaps content; no further builder edits needed",
+  "confidence": "high",
+  "next_actor": "needs_evaluator"
+}
+```
+
+builder_disagreement (wrong-problem):
+```
+{
+  "verdict": "not_done",
+  "missing": ["REQUIREMENT 2 says Turso libSQL via Prisma adapter; ARCHITECTURE.stack pins better-sqlite3 with file:./dev.db"],
+  "next_action": "planner should reset the data-layer architecture to use @libsql/client + @prisma/adapter-libsql; current plan cannot satisfy the requirement",
+  "confidence": "high",
+  "next_actor": "builder_disagreement"
+}
+```
+
+done (no actor needed):
+```
+{
+  "verdict": "done",
+  "missing": [],
+  "next_action": "call mark_done with the verification_token",
+  "confidence": "high",
+  "next_actor": null
+}
+```

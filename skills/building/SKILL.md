@@ -89,3 +89,24 @@ Failure modes to expect:
 - Advisor unreachable (Anthropic API down) — verify_completion returns an error; no token issued; you may retry (it counts toward the error cap of 2) or escalate via request_user_help.
 - mark_done called without verification_token — errors immediately, does not exit. You must call verify_completion first.
 - Token reused — errors. Each token is single-use; re-verify if mark_done's verify_command fails.
+
+HANDLING ADVISOR REJECTIONS:
+
+When verify_completion returns verdict="not_done", the response includes a `next_actor` field telling the harness who handles the next step. Read it carefully — it changes what you should do.
+
+- `next_actor: "builder_continue"` — the work is incomplete in a code-level way you can fix directly. Build error, missing file, type error, plan task you forgot. Address each item in `missing`, then call verify_completion again. This is the existing flow; nothing special to do.
+
+- `next_actor: "needs_evaluator"` — the CODE looks reasonable, but the advisor cannot verify the claim without browser-based evidence (visual layout, interactive UI, admin flow). The harness AUTOMATICALLY routes to the evaluator stage when this fires. **You do not need to do further verification work yourself.** Your verify_completion call has already exited the builder loop; the evaluator runs next with browser tools. Do not write more code, do not install Playwright, do not write inline Node verification scripts. Wait for the next builder iteration to receive the evaluator's findings.
+
+- `next_actor: "builder_disagreement"` — the advisor sees a fundamental approach problem (you changed the wrong files, ignored a requirement, used the wrong stack). The harness AUTOMATICALLY routes to the planner. The next iteration's plan will reflect the advisor's missing-list. **Don't try to "fix" the work in a follow-up verify_completion call**; the planner needs to re-engage. Your verify_completion call has already exited the builder loop.
+
+The bad pattern to avoid by name: **doing the evaluator's job inside the builder.** If the advisor's `missing` list mentions screenshots, browser interaction, visual checks, layout verification, "no evidence the visual fix worked", or anything you can only confirm by running a real browser — that's evaluator work. The harness will route there on `next_actor="needs_evaluator"`. Do not:
+
+- Install `@playwright/mcp` or any browser engine in the langgraph container (it lives in the playwright-mcp sibling container)
+- Write inline `node` scripts that import Playwright or puppeteer
+- Run `curl` and pretend it constitutes visual verification
+- "Just take one more pass at the CSS to be safe" when the advisor specifically said the visual evidence is missing — that's not the gap
+
+Trust the routing. needs_evaluator means "the harness has this; let the evaluator do its job."
+
+Conservative default: if the advisor's response is malformed or `next_actor` is missing, the harness substitutes `builder_continue` (existing behavior preserved). You'll see the original `missing` list and proceed normally.
