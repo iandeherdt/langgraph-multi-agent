@@ -18,6 +18,7 @@ read-only file tools + Playwright MCP.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -43,6 +44,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphRecursionError
@@ -2897,7 +2899,17 @@ async def planner_node(state: State) -> dict:
 # ────────────────────────── evaluator ──────────────────────────
 
 
-_evaluator_holder: dict = {"agent": None}
+# Evaluator caches (built once per process):
+# - agent: the create_agent return value
+# - mcp_session_cm: the async context manager that owns the persistent MCP SSE connection
+# - mcp_session: the ClientSession yielded by mcp_session_cm
+# A *persistent* MCP session is mandatory for the evaluator to do useful browser-based
+# verification. The default langchain-mcp-adapters mode (`client.get_tools()`) opens a
+# fresh session per tool call — and Playwright MCP gives each session a fresh page, so
+# every call after browser_navigate sees Page URL: about:blank. Page state is destroyed
+# between calls. Reproduced cleanly with a manual nav→snapshot probe; fixed by opening
+# `async with client.session(...)` once and binding tools via load_mcp_tools(session).
+_evaluator_holder: dict = {"agent": None, "mcp_session_cm": None, "mcp_session": None}
 
 
 async def build_evaluator_subagent():
@@ -2905,16 +2917,33 @@ async def build_evaluator_subagent():
     client = MultiServerMCPClient({
         "playwright": {"url": mcp_url, "transport": "sse"},
     })
+
+    # Persistent MCP session: open ONE session for the lifetime of the evaluator subagent.
+    # langchain-mcp-adapters has two modes:
+    #   1. client.get_tools() — returns tools that open a FRESH session per call. Default,
+    #      and broken for browser-based verification: each call gets a fresh Playwright
+    #      page, so any state (current URL, cookies, console messages) is lost between
+    #      calls. browser_navigate succeeds, then browser_snapshot returns about:blank.
+    #   2. async with client.session(name) → load_mcp_tools(session) — tools are bound to
+    #      a single persistent session, so all calls share browser state. We use this.
+    # Manual context-manager management: we enter the cm here and rely on process exit to
+    # close the SSE connection. _close_evaluator_mcp_session() in main()'s finally handles
+    # graceful close. Reconnect-on-error is a v2 concern; if the session dies the eval
+    # node's existing exception path catches it and routes to verdict=incomplete.
+    mcp_tools: list = []
     try:
-        mcp_tools = await client.get_tools()
-        print(f"  Loaded {len(mcp_tools)} Playwright MCP tools")
+        session_cm = client.session("playwright")
+        session = await session_cm.__aenter__()
+        _evaluator_holder["mcp_session_cm"] = session_cm
+        _evaluator_holder["mcp_session"] = session
+        mcp_tools = await load_mcp_tools(session)
+        print(f"  Loaded {len(mcp_tools)} Playwright MCP tools (persistent session)")
     except Exception as e:
         print(f"  WARN: failed to connect to Playwright MCP at {mcp_url}: {type(e).__name__}: {e}")
         # asyncio.TaskGroup wraps real causes; surface them so we know what to fix.
         for sub in getattr(e, "exceptions", ()):
             print(f"    cause: {type(sub).__name__}: {sub}")
         print("  WARN: evaluator will run with code-only tools (no screenshots).")
-        mcp_tools = []
 
     # Make individual tool failures recoverable. By default, BaseTool.handle_tool_error
     # is False and a ToolException raised by a tool propagates through .ainvoke / .astream
@@ -2932,6 +2961,22 @@ async def build_evaluator_subagent():
         tools=[view_file, list_dir, run_shell_oneshot, serve_in_background, stop_servers] + mcp_tools,
         **{_AGENT_PROMPT_KWARG: EVALUATOR_SYSTEM_PROMPT},
     )
+
+
+async def _close_evaluator_mcp_session() -> None:
+    """Gracefully close the persistent MCP SSE session at process shutdown. Idempotent —
+    safe to call when no session was ever opened (e.g., MCP wasn't reachable at startup)."""
+    cm = _evaluator_holder.get("mcp_session_cm")
+    if cm is None:
+        return
+    try:
+        await cm.__aexit__(None, None, None)
+    except Exception as e:
+        # Don't let cleanup errors mask the real reason the process is shutting down.
+        print(f"  (warn: error closing MCP session: {type(e).__name__}: {str(e)[:200]})")
+    finally:
+        _evaluator_holder["mcp_session_cm"] = None
+        _evaluator_holder["mcp_session"] = None
 
 
 def _tool_msg_content_str(content) -> str:
@@ -3493,7 +3538,16 @@ async def main():
     print("Ctrl-D to exit.\n")
 
     TRACE_DIR.mkdir(parents=True, exist_ok=True)
-    async with AsyncSqliteSaver.from_conn_string(str(CHECKPOINT_DB_PATH)) as saver:
+    # AsyncExitStack lets us register the MCP-session cleanup as a callback alongside the
+    # saver context manager, so both run on exit (normal or exception) without nesting more
+    # try/finally blocks. The MCP session is opened later (lazily, when the evaluator first
+    # builds), but registering the close callback up front guarantees it runs even if the
+    # process exits before the evaluator was ever invoked.
+    async with contextlib.AsyncExitStack() as stack:
+        stack.push_async_callback(_close_evaluator_mcp_session)
+        saver = await stack.enter_async_context(
+            AsyncSqliteSaver.from_conn_string(str(CHECKPOINT_DB_PATH))
+        )
         # Replace the no-checkpointer compiles with checkpointer-equipped ones.
         _graph_holder["builder"] = build_builder_graph(checkpointer=saver)
         _graph_holder["outer"] = build_outer_graph(checkpointer=saver)
