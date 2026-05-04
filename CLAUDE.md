@@ -45,8 +45,8 @@ These are not thread-safe. Single-threaded async only.
 ## Common commands
 
 - `docker compose build` — rebuild the langgraph image (after `requirements.txt` or `Dockerfile` changes).
-- `docker compose run --rm langgraph` — interactive task REPL.
-- `docker compose run --rm langgraph bash` — shell inside the container for debugging.
+- `docker compose run --rm --use-aliases langgraph` — interactive task REPL. The `--use-aliases` flag is REQUIRED: without it, the transient run container only has its container-name DNS alias, so the playwright-mcp sibling container can't resolve `langgraph:3000` for `browser_navigate` → Firefox returns `NS_ERROR_UNKNOWN_HOST`.
+- `docker compose run --rm --use-aliases langgraph bash` — shell inside the container for debugging. Same DNS reason if you'll be testing cross-container reachability.
 - `docker compose --profile local up -d llama-cpp` — start the local llama.cpp service (requires GGUF in `./models/`).
 - `ls workspace/.trace/` — list trace files. `jq -c 'select(.kind == "stuck_fire")' workspace/.trace/*.jsonl` to grep specific events.
 

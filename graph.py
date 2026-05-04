@@ -102,6 +102,9 @@ EVAL_INCOMPLETE_EXCEPTION_PATTERNS = [
     "browser launch",
     "playwright-mcp",            # transport URL or generic mention
     "ms-playwright",             # bundled-browser path mention in errors
+    "NS_ERROR_UNKNOWN_HOST",     # Firefox couldn't resolve the target hostname (cross-container DNS)
+    "browserBackend",            # MCP-side browser backend errors surface this token
+    "ToolException",             # langchain wraps most MCP transport failures in ToolException
 ]
 
 # Shell (both persistent and one-shot)
