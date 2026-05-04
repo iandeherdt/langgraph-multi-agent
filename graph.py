@@ -95,6 +95,25 @@ EVAL_MIN_SCREENSHOT_CALLS = 1   # browser_take_screenshot calls
 EVAL_MIN_CLICK_CALLS = 2        # browser_click calls (1 menu + 1 admin minimum)
 EVAL_INSUFFICIENT_EVIDENCE_RETRY_CAP = 2  # max re-eval rounds before accepting whatever we got
 
+# Empty-notes rejection. The evaluator was emitting verdict blocks with literally empty NOTES
+# (the model browsed pages, observed bugs, then wrote `NOTES:` with nothing under it). The
+# advisor correctly rejects empty notes as insufficient — but that rejection happened upstream
+# of the harness, after the eval had already exited. Now we catch empty notes inline and
+# force one retry with a corrective preamble before accepting. After the retry cap, escalate
+# to verdict=incomplete (genuine eval failure: model can't produce findings even when prompted).
+EVAL_NOTES_MIN_CHARS = 100              # below this, treated as empty/missing for web-app tasks
+EVAL_EMPTY_NOTES_RETRY_CAP = 1          # one retry; second empty notes → incomplete
+
+# Heartbeat thresholds per subagent label. The evaluator routinely takes 30-60s to compose
+# its verdict block (natural-language synthesis over many tool observations) — the 20s
+# default fired idle warnings spuriously and could mask real progress. Eval gets the longer
+# threshold; builder/planner stay tight (they should be making tool calls, not pausing to
+# write essays). The threshold here is informational only — it controls when we LOG idle,
+# not when anything is terminated. But longer also means we don't pollute the trace with
+# benign eval-thinking pauses.
+EVAL_HEARTBEAT_THRESHOLD_SECONDS = 60
+EVAL_HEARTBEAT_INTERVAL_SECONDS = 60
+
 # Eval exception → verdict="incomplete" mapping. When the evaluator subagent crashes with
 # an MCP / Playwright / browser-launch error, that is NOT a "the work is wrong, try again"
 # signal — it's an infrastructure failure the builder cannot fix. Mapping these to verdict=
@@ -3041,6 +3060,16 @@ async def _stream_subagent(subagent, prompt: str, label: str, recursion_limit: i
     enforcement). Caller passes a fresh dict each invocation; we never reset it.
     """
     final_text = ""
+    # Per-label idle thresholds: eval composes verdict prose between tool calls and may
+    # pause 30-60s mid-synthesis. Builder/planner should be moving fast; tighter threshold
+    # surfaces real stalls. Single global default would either spam idle warnings during
+    # legitimate eval composition OR miss real builder hangs.
+    if label == "eval":
+        threshold_s = EVAL_HEARTBEAT_THRESHOLD_SECONDS
+        interval_s = EVAL_HEARTBEAT_INTERVAL_SECONDS
+    else:
+        threshold_s = HEARTBEAT_THRESHOLD_SECONDS
+        interval_s = HEARTBEAT_INTERVAL_SECONDS
     stream = subagent.astream(
         {"messages": [HumanMessage(content=prompt)]},
         config={"recursion_limit": recursion_limit},
@@ -3050,12 +3079,12 @@ async def _stream_subagent(subagent, prompt: str, label: str, recursion_limit: i
     idle_ticks = 0
     while True:
         try:
-            event = await asyncio.wait_for(stream.__anext__(), timeout=HEARTBEAT_INTERVAL_SECONDS)
+            event = await asyncio.wait_for(stream.__anext__(), timeout=interval_s)
         except StopAsyncIteration:
             break
         except asyncio.TimeoutError:
             idle_for = time.monotonic() - last_event_time
-            if idle_for >= HEARTBEAT_THRESHOLD_SECONDS:
+            if idle_for >= threshold_s:
                 idle_ticks += 1
                 print(f"  ·· {label} [idle {int(idle_for)}s]", flush=True)
                 TRACE.log("subagent_idle", label=label, idle_ms=int(idle_for * 1000),
@@ -3267,6 +3296,17 @@ def _eval_evidence_shortfall(tool_counter: dict) -> list[str]:
     return short
 
 
+def _eval_notes_too_short(notes: str) -> bool:
+    """True when the verdict's NOTES content is too thin to act on for a web-app task.
+
+    Definition: under EVAL_NOTES_MIN_CHARS (currently 100) of non-whitespace content.
+    Catches the empty-notes failure mode — model wrote `NOTES:` with nothing after, or
+    just one short sentence — that the advisor was rejecting upstream after the eval had
+    already exited. Now we catch inline and force one retry with a corrective preamble.
+    """
+    return len((notes or "").strip()) < EVAL_NOTES_MIN_CHARS
+
+
 async def evaluator_node(state: State) -> dict:
     if _evaluator_holder["agent"] is None:
         _evaluator_holder["agent"] = await build_evaluator_subagent()
@@ -3292,20 +3332,28 @@ async def evaluator_node(state: State) -> dict:
         f"Verify the work and emit your verdict block at the end."
     )
 
-    # Layer 2 enforcement loop. On a web-app task, a verdict of "done" without browser
-    # interaction evidence (navigate + screenshot + at least 2 clicks) gets rejected and the
-    # evaluator is re-invoked with a corrective preamble. Capped to prevent infinite loops.
-    retry_round = 0
+    # Two-track enforcement loop on web-app tasks. Both reject thin verdicts and force a
+    # retry with a targeted corrective preamble; each track has its own cap.
+    #   evidence_retry: verdict=done but tool counters under EVAL_MIN_* — model claimed
+    #     done without exercising the running app.
+    #   empty_notes_retry: any verdict with NOTES under EVAL_NOTES_MIN_CHARS — model
+    #     observed bugs but didn't write findings down. The empty-notes failure mode
+    #     was producing builder→advisor→eval→empty→builder loops because the advisor
+    #     correctly rejected the empty NOTES upstream, but only after the harness had
+    #     already accepted them.
+    evidence_retry = 0
+    empty_notes_retry = 0
+    last_failure: str | None = None  # "evidence" | "empty_notes" | None
     text = ""
     verdict = "continue"
     notes = ""
     tool_counter: dict = {}
     while True:
         prompt = base_prompt
-        if retry_round > 0:
+        if last_failure == "evidence":
             shortfall = _eval_evidence_shortfall(tool_counter)
             prompt = (
-                f"⚠️  YOUR PRIOR VERDICT WAS REJECTED BY THE HARNESS (round {retry_round}/"
+                f"⚠️  YOUR PRIOR VERDICT WAS REJECTED BY THE HARNESS (round {evidence_retry}/"
                 f"{EVAL_INSUFFICIENT_EVIDENCE_RETRY_CAP}).\n\n"
                 f"You declared verdict=done but did NOT actually exercise the running app:\n"
                 f"  - " + "\n  - ".join(shortfall) + "\n\n"
@@ -3316,6 +3364,24 @@ async def evaluator_node(state: State) -> dict:
                 f"Take at least one screenshot, examine it (you have vision — describe what you "
                 f"see), click at least one menu item AND attempt the admin login flow. Re-emit "
                 f"your verdict with that evidence in NOTES.\n\n"
+                + base_prompt
+            )
+        elif last_failure == "empty_notes":
+            prompt = (
+                f"⚠️  YOUR PRIOR VERDICT HAD EMPTY NOTES (round {empty_notes_retry}/"
+                f"{EVAL_EMPTY_NOTES_RETRY_CAP}).\n\n"
+                f"You wrote a VERDICT line but no actionable NOTES under it. The harness "
+                f"requires concrete findings: which pages were navigated, what was visible on "
+                f"each (quoted from your snapshots), what console errors appeared, what "
+                f"happened when nav links were clicked. Verdicts without findings are useless "
+                f"to the next planner pass and are rejected by the harness.\n\n"
+                f"DO NOT gather more data this round. Use what you've already observed. Re-emit "
+                f"the verdict block with NOTES populated from the tool calls you already made. "
+                f"For example, if you navigated to /admin/menu and the page showed an Unhandled "
+                f"Runtime Error overlay with 16 console errors, NOTES should say so explicitly: "
+                f"'/admin/menu shows runtime error overlay; browser_console_messages reported 16 "
+                f"errors'. Cite specific URLs, specific error counts, specific page titles, "
+                f"specific click results.\n\n"
                 + base_prompt
             )
         try:
@@ -3411,24 +3477,81 @@ async def evaluator_node(state: State) -> dict:
         verdict = _extract_verdict(text)
         notes = _extract_notes(text) or text
 
-        # Layer 2: reject thin verdicts on web-app tasks. Non-done verdicts (continue/replan/
-        # incomplete) are accepted as-is — the loop is only protecting against false-done.
+        # Layer 2a: empty-notes rejection. On web-app tasks, NOTES under EVAL_NOTES_MIN_CHARS
+        # is rejected and the eval is re-invoked with a corrective preamble that asks for
+        # findings from already-observed data (no more exploration). Cap=1: second empty
+        # notes → escalate to verdict=incomplete (genuine eval failure to produce findings).
+        if is_web_app and _eval_notes_too_short(notes):
+            if empty_notes_retry < EVAL_EMPTY_NOTES_RETRY_CAP:
+                TRACE.log("evaluator_empty_notes_rejected",
+                          retry_round=empty_notes_retry + 1,
+                          retry_cap=EVAL_EMPTY_NOTES_RETRY_CAP,
+                          notes_chars=len((notes or "").strip()),
+                          notes_preview=(notes or "").strip()[:300],
+                          rejected_verdict=verdict)
+                print(f"\n  REJECTED: empty NOTES on web-app verdict "
+                      f"(round {empty_notes_retry + 1}/{EVAL_EMPTY_NOTES_RETRY_CAP}). "
+                      f"Forcing retry to populate findings.")
+                empty_notes_retry += 1
+                last_failure = "empty_notes"
+                continue
+            else:
+                # Cap exceeded: escalate to incomplete with a salvage attempt from the
+                # tool history. The eval has demonstrated it cannot produce findings even
+                # when explicitly asked; treat as an evaluator failure mode, not a routine
+                # continue (which would loop the builder on the same untested work).
+                findings_data = _extract_eval_findings(_eval_tool_history)
+                TRACE.log("evaluator_empty_notes_cap_exceeded",
+                          retry_cap=EVAL_EMPTY_NOTES_RETRY_CAP,
+                          findings_count=len(findings_data["findings"]),
+                          pages_ok=findings_data["pages_ok"],
+                          pages_with_errors=findings_data["pages_with_errors"])
+                print(f"\n  ESCALATED: empty NOTES persisted across "
+                      f"{EVAL_EMPTY_NOTES_RETRY_CAP + 1} rounds — verdict=incomplete.")
+                if findings_data["findings"]:
+                    salvage = "\n".join(f"  - {f}" for f in findings_data["findings"])
+                    notes = (
+                        f"Evaluator failed to write actionable NOTES across "
+                        f"{EVAL_EMPTY_NOTES_RETRY_CAP + 1} rounds. The harness salvaged "
+                        f"these findings from the tool history:\n{salvage}\n"
+                        f"Pages with errors: {', '.join(findings_data['pages_with_errors']) or '(none)'}\n"
+                        f"Pages OK: {', '.join(findings_data['pages_ok']) or '(none)'}\n"
+                        f"Recommend: next planner narrows the eval task to focus on the "
+                        f"specific pages with observed bugs, OR rewrite eval instructions "
+                        f"to prompt for verbatim citation of snapshots in NOTES."
+                    )
+                else:
+                    notes = (
+                        f"Evaluator failed to write actionable NOTES across "
+                        f"{EVAL_EMPTY_NOTES_RETRY_CAP + 1} rounds and the tool history "
+                        f"contained no extractable findings. The eval may have spent its "
+                        f"budget on exploration without observing testable behavior — "
+                        f"recommend the next planner narrows EVALUATOR_INSTRUCTIONS to "
+                        f"specific URLs and what to look for on each."
+                    )
+                verdict = "incomplete"
+                break
+
+        # Layer 2b: insufficient evidence on done verdicts (existing). Non-done verdicts
+        # (continue/replan/incomplete) are accepted as-is here — the loop is only protecting
+        # against false-done.
         if (is_web_app
                 and verdict == "done"
-                and retry_round < EVAL_INSUFFICIENT_EVIDENCE_RETRY_CAP):
+                and evidence_retry < EVAL_INSUFFICIENT_EVIDENCE_RETRY_CAP):
             shortfall = _eval_evidence_shortfall(tool_counter)
             if shortfall:
                 TRACE.log("evaluator_verdict_rejected_insufficient_evidence",
-                          retry_round=retry_round + 1,
+                          retry_round=evidence_retry + 1,
                           retry_cap=EVAL_INSUFFICIENT_EVIDENCE_RETRY_CAP,
                           tool_counter=dict(tool_counter),
                           shortfall=shortfall,
                           rejected_verdict=verdict)
                 print(f"\n  REJECTED: 'done' verdict without interaction evidence "
-                      f"(round {retry_round + 1}/{EVAL_INSUFFICIENT_EVIDENCE_RETRY_CAP}).")
+                      f"(round {evidence_retry + 1}/{EVAL_INSUFFICIENT_EVIDENCE_RETRY_CAP}).")
                 for s in shortfall:
                     print(f"    - {s}")
-                retry_round += 1
+                evidence_retry += 1
+                last_failure = "evidence"
                 continue
         break
 
@@ -3436,7 +3559,8 @@ async def evaluator_node(state: State) -> dict:
     print(f"  NOTES: {_truncate_simple(notes, 400)}")
     TRACE.log("verdict", verdict=verdict, notes=notes[:1000],
               tool_counter=dict(tool_counter), is_web_app=is_web_app,
-              evidence_retry_rounds=retry_round)
+              evidence_retry_rounds=evidence_retry,
+              empty_notes_retry_rounds=empty_notes_retry)
     return {"eval_verdict": verdict, "eval_notes": notes}
 
 
