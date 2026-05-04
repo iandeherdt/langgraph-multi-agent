@@ -3172,23 +3172,38 @@ def _is_web_app_task(state: State, plan_doc: dict) -> bool:
 
 
 def _extract_eval_findings(history: list[dict]) -> dict:
-    """Scan recent eval tool calls + results for actionable findings.
+    """Scan recent eval tool calls + results for both negative and positive observations.
 
-    Returns a dict with three lists:
-        findings: list[str] of human-readable observations (console errors, runtime
-            error dialogs, broken redirects, non-2xx responses, error pages)
-        pages_ok: list[str] of URLs that loaded with no observed errors
-        pages_with_errors: list[str] of URLs where at least one finding was observed
+    Returns:
+        findings:           list[str] — human-readable failure observations (console errors,
+                            runtime error dialogs, broken redirects, non-2xx responses)
+        pages_ok:           list[str] — URLs navigated cleanly with no observed errors
+        pages_with_errors:  list[str] — URLs where at least one finding fired
+        screenshots_taken:  int — count of browser_take_screenshot calls
+        interactions:       int — count of browser_click + browser_type + browser_fill_form
+                            + browser_run_code_unsafe calls (proxy for "exercised the UI")
+        navigates:          int — count of browser_navigate calls
 
-    Used by the recursion-limit handler so a budget-overrun run still produces actionable
-    verdict notes — the eval may have observed real bugs (the user's complaint) and we
-    don't want to discard them with generic "couldn't escape debugging loop" boilerplate.
-    Returns empty lists when nothing extractable.
+    Used by the recursion-limit handler AND the empty-notes-cap-exceeded escalation: a
+    budget-overrun OR communication-failed eval still produces actionable verdict notes.
+    Failure findings are surfaced for the obvious bug case (eval saw a runtime error and
+    didn't write it down). Positive observations are surfaced for the harder case where the
+    eval browsed cleanly but produced empty notes — without these the salvage emits "no
+    extractable findings" even though it has a full trail of successful navigates +
+    screenshots + form interactions. The next planner needs to know the eval DID exercise
+    the app even if it didn't synthesize a verdict.
     """
     findings: list[str] = []
     pages_ok: list[str] = []
     pages_with_errors: list[str] = []
     seen_urls: set[str] = set()
+    screenshots_taken = 0
+    interactions = 0
+    navigates = 0
+    _interactive_tools = {
+        "browser_click", "browser_type", "browser_fill_form",
+        "browser_press_key", "browser_run_code_unsafe", "browser_select_option",
+    }
 
     # Pair each result with the call that produced it, so we know what URL was being
     # browsed when, e.g., a snapshot showed a runtime-error dialog. last_nav_url tracks
@@ -3201,10 +3216,16 @@ def _extract_eval_findings(history: list[dict]) -> dict:
         if entry["kind"] == "call":
             if entry["tool"] == "browser_navigate":
                 last_nav_url = (entry.get("args") or {}).get("url")
+                navigates += 1
             elif entry["tool"] == "browser_click":
                 # The args usually contain a `ref` or `element` description we can quote.
                 args = entry.get("args") or {}
                 last_click_target = args.get("element") or args.get("ref") or "unknown element"
+                interactions += 1
+            elif entry["tool"] == "browser_take_screenshot":
+                screenshots_taken += 1
+            elif entry["tool"] in _interactive_tools:
+                interactions += 1
             continue
 
         # entry["kind"] == "result"
@@ -3288,7 +3309,66 @@ def _extract_eval_findings(history: list[dict]) -> dict:
         "findings": _dedupe(findings),
         "pages_ok": _dedupe(pages_ok),
         "pages_with_errors": _dedupe(pages_with_errors),
+        "screenshots_taken": screenshots_taken,
+        "interactions": interactions,
+        "navigates": navigates,
     }
+
+
+def _format_findings_for_notes(findings_data: dict, *, header: str) -> str:
+    """Format extracted findings as multi-line verdict notes.
+
+    Two main shapes depending on what the extractor saw:
+      - With failure findings: list them, then append pages-with-errors / pages-ok summary.
+      - Without failure findings: surface positive activity (N pages browsed, M screenshots,
+        K interactions) so the next planner knows the eval DID exercise the app even if it
+        didn't synthesize a verdict.
+    Either way: the notes are actionable evidence, not generic "no observations" boilerplate.
+    """
+    findings = findings_data.get("findings") or []
+    pages_ok = findings_data.get("pages_ok") or []
+    pages_err = findings_data.get("pages_with_errors") or []
+    nav = findings_data.get("navigates", 0)
+    snaps = findings_data.get("screenshots_taken", 0)
+    inters = findings_data.get("interactions", 0)
+
+    lines = [header]
+    if findings:
+        lines.append("Findings extracted from tool history:")
+        for f in findings:
+            lines.append(f"  - {f}")
+        if pages_err:
+            lines.append(f"Pages with observed errors: {', '.join(pages_err)}")
+        if pages_ok:
+            lines.append(f"Pages verified without observed errors: {', '.join(pages_ok)}")
+    elif pages_ok or nav or snaps or inters:
+        # No failure findings, but the eval clearly exercised the app. Report the activity
+        # so the next planner doesn't think the eval did nothing.
+        lines.append(
+            f"No failure signals extracted, BUT the eval did exercise the app: "
+            f"{nav} navigate(s), {snaps} screenshot(s), {inters} interaction(s) "
+            f"(clicks / form fills / page-script runs)."
+        )
+        if pages_ok:
+            lines.append(
+                f"Pages browsed cleanly with no observed console errors / runtime overlays: "
+                f"{', '.join(pages_ok)}"
+            )
+        lines.append(
+            "The work may actually be done — the model just failed to write the findings "
+            "down. Recommend: re-run with narrower EVALUATOR_INSTRUCTIONS asking the eval "
+            "to verify a SPECIFIC behavior on each named URL (e.g., 'on /admin/menu, "
+            "confirm sidebar does not overlap content; quote the snapshot heading text')."
+        )
+    else:
+        # Truly nothing — neither failures observed nor browsing activity.
+        lines.append(
+            "No actionable observations were salvageable from the tool history. The eval "
+            "may have spent its budget on shell/file inspection without exercising the "
+            "running app. Recommend: planner narrows EVALUATOR_INSTRUCTIONS to specific "
+            "URLs and what to look for on each."
+        )
+    return "\n".join(lines)
 
 
 def _eval_evidence_shortfall(tool_counter: dict) -> list[str]:
@@ -3409,35 +3489,18 @@ async def evaluator_node(state: State) -> dict:
             TRACE.log("evaluator_recursion_limit", limit=EVAL_RECURSION_LIMIT,
                       findings_count=len(findings_data["findings"]),
                       pages_ok=findings_data["pages_ok"],
-                      pages_with_errors=findings_data["pages_with_errors"])
+                      pages_with_errors=findings_data["pages_with_errors"],
+                      navigates=findings_data.get("navigates", 0),
+                      screenshots_taken=findings_data.get("screenshots_taken", 0),
+                      interactions=findings_data.get("interactions", 0))
             print(f"\n  EVALUATOR RECURSION LIMIT ({EVAL_RECURSION_LIMIT}) — returning 'continue'.")
-            if findings_data["findings"]:
-                lines = [
+            notes = _format_findings_for_notes(
+                findings_data,
+                header=(
                     f"Evaluator hit recursion limit at {EVAL_RECURSION_LIMIT} steps before "
-                    f"writing a verdict block. Findings extracted from tool history:",
-                ]
-                for f in findings_data["findings"]:
-                    lines.append(f"  - {f}")
-                if findings_data["pages_ok"]:
-                    lines.append(f"Pages verified without observed errors: "
-                                 f"{', '.join(findings_data['pages_ok'])}")
-                if findings_data["pages_with_errors"]:
-                    lines.append(f"Pages with observed errors: "
-                                 f"{', '.join(findings_data['pages_with_errors'])}")
-                lines.append(
-                    "Recommend: next planner narrows EVALUATOR_INSTRUCTIONS to focus on the "
-                    "above pages, or raise the recursion limit if a thorough sweep is needed."
-                )
-                notes = "\n".join(lines)
-            else:
-                notes = (
-                    f"Evaluator hit its recursion limit of {EVAL_RECURSION_LIMIT} steps without "
-                    f"producing a verdict and no actionable observations were salvageable from "
-                    f"the tool history. Likely a debugging loop the eval couldn't escape (e.g., "
-                    f"server-restart loop, repeated curl against an unhealthy endpoint). The "
-                    f"next planner should narrow the eval instructions or address obstacles the "
-                    f"eval couldn't get past on its own."
-                )
+                    f"writing a verdict block."
+                ),
+            )
             print(f"  NOTES: {_truncate_simple(notes, 400)}")
             return {"eval_verdict": "continue", "eval_notes": notes}
         except Exception as e:
@@ -3515,30 +3578,21 @@ async def evaluator_node(state: State) -> dict:
                           retry_cap=EVAL_EMPTY_NOTES_RETRY_CAP,
                           findings_count=len(findings_data["findings"]),
                           pages_ok=findings_data["pages_ok"],
-                          pages_with_errors=findings_data["pages_with_errors"])
+                          pages_with_errors=findings_data["pages_with_errors"],
+                          navigates=findings_data.get("navigates", 0),
+                          screenshots_taken=findings_data.get("screenshots_taken", 0),
+                          interactions=findings_data.get("interactions", 0))
                 print(f"\n  ESCALATED: empty NOTES persisted across "
                       f"{EVAL_EMPTY_NOTES_RETRY_CAP + 1} rounds — verdict=incomplete.")
-                if findings_data["findings"]:
-                    salvage = "\n".join(f"  - {f}" for f in findings_data["findings"])
-                    notes = (
+                # Notes start with the marker string "failed to write actionable NOTES" so
+                # route_after_eval can distinguish this from infrastructure-failure incomplete.
+                notes = _format_findings_for_notes(
+                    findings_data,
+                    header=(
                         f"Evaluator failed to write actionable NOTES across "
-                        f"{EVAL_EMPTY_NOTES_RETRY_CAP + 1} rounds. The harness salvaged "
-                        f"these findings from the tool history:\n{salvage}\n"
-                        f"Pages with errors: {', '.join(findings_data['pages_with_errors']) or '(none)'}\n"
-                        f"Pages OK: {', '.join(findings_data['pages_ok']) or '(none)'}\n"
-                        f"Recommend: next planner narrows the eval task to focus on the "
-                        f"specific pages with observed bugs, OR rewrite eval instructions "
-                        f"to prompt for verbatim citation of snapshots in NOTES."
-                    )
-                else:
-                    notes = (
-                        f"Evaluator failed to write actionable NOTES across "
-                        f"{EVAL_EMPTY_NOTES_RETRY_CAP + 1} rounds and the tool history "
-                        f"contained no extractable findings. The eval may have spent its "
-                        f"budget on exploration without observing testable behavior — "
-                        f"recommend the next planner narrows EVALUATOR_INSTRUCTIONS to "
-                        f"specific URLs and what to look for on each."
-                    )
+                        f"{EVAL_EMPTY_NOTES_RETRY_CAP + 1} rounds."
+                    ),
+                )
                 verdict = "incomplete"
                 break
 
@@ -3644,27 +3698,53 @@ def route_after_eval(state: State) -> Literal["planner", "builder", "__end__"]:
     if verdict == "replan":
         return "planner"
     if verdict == "incomplete":
-        # Infrastructure failure — Playwright MCP unreachable, transport closed, browser not
-        # installed, DNS resolution failed, etc. The builder cannot fix this; sending it back
-        # loops the same crash. Terminate with a diagnostic the operator can act on.
-        # Builder's work is preserved in the workspace.
+        # Two distinct paths set verdict=incomplete with very different causes:
+        #   1. Infra failure — MCP unreachable, transport closed, browser not installed,
+        #      DNS broken. Notes start with "INFRASTRUCTURE failure" (set by the eval
+        #      exception handler). Manual recovery: restart playwright-mcp, check DNS.
+        #   2. Eval failure to communicate — model browsed pages successfully, observed
+        #      whatever, but emitted empty NOTES across the retry cap. Notes start with
+        #      "failed to write actionable NOTES" (set by the empty-notes cap branch).
+        #      Infra is fine; manual recovery: read the salvaged findings + screenshots.
+        # The diagnostic must distinguish these — telling the user "fix infrastructure"
+        # when actually nothing was wrong with infra is a misleading dead-end.
         notes = str(state.get("eval_notes", "(no notes)"))
+        is_eval_communication_failure = "failed to write actionable NOTES" in notes
         print(f"\n━━━ Verification incomplete ━━━")
-        print(f"The evaluator could not complete browser-based verification because of MCP "
-              f"infrastructure issues:")
-        print(f"  {_truncate_simple(notes, 500)}")
-        print()
-        print(f"This is an infrastructure failure, not a code failure. The harness will not "
-              f"retry the builder.")
-        print()
-        print(f"The builder's last work is preserved. To verify manually:")
-        print(f"  1. Confirm the dev server is reachable from your host. With ./run.sh's")
-        print(f"     --service-ports, http://localhost:3000 on the host should hit the")
-        print(f"     container's dev server. Open it in a browser.")
-        print(f"  2. Inspect what the eval did capture: workspace/.playwright-mcp/ contains")
-        print(f"     screenshots, snapshots, and console logs from the crashed run.")
-        print(f"  3. Recover the MCP if the failure was transport-level:")
-        print(f"     `docker compose restart playwright-mcp`, then re-run.")
+        if is_eval_communication_failure:
+            print(f"The evaluator browsed the app but did not communicate findings:")
+            print(f"  {_truncate_simple(notes, 500)}")
+            print()
+            print(f"This is an evaluator-level failure, not an infrastructure or code "
+                  f"failure. The dev server, MCP transport, and Playwright are all healthy. "
+                  f"The harness will not retry the builder.")
+            print()
+            print(f"The builder's last work is preserved. To recover:")
+            print(f"  1. Inspect what the eval observed: workspace/.playwright-mcp/ has")
+            print(f"     all screenshots, accessibility snapshots, and console-message")
+            print(f"     dumps from the eval's tool calls. Browse them on your Mac.")
+            print(f"  2. Open the app in a host browser at http://localhost:3000 and")
+            print(f"     verify by hand. The dev server should be reachable.")
+            print(f"  3. If running again: narrow EVALUATOR_INSTRUCTIONS to specific URLs")
+            print(f"     and what to look for on each — the model needs concrete prompts")
+            print(f"     to produce concrete findings.")
+        else:
+            print(f"The evaluator could not complete browser-based verification because of "
+                  f"MCP infrastructure issues:")
+            print(f"  {_truncate_simple(notes, 500)}")
+            print()
+            print(f"This is an infrastructure failure, not a code failure. The harness will "
+                  f"not retry the builder.")
+            print()
+            print(f"The builder's last work is preserved. To recover:")
+            print(f"  1. Confirm the dev server is reachable from your host. With ./run.sh's")
+            print(f"     --service-ports, http://localhost:3000 on the host should hit the")
+            print(f"     container's dev server. Open it in a browser.")
+            print(f"  2. Inspect what the eval did capture before the crash:")
+            print(f"     workspace/.playwright-mcp/ has screenshots, snapshots, and console")
+            print(f"     logs from before the transport dropped.")
+            print(f"  3. Recover the MCP if the failure was transport-level:")
+            print(f"     `docker compose restart playwright-mcp`, then re-run.")
         print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         return END
     return "builder"
