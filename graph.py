@@ -93,26 +93,24 @@ EVAL_INSUFFICIENT_EVIDENCE_RETRY_CAP = 2  # max re-eval rounds before accepting 
 # embedded browser name, which is why the pattern is "is not installed" not "browser is
 # not installed").
 EVAL_INCOMPLETE_EXCEPTION_PATTERNS = [
-    "Playwright",
+    # Conservative: each pattern must be a clear infrastructure-failure signal, not a
+    # recoverable per-tool error. Bare "Playwright" was REMOVED because it false-positived
+    # on the literal substring `/tmp/.playwright-mcp/` in tool error paths (which is a
+    # workspace path, not an infra issue). "ToolException" was REMOVED because once we
+    # wrap MCP tools with handle_tool_error=True, ToolExceptions become tool results and
+    # only escape on infrastructure-level failures — keeping the wrapper-token broad over-
+    # matches once individual tool errors are already recoverable. Cleared error tokens
+    # below leave bare module/transport mentions and only-at-startup signals.
     "is not installed",          # Browser "<name>" is not installed at /ms-playwright/...
-    "ConnectError",
-    "Cannot find module 'playwright",
-    "MCP server",
+    "ConnectError",              # SSE transport / DNS at MCP-connect time
+    "Cannot find module 'playwright",  # missing dep
+    "MCP server",                # server-level error, e.g. failed to start
     "launching browser",         # Error launching browser
     "browser launch",
-    "playwright-mcp",            # transport URL or generic mention
-    "ms-playwright",             # bundled-browser path mention in errors
     "NS_ERROR_UNKNOWN_HOST",     # Firefox couldn't resolve the target hostname (cross-container DNS)
-    "browserBackend",            # MCP-side browser backend errors surface this token
-    "ToolException",             # langchain wraps most MCP transport failures in ToolException
-    # Generic AttributeError isn't always infrastructure, but the eval subagent in our
-    # harness only loads MCP browser tools + a fixed set of code tools we control. An
-    # AttributeError raised inside the eval path is almost always an MCP response-shape
-    # regression (multimodal content list vs str, schema drift between MCP versions). Route
-    # to incomplete so a single shape change doesn't loop builder→eval→crash three times
-    # before give_up. Misroutes here are cheap (the operator inspects the trace, fixes
-    # the harness or pins the MCP version) and far cheaper than the loop.
-    "AttributeError",
+    "browserBackend.launch",     # MCP-side launch failure (NOT bare "browserBackend" — too broad)
+    "ECONNREFUSED",              # transport refused
+    "Connection refused",        # likewise (some langchain wrappers spell it out)
 ]
 
 # Shell (both persistent and one-shot)
@@ -2917,6 +2915,18 @@ async def build_evaluator_subagent():
             print(f"    cause: {type(sub).__name__}: {sub}")
         print("  WARN: evaluator will run with code-only tools (no screenshots).")
         mcp_tools = []
+
+    # Make individual tool failures recoverable. By default, BaseTool.handle_tool_error
+    # is False and a ToolException raised by a tool propagates through .ainvoke / .astream
+    # and out of the subagent, terminating the entire eval. With True, the exception's str()
+    # is returned to the agent as the tool result instead, so the model sees the error
+    # message and can retry with different args (e.g., screenshot with a valid filename).
+    # Real infrastructure failures (MCP transport down, browser not installed) still
+    # surface — those raise different exception types (ConnectError, missing browser
+    # bundles) at connection time, not as ToolException at call time.
+    for t in mcp_tools:
+        t.handle_tool_error = True
+
     return create_agent(
         evaluator_llm,
         tools=[view_file, list_dir, run_shell_oneshot, serve_in_background, stop_servers] + mcp_tools,

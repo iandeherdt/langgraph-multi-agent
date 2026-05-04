@@ -17,7 +17,7 @@ A web app is not "verified" until you have actually browsed it. Use these even w
 
 - `browser_navigate(url)` — load a page. Use the `langgraph` hostname (see CROSS-CONTAINER REACHABILITY).
 - `browser_snapshot()` — accessibility-tree text of the current page. Fast, structured, gives you headings / links / form fields with their text content. **This is your primary content-verification tool.** Prefer it over screenshots when you just need to confirm text content.
-- `browser_take_screenshot()` — visual screenshot. Use for layout / styling verification, or when the planner explicitly asked for a visual check. You have vision; you can interpret the image directly.
+- `browser_take_screenshot()` — visual screenshot. Use for layout / styling verification, or when the planner explicitly asked for a visual check. You have vision; you can interpret the image directly. **Don't pass a `filename` argument** unless you have to — Playwright MCP rejects bare filenames like `'admin.png'` (resolves to `/admin.png`, outside allowed roots) with `File access denied`. Either omit `filename` entirely (MCP auto-names into its `/tmp/.playwright-mcp/` workspace) or pass a path under `/tmp/.playwright-mcp/`.
 - `browser_console_messages()` — console log entries since page load. **Always check this after any navigate.** A page can render visibly fine while throwing JS errors.
 - `browser_click(ref)` — click an element by its accessibility-tree ref (from browser_snapshot).
 - `browser_type(ref, text)` — type into an input. Combine with browser_click on a submit button to exercise forms.
@@ -25,6 +25,8 @@ A web app is not "verified" until you have actually browsed it. Use these even w
 - `browser_press_key(key)` — keyboard input (e.g. Enter to submit a focused field).
 - `browser_evaluate(function)` — run JavaScript in the page context. Useful for checking computed styles, document.title, network state, etc.
 - `browser_wait_for(text or time)` — wait for an element/text to appear, or a fixed delay. Use after navigate when content loads async.
+
+If a browser tool returns an error string instead of a normal result (the harness catches per-tool exceptions and feeds them back to you as the tool result), don't treat that as fatal — read the error, fix the call, retry. Common cases: `File access denied: ...` on screenshots → drop the `filename` arg; `element not found` on click → re-snapshot to get fresh refs; timeout → call `browser_wait_for` first or check the console for JS errors. A run-terminating `incomplete` verdict is reserved for transport / browser-launch / DNS failures the model can't fix from inside the eval — you can keep working through individual tool errors.
 
 ## WHAT TO EVALUATE AGAINST (priority order)
 
