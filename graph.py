@@ -137,12 +137,22 @@ EVAL_INCOMPLETE_EXCEPTION_PATTERNS = [
     "ConnectError",              # SSE transport / DNS at MCP-connect time
     "Cannot find module 'playwright",  # missing dep
     "MCP server",                # server-level error, e.g. failed to start
+    "MCP transport",             # langchain-mcp wrappers report transport-level disconnects
     "launching browser",         # Error launching browser
     "browser launch",
     "NS_ERROR_UNKNOWN_HOST",     # Firefox couldn't resolve the target hostname (cross-container DNS)
     "browserBackend.launch",     # MCP-side launch failure (NOT bare "browserBackend" — too broad)
     "ECONNREFUSED",              # transport refused
     "Connection refused",        # likewise (some langchain wrappers spell it out)
+    # anyio-level transport disconnects. The persistent SSE session occasionally drops mid-
+    # eval (long runs, MCP-side resource exhaustion, occasional network blip). Without these,
+    # the closed-stream error surfaces as a per-tool exception that's NOT in the existing
+    # patterns and routes to verdict=continue → builder retries → same crash → loop. Three
+    # tokens because the disconnect manifests at slightly different stack frames depending
+    # on which anyio coro raises first.
+    "ClosedResourceError",       # the bare exception class
+    "send_nowait",               # the anyio call site where the closed stream is detected
+    "BrokenResourceError",       # related anyio exception when peer closed unexpectedly
 ]
 
 # Shell (both persistent and one-shot)
@@ -3634,17 +3644,28 @@ def route_after_eval(state: State) -> Literal["planner", "builder", "__end__"]:
     if verdict == "replan":
         return "planner"
     if verdict == "incomplete":
-        # Infrastructure failure — Playwright MCP unreachable, browser not installed, etc.
-        # The builder cannot fix this; sending it back loops the same crash. Terminate with
-        # a diagnostic the operator can act on. Builder's work is preserved in the workspace.
+        # Infrastructure failure — Playwright MCP unreachable, transport closed, browser not
+        # installed, DNS resolution failed, etc. The builder cannot fix this; sending it back
+        # loops the same crash. Terminate with a diagnostic the operator can act on.
+        # Builder's work is preserved in the workspace.
         notes = str(state.get("eval_notes", "(no notes)"))
         print(f"\n━━━ Verification incomplete ━━━")
-        print(f"The work could not be verified because of infrastructure issues:")
-        print(f"  {_truncate_simple(notes, 600)}")
-        print(f"Fix the infrastructure (rebuild playwright-mcp, check MCP transport) and "
-              f"re-run.")
-        print(f"The builder's last work is preserved. You may continue from this state once "
-              f"verification is possible.")
+        print(f"The evaluator could not complete browser-based verification because of MCP "
+              f"infrastructure issues:")
+        print(f"  {_truncate_simple(notes, 500)}")
+        print()
+        print(f"This is an infrastructure failure, not a code failure. The harness will not "
+              f"retry the builder.")
+        print()
+        print(f"The builder's last work is preserved. To verify manually:")
+        print(f"  1. Confirm the dev server is reachable from your host. With ./run.sh's")
+        print(f"     --service-ports, http://localhost:3000 on the host should hit the")
+        print(f"     container's dev server. Open it in a browser.")
+        print(f"  2. Inspect what the eval did capture: workspace/.playwright-mcp/ contains")
+        print(f"     screenshots, snapshots, and console logs from the crashed run.")
+        print(f"  3. Recover the MCP if the failure was transport-level:")
+        print(f"     `docker compose restart playwright-mcp`, then re-run.")
+        print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         return END
     return "builder"
 
