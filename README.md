@@ -44,10 +44,12 @@ cp .env.example .env
 # Fill in ANTHROPIC_API_KEY and OPENAI_API_KEY (OpenRouter)
 
 docker compose build
-docker compose run --rm --use-aliases langgraph
+docker compose run --rm --use-aliases --service-ports langgraph
 ```
 
-The `--use-aliases` flag is required: without it, the transient `compose run` container only registers its container-name on the project network, so the `playwright-mcp` sibling can't resolve `langgraph:3000` for `browser_navigate` calls and Firefox returns `NS_ERROR_UNKNOWN_HOST`. With it, the run container picks up the service-name DNS alias.
+Two flags are required (the `./run.sh` wrapper sets both for you):
+- `--use-aliases`: without it, the transient `compose run` container only registers its container-name on the project network, so the `playwright-mcp` sibling can't resolve `langgraph:3000` for `browser_navigate` calls and Firefox returns `NS_ERROR_UNKNOWN_HOST`. With it, the run container picks up the service-name DNS alias.
+- `--service-ports`: `compose run` ignores the service's `ports:` mapping by default (a known compose-run-vs-up difference). Without this, the dev server the builder spawns is reachable inside the container and from playwright-mcp, but NOT from your host browser at `http://localhost:3000`. With it, the declared port is published.
 
 Then at the `Task:` prompt, give it a coding task. Each task runs the full PBE loop (max 5 iterations) and emits a trace file you can grep.
 
@@ -81,10 +83,10 @@ The `local` compose profile starts a llama.cpp server alongside, for the eventua
 
 There's no automated test for end-to-end resume (it requires a real model + a kill mid-builder), but the recipe is short:
 
-1. `docker compose run --rm --use-aliases langgraph` and give it a multi-step task that takes ≥30s of builder work (e.g. "scaffold a Next.js app with Prisma").
+1. `docker compose run --rm --use-aliases --service-ports langgraph` and give it a multi-step task that takes ≥30s of builder work (e.g. "scaffold a Next.js app with Prisma").
 2. Watch the builder progress (`Step N of 50`). When you see, say, step 5 has executed, **kill the process** (Ctrl-C the docker run, or `docker kill` from another shell).
 3. Confirm `workspace/.trace/checkpoints.db` exists and the most-recent trace `.jsonl` does NOT end with a `task_end` line: `tail -1 workspace/.trace/<latest>.jsonl | jq .kind` → not `"task_end"`.
-4. `docker compose run --rm --use-aliases langgraph` again. Expect: `Found unfinished task from Nm ago: '<task text>' / Last event: <kind> / Resume? [y/N]:`. Type `y`.
+4. `docker compose run --rm --use-aliases --service-ports langgraph` again. Expect: `Found unfinished task from Nm ago: '<task text>' / Last event: <kind> / Resume? [y/N]:`. Type `y`.
 5. Verify in stdout that the builder step counter resumes at ≥6 (the exact post-crash checkpoint), not 1. The trace will show a `task_resume` event followed by the existing iteration's events continuing.
 
 If step 5 shows the counter at 1, checkpointing isn't actually working — check that `_graph_holder["builder"]` is being replaced in `main()`.
@@ -92,7 +94,7 @@ If step 5 shows the counter at 1, checkpointing isn't actually working — check
 For automated resilience tests (model retry classification, schema mismatch detection, transient-error retry), run:
 
 ```bash
-docker compose run --rm --use-aliases langgraph python /app/test_resilience.py
+docker compose run --rm --use-aliases --service-ports langgraph python /app/test_resilience.py
 ```
 
 ## Tunable thresholds
