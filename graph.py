@@ -153,7 +153,7 @@ UI_PATH_PATTERNS = [
 # The evaluator gets injected back with a corrective system message; capped to prevent loops.
 EVAL_MIN_NAVIGATE_CALLS = 1     # browser_navigate calls
 EVAL_MIN_SCREENSHOT_CALLS = 1   # browser_take_screenshot calls
-EVAL_MIN_CLICK_CALLS = 2        # browser_click calls (1 menu + 1 admin minimum)
+EVAL_MIN_CLICK_CALLS = 2        # browser_click calls (1 menu link + 1 feature interaction; NOT login submit — login goes through the API path per the skill)
 EVAL_INSUFFICIENT_EVIDENCE_RETRY_CAP = 2  # max re-eval rounds before accepting whatever we got
 
 # Empty-notes rejection. The evaluator was emitting verdict blocks with literally empty NOTES

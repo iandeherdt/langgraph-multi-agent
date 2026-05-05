@@ -76,10 +76,10 @@ Run in this order. Short-circuit to `continue` or `replan` on a failure at any s
    - `browser_snapshot()` — confirm the page rendered with expected content (a heading from the seed, a section title, navigation links). NOT just "the page loaded."
    - `browser_console_messages()` — capture any JS errors / warnings. Report errors in NOTES even if the page visually renders.
 5. **Browse each additional public page named in the plan** (e.g. `/about`, `/services`, `/contact`). For each: `browser_navigate` → `browser_snapshot` → `browser_console_messages`. Confirm specific seeded content appears (not a generic "page X loaded" claim).
-6. **Admin flow** (if the plan includes auth):
-   - `browser_navigate("http://langgraph:<port>/admin")` — should redirect to login (verify via the snapshot showing a login form, not the admin dashboard).
-   - `browser_navigate("http://langgraph:<port>/admin/login")`, `browser_snapshot` to find the password field's ref, `browser_type(ref, "<admin-password>")`, click submit.
-   - After login: `browser_navigate` to a protected page, `browser_snapshot` to confirm the dashboard rendered (not the login page).
+6. **Admin flow** (if the plan includes auth) — see "Project login patterns" below for the full recipe. The short version:
+   - `browser_navigate("http://langgraph:<port>/admin")` — verify it redirects to login (snapshot shows a login form, not the dashboard). Optional spot check; skip if the plan doesn't ask for it.
+   - **Authenticate via the API**, not the browser form. `run_shell_oneshot("curl -s -c /tmp/admin_cookies.txt -X POST http://localhost:3000/api/admin/login -H 'Content-Type: application/json' -d '{\"password\":\"admin\"}'")` then inject the resulting cookie via `browser_run_code_unsafe` (one Playwright `addCookies` call). DO NOT call `browser_type` or `browser_click` on the login form — that's the slow path the harness explicitly steers away from.
+   - After cookie injection: `browser_navigate` to a protected page, `browser_snapshot` to confirm the dashboard rendered (not the login page).
 
 ## MANDATORY INTERACTION VERIFICATION
 
@@ -89,7 +89,7 @@ Minimums per evaluation, hard-checked by the harness:
 
 - `browser_navigate` ≥ 1
 - `browser_take_screenshot` ≥ 1
-- `browser_click` ≥ 2 (e.g. one menu link + one admin submit button)
+- `browser_click` ≥ 2 (e.g. one menu link + one feature interaction like Delete / Save / Toggle. NOT the login submit button — login goes through the API path; see below.)
 
 These are floors, not goals. A real verification of even a small CMS will use ~10 navigates, ~5 screenshots, and ~5 clicks. Do not stop at the floor.
 
@@ -102,9 +102,11 @@ These are floors, not goals. A real verification of even a small CMS will use ~1
 
 ### Admin / authenticated flows
 
-1. `browser_navigate` to the login page → `browser_snapshot` to find the password field and submit button refs → `browser_type(password_ref, "<admin-password>")` → `browser_click(submit_ref)`.
-2. After submit: navigate to a protected page → `browser_take_screenshot` → describe what you see (dashboard? still on login? error?) → `browser_console_messages`.
-3. For each admin page named in the plan: navigate, screenshot, describe. If a save/edit/submit button is present, **click it** and verify the resulting state — did the success message appear? Did the form clear? Did the data persist (reload the page and check)? A "save" button that does nothing visible is a bug; report it.
+**Authenticate via the API + cookie injection** (full recipe in "Project login patterns" below). DO NOT call `browser_type` or `browser_click` on the login form — that path is slow, error-prone, and explicitly deprecated in this harness. One curl POST + one `browser_run_code_unsafe(addCookies)` is the entire login.
+
+1. `run_shell_oneshot("curl -s -c /tmp/admin_cookies.txt -X POST http://localhost:<port>/api/admin/login -H 'Content-Type: application/json' -d '{\"password\":\"<password>\"}'")` — read the cookie value from `/tmp/admin_cookies.txt`. Then `browser_run_code_unsafe` with a Playwright `addCookies` call (see the "Project login patterns" example).
+2. After cookie injection: navigate to a protected page → `browser_take_screenshot` → describe what you see (dashboard? still on login? error?) → `browser_console_messages`.
+3. For each admin page named in the plan: navigate, screenshot, describe. If a save/edit/submit/delete button is present, **click it** and verify the resulting state — did the success message appear? Did the form clear? Did the data persist (reload the page and check)? A "save" button that does nothing visible is a bug; report it. These feature-interaction clicks are what the `browser_click ≥ 2` minimum is for.
 
 ### Bad NOTES vs good NOTES
 
@@ -155,47 +157,54 @@ Concrete examples of how to read a large `browser_console_messages` result:
 
 ## Project login patterns
 
-For Next.js admin routes with cookie-based auth, prefer ONE-SHOT API LOGIN over interactive browser form login. Browser-based form login is slow, error-prone, and burns expensive tool calls.
+**This is the ONLY login path. Do not call `browser_type` or `browser_click` on a login form.** Browser-form login takes 5-6 tool calls and ~€0.20-€0.30 of model budget per attempt; API + cookie injection takes 2 tool calls and ~€0.04. The minimum `browser_click ≥ 2` requirement is satisfied by feature interactions (Delete, Toggle, Save), not by the login submit button.
 
-The standard agency-cms login pattern (and similar projects):
+For Next.js admin routes with cookie-based auth (agency-cms and similar):
 
-Step 1: Login via API to get the session cookie:
+**Step 1.** API login — gets the session cookie:
 ```bash
 curl -s -c /tmp/admin_cookies.txt -X POST http://localhost:3000/api/admin/login \
   -H "Content-Type: application/json" \
   -d '{"password":"admin"}'
 ```
 
-Step 2: Verify the cookie was set:
+**Step 2.** Read the cookie value (name<TAB>value format from curl `-c`):
 ```bash
-cat /tmp/admin_cookies.txt | grep -E "admin_session|session"
+COOKIE_VALUE=$(awk '/admin_session|session/ {print $7}' /tmp/admin_cookies.txt)
+echo "$COOKIE_VALUE"
 ```
 
-Step 3a (for non-browser verification — preferred when only checking server-rendered HTML):
+**Step 3a — non-browser verification** (preferred when only checking server-rendered HTML, status codes, or response bodies):
 ```bash
 curl -s -b /tmp/admin_cookies.txt http://localhost:3000/admin/pages
+# or check status:
+curl -s -o /dev/null -w "%{http_code}" -b /tmp/admin_cookies.txt http://localhost:3000/admin/pages
 ```
 
-Step 3b (for browser verification — when you need DOM/console inspection):
-Read the cookie value from the file, then inject it into the browser session:
+**Step 3b — browser verification** (when you need DOM, console messages, or screenshots of an authenticated page). Inject the cookie into Playwright's browser context, then navigate:
+
 ```javascript
 async (page) => {
-  // Parse cookie value from /tmp/admin_cookies.txt — name and value are tab-separated
+  // Replace <COOKIE_VALUE> with the value you read from /tmp/admin_cookies.txt in Step 2.
   await page.context().addCookies([{
     name: 'admin_session',
-    value: '<value-from-cookies-file>',
-    domain: 'localhost',
+    value: '<COOKIE_VALUE>',
+    domain: 'langgraph',          // or 'localhost' if you're using browser_navigate('http://localhost:...')
     path: '/',
     httpOnly: true,
   }]);
-  await page.goto('http://localhost:3000/admin/pages');
+  await page.goto('http://langgraph:3000/admin/pages');
   return page.url();
 }
 ```
 
-DO NOT use `browser_type` + `browser_click` to fill the login form repeatedly. Each attempt costs a full LLM tool-call cycle. If the API-login + cookie-injection path doesn't work after one attempt, document the failure and proceed with whatever verification you can do without auth.
+Pass that as the `code` argument to `browser_run_code_unsafe`. Then call `browser_console_messages`, `browser_take_screenshot`, `browser_snapshot` etc. as normal — the page is now authenticated.
 
-Failed login attempts beyond the first are NOT a productive use of the evaluator's budget.
+### Pitfalls — read these before you debug
+
+- **`document.cookie = "..."` does NOT work** for httpOnly cookies (which is what almost every Next.js auth library sets). The browser silently drops the assignment. Use `page.context().addCookies()` via `browser_run_code_unsafe` instead. `browser_evaluate` runs in the page (no cookie-write permission for httpOnly); `browser_run_code_unsafe` runs in the Playwright context (which can call `addCookies`).
+- **Domain matters.** The cookie's `domain` field must match the host the browser actually fetches from. If you `browser_navigate("http://langgraph:3000/...")`, set `domain: 'langgraph'`. If you use `localhost`, set `domain: 'localhost'`. Mismatched domain → cookie not sent → still appears as logged-out.
+- **One attempt only.** If API login + cookie injection doesn't work the first time, do NOT retry the login. Document the failure in NOTES (`auth flow failed: <reason>`) and continue with whatever verification you can do without auth (public pages, code inspection, build status). Repeated login attempts burn budget without producing information.
 
 ## WHAT COUNTS AS VERIFICATION FAILURE
 
