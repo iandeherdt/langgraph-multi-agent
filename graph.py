@@ -278,14 +278,43 @@ MODEL_RETRY_RETRYABLE_STATUS = {500, 502, 503, 504, 529}
 # model names returned by the LangChain wrappers — match-by-substring covers the various
 # slug forms ("anthropic/claude-sonnet-4-6" vs "claude-sonnet-4-6", "qwen/qwen3-coder-next"
 # vs "qwen3.6-27b" etc). Update when provider pricing changes.
+#
+# IMPORTANT: ORDER MATTERS. Substring matching first-hits on dict-iteration order, so
+# more-specific keys must come BEFORE less-specific ones. Example: "kimi-k2.6" before
+# "kimi-k2" before "kimi" — otherwise a "moonshotai/kimi-k2.6" slug short-circuits on
+# "kimi-k2" and gets the wrong (cheaper) rate.
+#
+# Vision capability matters for evaluator selection: the evaluator interprets screenshots,
+# so HARNESS_EVALUATOR_MODEL = a non-vision model (e.g. all current DeepSeek flagships)
+# will burn budget without doing real visual verification. Vision flag noted per row.
 COST_PER_1M_TOKENS = {
-    "claude-opus-4-7":   {"input": 15.00, "output": 75.00},
-    "claude-opus-4-6":   {"input": 15.00, "output": 75.00},
-    "claude-sonnet-4-6": {"input":  3.00, "output": 15.00},
-    "claude-haiku-4-5":  {"input":  0.80, "output":  4.00},
-    "qwen3-coder":       {"input":  0.20, "output":  0.40},  # OpenRouter approx for qwen3-coder-next
-    "qwen3.6":           {"input":  0.20, "output":  0.40},  # qwen3.6-27b
-    "qwen":              {"input":  0.20, "output":  0.40},  # generic qwen fallback
+    "claude-opus-4-7":           {"input": 15.00, "output": 75.00},
+    "claude-opus-4-6":           {"input": 15.00, "output": 75.00},
+    "claude-sonnet-4-6":         {"input":  3.00, "output": 15.00},
+    "claude-haiku-4-5":          {"input":  0.80, "output":  4.00},
+    "qwen3-coder":               {"input":  0.20, "output":  0.40},  # qwen3-coder-next
+    "qwen3.6":                   {"input":  0.20, "output":  0.40},  # qwen3.6-27b (vision)
+    "qwen":                      {"input":  0.20, "output":  0.40},  # generic qwen fallback
+    # Moonshot Kimi K2 family (OpenRouter, moonshotai/*). K2.5 + K2.6 are multimodal —
+    # suitable as evaluator models. K2-thinking / K2-0905 / K2 (0711) — vision unconfirmed.
+    "kimi-k2.6":                 {"input":  0.74, "output":  3.49},  # multimodal
+    "kimi-k2.5":                 {"input":  0.44, "output":  2.00},  # multimodal
+    "kimi-k2-thinking":          {"input":  0.60, "output":  2.50},
+    "kimi-k2-0905":              {"input":  0.40, "output":  2.00},
+    "kimi-k2":                   {"input":  0.57, "output":  2.30},  # K2 0711 legacy
+    "kimi":                      {"input":  0.57, "output":  2.30},  # generic fallback
+    # DeepSeek family (OpenRouter, deepseek/*). NONE of the current flagships support
+    # vision — usable as builder / planner, NOT evaluator on web-app tasks.
+    "deepseek-v4-pro":           {"input":  0.435, "output": 0.87},
+    "deepseek-v4-flash":         {"input":  0.14, "output":  0.28},
+    "deepseek-v3.2-speciale":    {"input":  0.40, "output":  1.20},
+    "deepseek-v3.2":             {"input":  0.252, "output": 0.378},
+    "deepseek-v3.1-terminus":    {"input":  0.27, "output":  0.95},
+    "deepseek-chat-v3.1":        {"input":  0.15, "output":  0.75},
+    "deepseek-chat-v3-0324":     {"input":  0.20, "output":  0.77},
+    "deepseek-r1-0528":          {"input":  0.50, "output":  2.15},
+    "deepseek-r1":               {"input":  0.70, "output":  2.50},
+    "deepseek":                  {"input":  0.252, "output": 0.378},  # generic ~ V3.2
 }
 COST_USD_TO_EUR = 0.92  # rough; the summary line shows €. Set HARNESS_COST_CCY=USD to render USD.
 
