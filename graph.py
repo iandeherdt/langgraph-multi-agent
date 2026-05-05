@@ -79,6 +79,7 @@ GIT_WORKSPACE_GITIGNORE = """\
 .trace/
 .servers/
 .playwright-mcp/
+.harness/
 __pycache__/
 *.pyc
 """
@@ -241,6 +242,30 @@ MODEL_RETRY_BASE_DELAY = 2  # seconds; doubled per attempt → 2, 4, 8
 # 60s catches the stall faster while still tolerating typical cold-start latency.
 STREAM_CHUNK_TIMEOUT_SECONDS = int(os.environ.get("STREAM_CHUNK_TIMEOUT_SECONDS", "60"))
 MODEL_RETRY_RETRYABLE_STATUS = {500, 502, 503, 504, 529}
+
+# Per-1M-token approximate pricing in USD (the harness denominates totals in EUR for the
+# summary; conversion factor below). Keys are case-insensitive substrings matched against
+# model names returned by the LangChain wrappers — match-by-substring covers the various
+# slug forms ("anthropic/claude-sonnet-4-6" vs "claude-sonnet-4-6", "qwen/qwen3-coder-next"
+# vs "qwen3.6-27b" etc). Update when provider pricing changes.
+COST_PER_1M_TOKENS = {
+    "claude-opus-4-7":   {"input": 15.00, "output": 75.00},
+    "claude-opus-4-6":   {"input": 15.00, "output": 75.00},
+    "claude-sonnet-4-6": {"input":  3.00, "output": 15.00},
+    "claude-haiku-4-5":  {"input":  0.80, "output":  4.00},
+    "qwen3-coder":       {"input":  0.20, "output":  0.40},  # OpenRouter approx for qwen3-coder-next
+    "qwen3.6":           {"input":  0.20, "output":  0.40},  # qwen3.6-27b
+    "qwen":              {"input":  0.20, "output":  0.40},  # generic qwen fallback
+}
+COST_USD_TO_EUR = 0.92  # rough; the summary line shows €. Set HARNESS_COST_CCY=USD to render USD.
+
+# Run-summary file path. Updated after every iteration end. Gitignored by default (see
+# GIT_WORKSPACE_GITIGNORE additions below). Intended as the human-readable per-run artefact —
+# the JSONL trace remains the machine-readable source of truth.
+HARNESS_DIR = WORKSPACE / ".harness"
+RUN_SUMMARY_PATH = HARNESS_DIR / "RUN_SUMMARY.md"
+RUN_SUMMARY_NOTES_PREVIEW_CHARS = 240  # per-iteration notes preview length in the summary
+RUN_SUMMARY_TASK_SUMMARY_CHARS = 80    # per-iteration title/summary length
 
 # Checkpointing: persist outer + inner graph state to .trace/checkpoints.db so a crash
 # doesn't lose in-progress builder work. Bump CHECKPOINT_SCHEMA_VERSION whenever the State
@@ -500,6 +525,9 @@ def _create_checkpoint(*, iteration: int, task: str, plan_doc: dict,
         head = _git(["rev-parse", "--short", "HEAD"], cwd=workspace)
         commit_hash = head.stdout.strip() if head.returncode == 0 else "(unknown)"
         _git_checkpoint_state["commit_count"] += 1
+        # Track the latest commit so RUN_SUMMARY.md's "Last successful checkpoint" line
+        # has something to render.
+        _git_checkpoint_state["last_commit"] = {"iter": iteration, "hash": commit_hash}
 
         TRACE.log("checkpoint_created",
                   iter=iteration, commit_hash=commit_hash,
@@ -533,6 +561,316 @@ def _emit_checkpoint_summary() -> None:
     if n > 0:
         print(f"  Diff against run start: git -C {workspace} diff "
               f"{state.get('init_commit', 'HEAD~' + str(n))} {branch}")
+
+
+# ────────────────────────── cost tracking + run summary ──────────────────────────
+
+
+# Per-model cumulative usage. Populated by _record_cost as model calls complete; read by
+# _update_run_summary for the cost line + by _emit_run_cost_summary at session end.
+_cost_tracker: dict = {
+    "by_model": {},   # model_name -> {input, output, calls, cost_usd}
+    "total_usd": 0.0,
+    "started_at": None,
+}
+
+
+def _normalize_model_for_pricing(model: str) -> tuple[str, dict] | tuple[None, dict]:
+    """Match `model` (any of the slug forms LangChain returns) against COST_PER_1M_TOKENS.
+
+    Returns (matched_key, rates) on hit; (None, {}) when nothing matches and we should
+    record at zero cost. Case-insensitive substring match — pricing keys are intentionally
+    short ("claude-sonnet-4-6", "qwen3-coder") so a longer slug matches if it contains
+    the key as substring.
+    """
+    if not model:
+        return None, {}
+    lower = model.lower()
+    for key, rates in COST_PER_1M_TOKENS.items():
+        if key.lower() in lower:
+            return key, rates
+    return None, {}
+
+
+def _record_cost(model: str, input_tokens: int, output_tokens: int, *, label: str = "") -> None:
+    """Update the cumulative cost tracker for one model call. Logs a model_call_cost trace
+    event so post-hoc analysis can correlate cost to specific iterations / labels."""
+    if not (input_tokens or output_tokens):
+        return  # nothing to record; some streams don't surface usage_metadata
+    if _cost_tracker["started_at"] is None:
+        _cost_tracker["started_at"] = datetime.now(timezone.utc).isoformat()
+
+    matched, rates = _normalize_model_for_pricing(model)
+    cost_usd = (input_tokens * rates.get("input", 0.0)
+                + output_tokens * rates.get("output", 0.0)) / 1_000_000.0
+
+    by_model = _cost_tracker["by_model"].setdefault(
+        model, {"input": 0, "output": 0, "calls": 0, "cost_usd": 0.0,
+                "matched_pricing_key": matched})
+    by_model["input"] += int(input_tokens or 0)
+    by_model["output"] += int(output_tokens or 0)
+    by_model["calls"] += 1
+    by_model["cost_usd"] += cost_usd
+    _cost_tracker["total_usd"] += cost_usd
+
+    TRACE.log("model_call_cost", model=model, label=label,
+              input_tokens=int(input_tokens or 0),
+              output_tokens=int(output_tokens or 0),
+              cost_usd=round(cost_usd, 6),
+              matched_pricing_key=matched,
+              total_usd=round(_cost_tracker["total_usd"], 4))
+
+
+def _extract_usage(msg) -> tuple[int, int, str]:
+    """Extract (input_tokens, output_tokens, model_name) from a langchain message.
+
+    AIMessages from LangChain v0.3+ carry .usage_metadata = {'input_tokens', 'output_tokens',
+    'total_tokens'}. Older / vendor wrappers sometimes use .response_metadata.token_usage =
+    {'prompt_tokens', 'completion_tokens'} (OpenAI shape) or
+    .response_metadata.usage = {'input_tokens', 'output_tokens'} (Anthropic shape). We try
+    each shape; absent usage returns (0, 0, "")."""
+    if msg is None:
+        return 0, 0, ""
+    # Modern, vendor-agnostic
+    um = getattr(msg, "usage_metadata", None)
+    if um:
+        return int(um.get("input_tokens", 0) or 0), int(um.get("output_tokens", 0) or 0), getattr(msg, "response_metadata", {}).get("model_name", "") or ""
+    rm = getattr(msg, "response_metadata", {}) or {}
+    # OpenAI / OpenRouter shape
+    tu = rm.get("token_usage")
+    if tu:
+        return int(tu.get("prompt_tokens", 0) or 0), int(tu.get("completion_tokens", 0) or 0), rm.get("model_name", "") or ""
+    # Anthropic native shape
+    u = rm.get("usage")
+    if u:
+        return int(u.get("input_tokens", 0) or 0), int(u.get("output_tokens", 0) or 0), rm.get("model", "") or ""
+    return 0, 0, ""
+
+
+# Per-iteration history. Each entry = {iter, status, summary, verdict, advisor_missing,
+# touched_count, cost_usd_delta, commit_hash}. Cleared at process start; populated by
+# _record_iteration_history at iteration-end. The RUN_SUMMARY.md "Iteration history"
+# section is rendered from this list.
+_iteration_history: list[dict] = []
+# Per-iteration summary cache: verify_completion captures task_summary into here so the
+# iteration-history line can reuse it. Module-level (not in State) because verify_completion
+# is a @tool function.
+_iteration_summary_holder: dict = {"task_summary": "", "advisor_missing": []}
+
+
+def _reset_iteration_summary_holder() -> None:
+    _iteration_summary_holder["task_summary"] = ""
+    _iteration_summary_holder["advisor_missing"] = []
+
+
+def _record_iteration_history(*, iteration: int, status: str, verdict: str,
+                              touched_count: int, commit_hash: str | None,
+                              advisor_missing: list | None = None,
+                              builder_summary: str = "") -> None:
+    """Append one entry to _iteration_history with a one-line summary line.
+
+    Summary precedence: verify_completion's task_summary (most informative) → builder
+    summary's first non-empty line → "exploration" (early-exit fallback)."""
+    summary = _iteration_summary_holder.get("task_summary") or ""
+    if not summary and builder_summary:
+        first = builder_summary.strip().splitlines()[0] if builder_summary.strip() else ""
+        summary = first
+    if not summary:
+        summary = "exploration (no completion attempted)"
+    if len(summary) > RUN_SUMMARY_TASK_SUMMARY_CHARS:
+        summary = summary[: RUN_SUMMARY_TASK_SUMMARY_CHARS - 1] + "…"
+    advisor_missing = (advisor_missing
+                       or _iteration_summary_holder.get("advisor_missing")
+                       or [])
+    cost_so_far_usd = _cost_tracker["total_usd"]
+    _iteration_history.append({
+        "iter": iteration,
+        "status": status,        # "ok" | "rejected" | "incomplete" | "early-exit"
+        "verdict": verdict,
+        "summary": summary,
+        "advisor_missing": list(advisor_missing)[:5],
+        "touched_count": touched_count,
+        "cost_usd_at_end": round(cost_so_far_usd, 4),
+        "commit_hash": commit_hash or "",
+    })
+
+
+_VERDICT_TO_STATUS = {
+    "done": "ok",
+    "continue": "ok",
+    "replan": "rejected",
+    "incomplete": "incomplete",
+}
+
+
+def _format_cost_line() -> str:
+    """One-line cost summary in the CCY the user picked (€ default, $ via env)."""
+    use_eur = os.environ.get("HARNESS_COST_CCY", "EUR").upper() == "EUR"
+    sym = "€" if use_eur else "$"
+    factor = COST_USD_TO_EUR if use_eur else 1.0
+    total = _cost_tracker["total_usd"] * factor
+    parts = []
+    for model, e in _cost_tracker["by_model"].items():
+        amt = e["cost_usd"] * factor
+        parts.append(f"{_compact_model_name(model)}: {sym}{amt:.4f}")
+    breakdown = " · ".join(parts) if parts else "(no usage recorded)"
+    return f"{sym}{total:.4f} so far  ·  {breakdown}"
+
+
+def _compact_model_name(model: str) -> str:
+    """Trim provider prefix for display ('anthropic/claude-sonnet-4-6' -> 'claude-sonnet-4-6')."""
+    if "/" in model:
+        return model.rsplit("/", 1)[-1]
+    return model
+
+
+def _gather_open_concerns(state) -> list[str]:
+    """Collect actionable concerns for the summary's 'Open concerns' section.
+
+    Sources:
+      - Most recent iteration with status != ok → its advisor_missing items
+      - Pending architecture proposals on the plan
+      - Any non-empty notes from the most recent eval that wasn't 'done'
+    """
+    concerns: list[str] = []
+    # Recent rejected/incomplete iteration's advisor missing items
+    for entry in reversed(_iteration_history):
+        if entry["status"] != "ok":
+            for m in entry.get("advisor_missing", []):
+                concerns.append(f"(iter {entry['iter']}) {m}")
+            break  # only the most recent non-ok
+    # Pending architecture proposals
+    plan = state.get("plan") if state else None
+    if isinstance(plan, dict):
+        for prop in plan.get("pending_proposals") or []:
+            concerns.append(f"(architecture) {prop.get('section','?')}: {prop.get('change','?')}")
+    return concerns[:10]
+
+
+def _next_planned_actions(state, max_n: int = 5) -> list[str]:
+    """Pick up to `max_n` outstanding plan tasks (status in {todo, doing}) for the
+    'Next planned actions' section."""
+    plan = (state or {}).get("plan") or {}
+    out: list[str] = []
+    for t in plan.get("tasks") or []:
+        if t.get("status") in ("todo", "doing"):
+            text = (t.get("text") or "").strip()
+            marker = "→" if t.get("status") == "doing" else " "
+            out.append(f"{marker} #{t.get('id','?')}: {text[:120]}")
+            if len(out) >= max_n:
+                break
+    return out
+
+
+def _update_run_summary(state) -> None:
+    """Write/overwrite RUN_SUMMARY.md with the current run state.
+
+    Idempotent and fail-soft: any I/O error logs a trace event and does not propagate.
+    Called from end of evaluator_node and from builder early-exit returns.
+    """
+    try:
+        HARNESS_DIR.mkdir(parents=True, exist_ok=True)
+        task = (state or {}).get("task", "(no task)")
+        plan = (state or {}).get("plan") or {}
+        tasks = plan.get("tasks") or []
+        done_n = sum(1 for t in tasks if t.get("status") == "done")
+        total_n = len(tasks)
+        iterations_n = (state or {}).get("iteration", 0)
+        branch = _git_checkpoint_state.get("branch") or "(no branch)"
+        last_commit = _git_checkpoint_state.get("last_commit") or {}
+        cost_line = _format_cost_line()
+
+        history_lines = []
+        if not _iteration_history:
+            history_lines.append("- (none yet — first iteration not finished)")
+        else:
+            for entry in _iteration_history:
+                marker = {"ok": "✓", "rejected": "✗", "incomplete": "⚠", "early-exit": "↩"}.get(
+                    entry["status"], "•")
+                hash_str = f" [{entry['commit_hash']}]" if entry["commit_hash"] else ""
+                history_lines.append(
+                    f"- Iter {entry['iter']}: {entry['summary']} "
+                    f"({entry['verdict']}, {entry['touched_count']} files){hash_str} {marker}"
+                )
+
+        concerns = _gather_open_concerns(state)
+        concerns_block = "\n".join(f"- {c}" for c in concerns) if concerns else "- (none)"
+
+        next_actions = _next_planned_actions(state)
+        next_block = "\n".join(f"- {a}" for a in next_actions) if next_actions else "- (none — plan complete or empty)"
+
+        started = _cost_tracker.get("started_at") or datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
+
+        last_ckpt_line = "(none)"
+        if last_commit:
+            last_ckpt_line = f"iter {last_commit.get('iter','?')}, commit {last_commit.get('hash','?')}"
+
+        truncated_task = task.strip().splitlines()[0] if task else "(no task)"
+        if len(truncated_task) > 200:
+            truncated_task = truncated_task[:197] + "..."
+
+        md = (
+            f"# Run summary: {truncated_task}\n\n"
+            f"Started: {started}\n"
+            f"Last updated: {now}\n"
+            f"Run branch: {branch}\n\n"
+            f"## Status\n"
+            f"- Plan tasks: {done_n} done / {total_n} total\n"
+            f"- Iterations: {iterations_n}\n"
+            f"- Last successful checkpoint: {last_ckpt_line}\n"
+            f"- Estimated cost so far: {cost_line}\n\n"
+            f"## Iteration history\n"
+            + "\n".join(history_lines) + "\n\n"
+            f"## Open concerns\n"
+            f"{concerns_block}\n\n"
+            f"## Next planned actions\n"
+            f"{next_block}\n"
+        )
+
+        # Atomic write: write to .tmp then rename, so a crash mid-write doesn't leave a
+        # partial file that the next builder iteration might read into context.
+        tmp = RUN_SUMMARY_PATH.with_suffix(RUN_SUMMARY_PATH.suffix + ".tmp")
+        tmp.write_text(md)
+        tmp.replace(RUN_SUMMARY_PATH)
+        TRACE.log("run_summary_updated", path=str(RUN_SUMMARY_PATH), bytes=len(md),
+                  iterations=iterations_n, cost_usd=round(_cost_tracker["total_usd"], 4))
+    except Exception as e:
+        TRACE.log("run_summary_failed", error=str(e)[:300])
+
+
+def _finalize_iteration_summary(*, state, verdict: str, builder_summary: str = "") -> None:
+    """Record the iteration in history + rewrite RUN_SUMMARY.md. Idempotent. Called from
+    every return path in evaluator_node and from builder_node early-exit returns. The
+    iteration history's status is derived from the verdict via _VERDICT_TO_STATUS; for
+    builder-side early exits (e.g., 'builder_exit:give_up') the status is 'early-exit'."""
+    if verdict.startswith("builder_exit:"):
+        status = "early-exit"
+    else:
+        status = _VERDICT_TO_STATUS.get(verdict, "rejected")
+    last_commit = (_git_checkpoint_state.get("last_commit") or {}).get("hash")
+    _record_iteration_history(
+        iteration=(state or {}).get("iteration", 0),
+        status=status,
+        verdict=verdict,
+        touched_count=len((state or {}).get("iteration_files_touched") or []),
+        commit_hash=last_commit,
+        builder_summary=builder_summary,
+    )
+    _update_run_summary(state)
+    _reset_iteration_summary_holder()
+
+
+def _read_run_summary_for_builder() -> str:
+    """Read RUN_SUMMARY.md if it exists, return the contents to inject into the builder's
+    system prompt as 'PREVIOUS RUN STATE'. Returns empty string when the file doesn't
+    exist (e.g., iteration 1 — no prior state to display)."""
+    try:
+        if RUN_SUMMARY_PATH.exists():
+            return RUN_SUMMARY_PATH.read_text()
+    except Exception:
+        pass
+    return ""
 
 
 # ────────────────────────── helpers ──────────────────────────
@@ -678,6 +1016,16 @@ async def _ainvoke_streaming(llm, messages: list, label: str):
             if final is not None:
                 for tc in getattr(final, "tool_calls", None) or []:
                     print(f"  → {tc.get('name', '?')}({_format_args(tc.get('args', {}))})", flush=True)
+                # Token + cost accounting. Pulls usage_metadata from the final assembled
+                # AIMessage. If the wrapper / provider doesn't surface usage on this stream,
+                # _record_cost no-ops on (0, 0) and we just don't bill it. Best-effort:
+                # we'd rather under-report than crash the run on a missing field.
+                try:
+                    in_t, out_t, model_from_msg = _extract_usage(final)
+                    model_for_cost = model_from_msg or getattr(llm, "model", None) or getattr(llm, "model_name", None) or label
+                    _record_cost(model_for_cost, in_t, out_t, label=label)
+                except Exception as _cost_exc:
+                    TRACE.log("model_call_cost_error", label=label, error=str(_cost_exc)[:200])
             return final
         except _MODEL_RETRY_EXCEPTIONS as e:
             last_exc = e
@@ -2146,6 +2494,13 @@ async def verify_completion(
               verdict_cap=VERIFY_COMPLETION_CAP, error_cap=VERIFY_COMPLETION_ERROR_CAP,
               elapsed_ms=elapsed_ms, advisor_model=ADVISOR_MODEL)
 
+    # Capture the builder's self-described task summary + the advisor's missing items so
+    # _record_iteration_history can produce a meaningful one-line summary for RUN_SUMMARY.md.
+    # Overwritten on each verify_completion call within an iteration; the LAST call wins,
+    # which is the informative one (closest to the iteration's actual conclusion).
+    _iteration_summary_holder["task_summary"] = (task_summary or "").strip()
+    _iteration_summary_holder["advisor_missing"] = list(parsed.get("missing") or [])
+
     # Route on next_actor. needs_evaluator and builder_disagreement short-circuit the builder
     # loop; the outer router hands off to the appropriate next stage. builder_continue is the
     # default — no exit, builder reads the rejection and keeps working.
@@ -2507,6 +2862,18 @@ def _render_builder_system(state: BuilderState) -> str:
     max_steps = state["max_steps"]
     remaining = max_steps - step
     parts = [BUILDER_BASE_SYSTEM_PROMPT]
+    # Inject the run summary as PREVIOUS RUN STATE if it exists (only on iter > 1; on
+    # iter 1 the file doesn't exist yet, so this is a no-op). Replaces dragging the full
+    # JSONL trace through context — the summary is short, structured, and captures
+    # iteration history + open concerns + cost.
+    summary_md = _read_run_summary_for_builder()
+    if summary_md:
+        parts.append(
+            "\n# PREVIOUS RUN STATE\n"
+            "(Auto-generated summary of prior iterations. Treat as authoritative for what\n"
+            "happened before — the JSONL trace is not in your context.)\n\n"
+            + summary_md
+        )
     parts.append("\n" + _render_plan_doc(state["plan"]))
     parts.append(f"\n# STEP BUDGET\nStep {step + 1} of {max_steps}. {remaining} tool calls remaining.")
     if remaining <= 1:
@@ -2822,6 +3189,21 @@ async def builder_node(outer_state: State, config: RunnableConfig | None = None)
             plan_doc=final["plan"],
             verdict=f"builder_exit:{exit_signal}",
             builder_model=builder_llm.model_name,
+        )
+        # These exit signals bypass the evaluator (route_after_builder routes them to END
+        # or the planner), so the iteration ends here. Finalize the run summary now —
+        # otherwise these iterations would be missing from RUN_SUMMARY.md history.
+        # outer_state has iteration_files_touched from prior iterations only; substitute
+        # the live touched set so the count is accurate for THIS iteration.
+        synthetic_state = {
+            **outer_state,
+            "plan": final["plan"],
+            "iteration_files_touched": sorted(_files_touched_holder),
+        }
+        _finalize_iteration_summary(
+            state=synthetic_state,
+            verdict=f"builder_exit:{exit_signal}",
+            builder_summary=summary,
         )
     # Sync the file-touch holder into State for evaluator_node's skip-eval check. Sorted
     # for deterministic trace output. The holder is cleared at the next builder entry.
@@ -3379,6 +3761,16 @@ async def _stream_subagent(subagent, prompt: str, label: str, recursion_limit: i
         last_event_time = time.monotonic()
         for _, node_output in event.items():
             for msg in node_output.get("messages", []):
+                # Token accounting for any AIMessage that carries usage metadata. With
+                # stream_mode="updates" each AIMessage appears once in a node update, so
+                # this doesn't double-count. Tool messages don't have usage; _extract_usage
+                # returns (0, 0, "") and _record_cost no-ops. Best-effort throughout.
+                try:
+                    in_t, out_t, model_from_msg = _extract_usage(msg)
+                    if in_t or out_t:
+                        _record_cost(model_from_msg or label, in_t, out_t, label=label)
+                except Exception as _cost_exc:
+                    TRACE.log("model_call_cost_error", label=label, error=str(_cost_exc)[:200])
                 if getattr(msg, "tool_calls", None):
                     for tc in msg.tool_calls:
                         print(f"  [{label}] {tc['name']}({_format_args(tc.get('args', {}))})")
@@ -3737,6 +4129,7 @@ async def evaluator_node(state: State) -> dict:
         # Don't refresh last_successful_eval — keep the original cached one as the source
         # of truth so subsequent skips still point at the iteration that was actually
         # browser-verified.
+        _finalize_iteration_summary(state=state, verdict=cached_verdict)
         return {
             "eval_verdict": cached_verdict,
             "eval_notes": skip_reason + "\n\n" + notes,
@@ -3832,6 +4225,7 @@ async def evaluator_node(state: State) -> dict:
                 ),
             )
             print(f"  NOTES: {_truncate_simple(notes, 400)}")
+            _finalize_iteration_summary(state=state, verdict="continue")
             return {"eval_verdict": "continue", "eval_notes": notes}
         except Exception as e:
             # Defense in depth: any other escape from the eval subagent (tool crash, MCP failure,
@@ -3868,6 +4262,7 @@ async def evaluator_node(state: State) -> dict:
                     f"expects) before re-running. The builder's last work is preserved in the "
                     f"workspace."
                 )
+                _finalize_iteration_summary(state=state, verdict="incomplete")
                 return {"eval_verdict": "incomplete", "eval_notes": notes}
             print(f"\n  EVALUATOR CRASH ({type(e).__name__}: {err_str[:200]}) — returning 'continue'.")
             notes = (
@@ -3875,6 +4270,7 @@ async def evaluator_node(state: State) -> dict:
                 f"verify'; the next planner should narrow the eval instructions or check whether "
                 f"a harness tool needs fixing (full traceback in trace as evaluator_exception)."
             )
+            _finalize_iteration_summary(state=state, verdict="continue")
             return {"eval_verdict": "continue", "eval_notes": notes}
 
         verdict = _extract_verdict(text)
@@ -3978,6 +4374,7 @@ async def evaluator_node(state: State) -> dict:
             "notes_preview": notes[:2000],
             "ts": datetime.now(timezone.utc).isoformat(),
         }
+    _finalize_iteration_summary(state=state, verdict=verdict)
     return update
 
 
