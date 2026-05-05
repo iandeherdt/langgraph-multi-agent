@@ -373,18 +373,24 @@ def _load_design_for_role(basename: str, designs_manifest: list[dict],
                 payload["notes_text"] = f.read()
         except OSError:
             pass
-    # HTML mockup (always loadable — text content; every role can read it)
+    # HTML mockup (always loadable — text content; every role can read it).
+    # Truncated to DESIGN_INJECT_HTML_CHAR_CAP to keep the prompt manageable when
+    # multiple designs are injected on the same call.
     if entry.get("html_path"):
         try:
             with open(entry["html_path"], "r", encoding="utf-8", errors="replace") as f:
-                payload["html_text"] = f.read()
+                raw = f.read()
+            payload["html_text"], payload["html_truncated"] = _truncate_design_text(
+                raw, max_chars=DESIGN_INJECT_HTML_CHAR_CAP)
         except OSError:
             pass
-    # Companion CSS (always loadable — text content)
+    # Companion CSS (always loadable — text content). Same truncation policy.
     if entry.get("css_path"):
         try:
             with open(entry["css_path"], "r", encoding="utf-8", errors="replace") as f:
-                payload["css_text"] = f.read()
+                raw = f.read()
+            payload["css_text"], payload["css_truncated"] = _truncate_design_text(
+                raw, max_chars=DESIGN_INJECT_HTML_CHAR_CAP)
         except OSError:
             pass
     # Image (only when role has vision)
@@ -428,6 +434,50 @@ def _format_design_block_for_text(payload: dict) -> str:
         parts.append(f"\n--- css ({payload['basename']}.css) ---\n{payload['css_text']}\n--- end css ---")
     parts.append(f"=== end {payload['basename']} ===")
     return "\n".join(parts)
+
+
+def _flush_designs_scan_trace_once() -> None:
+    """Emit the buffered designs_scanned + design_format_unsupported events to the
+    current task's trace. Called on the first planner iteration — by which point
+    TRACE.start_task() has opened the per-task file. Subsequent calls are no-ops."""
+    pending = _designs_holder.pop("_pending_trace", None)
+    if pending is None:
+        return
+    TRACE.log("designs_scanned",
+              folder=_designs_holder.get("folder"),
+              total_count=_designs_holder.get("total_count", 0),
+              with_images=pending["with_images"],
+              with_html=pending["with_html"],
+              with_notes=pending["with_notes"],
+              unsupported_count=len(_designs_holder.get("unsupported", [])))
+    for path in _designs_holder.get("unsupported", []):
+        TRACE.log("design_format_unsupported", path=path)
+
+
+# Per-design HTML truncation cap. Single design's HTML+CSS combined is capped to this
+# size before injection. Above the cap, we keep the head + a structural slice and
+# replace the middle with a marker. Default 25 KB strikes a balance between giving
+# the role enough structure to verify against vs. blowing the prompt context.
+DESIGN_INJECT_HTML_CHAR_CAP = int(os.environ.get("HARNESS_DESIGN_INJECT_HTML_CAP", "25000"))
+
+
+def _truncate_design_text(text: str, *, max_chars: int) -> tuple[str, bool]:
+    """Return (text, was_truncated). Keeps the first ~70% and last ~25% of the input,
+    replacing the middle with a `[…N chars elided…]` marker. Truncation is for prompt-
+    size control on multi-design eval calls — the role still sees both ends of the
+    file so structure (head <style>, body open) and footer markers are visible.
+    """
+    if not text or len(text) <= max_chars:
+        return text, False
+    head_size = int(max_chars * 0.70)
+    tail_size = max_chars - head_size - 60  # 60 reserved for the marker
+    if tail_size < 0:
+        tail_size = 0
+    elided = len(text) - head_size - tail_size
+    head = text[:head_size]
+    tail = text[-tail_size:] if tail_size > 0 else ""
+    marker = f"\n\n[…{elided:,} chars elided for prompt-size cap…]\n\n"
+    return head + marker + tail, True
 
 
 def _parse_design_compliance_from_notes(notes: str, expected_refs: list[str]) -> list[dict]:
@@ -4703,6 +4753,11 @@ async def planner_node(state: State) -> dict:
     task = state["task"]
     TRACE.set_iter(iteration)
     TRACE.set_step(0)
+    # Flush buffered designs_scanned events to the per-task trace on the first
+    # planner pass. (Logged at startup would land before TraceLogger has a file
+    # open; see _flush_designs_scan_trace_once.) Subsequent iterations are no-op.
+    if iteration == 1:
+        _flush_designs_scan_trace_once()
 
     # Increment replan_count when entering after a builder revise_plan signal
     replan_count = state.get("replan_count", 0)
@@ -4754,9 +4809,48 @@ async def planner_node(state: State) -> dict:
         sections_to_emit.append("# PROPOSAL_REVIEW (required if path=continued)")
     sections_to_emit += [
         "# REQUIREMENTS", "# ARCHITECTURE", "# TASKS",
+    ]
+    # DESIGN_REFS — only requested when the workspace has a designs/ folder with
+    # content. The planner is given the manifest separately (see designs_block below)
+    # and emits per-task design assignments in this section.
+    designs_present = bool(_designs_holder.get("enabled") and _designs_holder.get("manifest"))
+    if designs_present:
+        sections_to_emit.append("# DESIGN_REFS")
+    sections_to_emit += [
         "# BUILDER_INSTRUCTIONS", "# EVALUATOR_INSTRUCTIONS",
     ]
     sections_clause = ", ".join(sections_to_emit)
+
+    # Build the designs manifest snippet — only included when designs/ exists.
+    designs_block = ""
+    if designs_present:
+        rows = []
+        for entry in _designs_holder["manifest"]:
+            parts = [f"- {entry['basename']}"]
+            attached = []
+            if entry.get("html_path"):
+                attached.append("html")
+            if entry.get("css_path"):
+                attached.append("css")
+            if entry.get("notes_path"):
+                attached.append("notes")
+            if entry.get("image_path"):
+                attached.append(f"image ({entry.get('format', 'png')})")
+            if attached:
+                parts.append(f"  [{', '.join(attached)}]")
+            rows.append(" ".join(parts))
+        manifest_render = "\n".join(rows)
+        designs_block = (
+            f"\n\n# DESIGNS AVAILABLE\n"
+            f"The workspace has a designs/ folder. Tag each task that touches UI "
+            f"rendering, layout, copy, or interaction-design with the relevant "
+            f"design basenames in the # DESIGN_REFS section. Tasks that touch only "
+            f"data layer, build config, or non-UI server logic typically have no "
+            f"design refs.\n\n"
+            f"Available designs:\n{manifest_render}\n\n"
+            f"DESIGN_REFS format (per line: `<task-id>: <basename>[, <basename>...]`):\n"
+            f"```\n# DESIGN_REFS\n3: homepage\n7: admin-pages-list\n9: admin-pages-list, homepage\n```\n"
+        )
 
     # Build the user-message content
     if iteration == 1:
@@ -4794,7 +4888,7 @@ async def planner_node(state: State) -> dict:
         else:
             prior_block = "\n\n# PRIOR PLAN CONTEXT\n(no prior plan exists)"
         msg = (
-            f"USER TASK:\n{task}{prior_block}\n\n"
+            f"USER TASK:\n{task}{prior_block}{designs_block}\n\n"
             f"Decide path (fresh | continued | replaced), then emit {sections_clause}."
         )
     else:
@@ -4813,7 +4907,8 @@ async def planner_node(state: State) -> dict:
             f"PRIOR BUILDER EXIT SIGNAL: {state.get('builder_exit_signal', '?')}\n"
             f"{revise_block}"
             f"PRIOR EVALUATOR VERDICT: {state.get('eval_verdict', 'continue')}\n"
-            f"PRIOR EVALUATOR NOTES:\n{state.get('eval_notes', '(none)')}\n\n"
+            f"PRIOR EVALUATOR NOTES:\n{state.get('eval_notes', '(none)')}\n"
+            f"{designs_block}\n"
             f"Write the revised plan and instructions for iteration {iteration}. "
             f"Emit {sections_clause} (path: continued | replaced)."
         )
@@ -4841,6 +4936,50 @@ async def planner_node(state: State) -> dict:
     new_requirements = _parse_requirements(requirements_text)
     new_architecture = _parse_architecture(architecture_text)
     new_tasks = _parse_tasks(tasks_text)
+
+    # # DESIGN_REFS — only parsed when designs/ is enabled. Format per line:
+    #   `<task-id>: <basename>[, <basename>, ...]`
+    # The leading bullet (`-`, `*`) is optional; whitespace flexible. Unknown
+    # basenames (not in the manifest) are filtered out and logged. Refs are
+    # attached to matching task ids; tasks without an entry get no refs.
+    if designs_present:
+        design_refs_text = _extract_section(text, "DESIGN_REFS")
+        valid_basenames = {m["basename"] for m in _designs_holder["manifest"]}
+        per_task_refs: dict[int, list[str]] = {}
+        for raw in (design_refs_text or "").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            m = re.match(r"^(?:[-*]\s+)?(\d+)\s*[:=]\s*(.+)$", line)
+            if not m:
+                continue
+            try:
+                tid = int(m.group(1))
+            except ValueError:
+                continue
+            refs = [r.strip() for r in m.group(2).split(",")]
+            kept = [r for r in refs if r in valid_basenames]
+            dropped = [r for r in refs if r and r not in valid_basenames]
+            if kept:
+                per_task_refs[tid] = kept
+            for r in dropped:
+                TRACE.log("planner_design_refs_unknown",
+                          task_id=tid, ref=r,
+                          known=sorted(valid_basenames))
+        # Attach refs onto tasks; emit a per-task trace event for analysis.
+        for t in new_tasks:
+            assigned = per_task_refs.get(t["id"], [])
+            if assigned:
+                t["design_refs"] = assigned
+                TRACE.log("planner_design_refs_assigned",
+                          task_id=t["id"],
+                          task_text=t["text"][:200],
+                          design_refs=assigned)
+        # Summary event for the whole assignment pass.
+        TRACE.log("planner_designs_manifest",
+                  designs_count=len(valid_basenames),
+                  tasks_with_refs=len(per_task_refs),
+                  total_tasks=len(new_tasks))
 
     # Determine effective path. Anomaly cases: 'fresh' with prior → treat as replaced;
     # non-fresh with no prior → treat as fresh.
@@ -5728,6 +5867,25 @@ async def evaluator_node(state: State) -> dict:
     eval_role_has_vision = _model_has_vision(chosen_model)
     design_text_block = ""
     design_image_blocks: list[dict] = []
+    # Builder tier signal — when the current iteration's task carries design refs,
+    # the cheap-tier builder is often the wrong choice (translating restrained
+    # design systems with next/font + Tailwind config dance is hard for qwen-coder).
+    # We log the recommendation; the operator can act on it via HARNESS_BUILDER_MODEL.
+    # An automatic mid-run swap would require rebuilding the builder StateGraph each
+    # iteration — separate followup.
+    builder_recommended_strong = (
+        bool(iteration_design_refs)
+        and not os.environ.get("HARNESS_BUILDER_MODEL", "").strip()
+    )
+    if builder_recommended_strong:
+        TRACE.log("builder_design_tier_recommendation",
+                  iteration=state["iteration"],
+                  current_builder=getattr(builder_llm, "model_name", None) or getattr(builder_llm, "model", None),
+                  recommended_action="set HARNESS_BUILDER_MODEL to a stronger slug "
+                                     "(e.g. anthropic/claude-sonnet-4-6 or moonshotai/kimi-k2-thinking) "
+                                     "for design-heavy iterations",
+                  reason="design_refs_present_on_iteration")
+
     if iteration_design_refs:
         design_text_block, design_image_blocks = _build_design_injection(
             role="evaluator",
@@ -5735,13 +5893,43 @@ async def evaluator_node(state: State) -> dict:
             designs_manifest=_designs_holder["manifest"],
             role_has_vision=eval_role_has_vision,
         )
+        # Compute which content types actually got attached. `vision_used` reports
+        # whether image content was sent; `content_types` is the explicit list of
+        # what's in the prompt (html/css/notes/image). HTML/CSS designs land
+        # `vision_used=False` but `content_types=["html","css"]` — the role has
+        # the full design source as text, which is *more* useful for compliance
+        # checking than an image attachment. Don't conflate text-only with "fallback".
+        content_types: list[str] = []
+        any_truncated = False
+        for ref in iteration_design_refs:
+            entry = next((m for m in _designs_holder["manifest"]
+                          if m.get("basename") == ref), None)
+            if not entry:
+                continue
+            if entry.get("html_path"):
+                content_types.append("html")
+                # truncation flag is per-payload — re-derive by loading once is wasteful;
+                # easier to re-check size against the cap.
+                try:
+                    sz = entry.get("image_size_bytes") or 0
+                except Exception:
+                    sz = 0
+            if entry.get("css_path"):
+                content_types.append("css")
+            if entry.get("notes_path"):
+                content_types.append("notes")
+            if entry.get("image_path") and eval_role_has_vision:
+                content_types.append("image")
+        # de-dup while preserving order
+        seen = set(); content_types = [t for t in content_types if not (t in seen or seen.add(t))]
         TRACE.log("design_injected",
                   role="evaluator",
                   refs=iteration_design_refs,
-                  vision_used=eval_role_has_vision and bool(design_image_blocks),
-                  fallback_used=not (eval_role_has_vision and design_image_blocks),
+                  vision_used=bool(design_image_blocks),
+                  content_types=content_types,
                   text_chars=len(design_text_block),
-                  image_blocks=len(design_image_blocks))
+                  image_blocks=len(design_image_blocks),
+                  per_design_cap_chars=DESIGN_INJECT_HTML_CHAR_CAP)
 
     base_prompt = (
         f"REQUIREMENTS (load-bearing contract — verify EACH one is satisfied):\n"
@@ -6876,22 +7064,24 @@ async def main():
     _check_service_alias_or_warn()
     # Scan the designs folder once at startup. Populates _designs_holder; downstream
     # planner/builder/evaluator code reads from there. No-op when the folder is absent
-    # or DESIGNS_ENABLED=disabled.
+    # or DESIGNS_ENABLED=disabled. Trace events for the scan are deferred until the
+    # first task starts (TraceLogger swallows .log() calls when no task file is open
+    # yet — see TraceLogger.log).
     _designs_scan = _scan_designs_folder(WORKSPACE)
     _designs_holder.update(_designs_scan)
     if _designs_holder["enabled"]:
         with_notes = sum(1 for m in _designs_holder["manifest"] if m.get("notes_path"))
         with_images = sum(1 for m in _designs_holder["manifest"] if m.get("image_path"))
+        with_html = sum(1 for m in _designs_holder["manifest"] if m.get("html_path"))
         print(f"Designs:   {_designs_holder['total_count']} design(s) at {_designs_holder['folder']} "
-              f"({with_images} with image, {with_notes} with notes, "
-              f"{len(_designs_holder['unsupported'])} unsupported)")
-        TRACE.log("designs_scanned",
-                  folder=_designs_holder["folder"],
-                  total_count=_designs_holder["total_count"],
-                  with_images=with_images, with_notes=with_notes,
-                  unsupported_count=len(_designs_holder["unsupported"]))
-        for path in _designs_holder["unsupported"]:
-            TRACE.log("design_format_unsupported", path=path)
+              f"({with_images} with image, {with_html} with html, "
+              f"{with_notes} with notes, {len(_designs_holder['unsupported'])} unsupported)")
+        # Buffer the events; planner_node flushes them on iter=1.
+        _designs_holder["_pending_trace"] = {
+            "with_notes": with_notes,
+            "with_images": with_images,
+            "with_html": with_html,
+        }
     elif DESIGNS_ENABLED == "enabled":
         print(f"Designs:   WARNING: HARNESS_DESIGNS_ENABLED=enabled but no designs found at "
               f"{_designs_holder['folder']}")
