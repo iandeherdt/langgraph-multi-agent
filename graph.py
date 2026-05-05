@@ -214,6 +214,301 @@ EVAL_REASONING_OFF = os.environ.get("HARNESS_EVAL_REASONING_OFF", "0").strip().l
 # To enable on Anthropic eval: set this to a positive integer (e.g. 4000).
 EVAL_ANTHROPIC_THINKING_BUDGET = os.environ.get("HARNESS_EVAL_ANTHROPIC_THINKING_BUDGET", "").strip()
 
+# Visual designs reference. Folder convention:
+#   <workspace>/<DESIGNS_DIR>/<basename>.{png,jpg,jpeg,webp}     — visual mockup
+#   <workspace>/<DESIGNS_DIR>/<basename>.md                       — design notes
+# Pairs are linked by basename. The planner is given a manifest at run start;
+# tasks the planner judges UI-relevant get a `design_refs: [<basename>, ...]`
+# field. For tagged tasks, the builder + evaluator have the design content
+# (image when role has vision, notes always, fallback description otherwise)
+# injected as a system message; both must surface a `design_compliance` block.
+# Non-compliant evaluator findings coerce verdict=done → continue.
+DESIGNS_DIR = os.environ.get("HARNESS_DESIGNS_DIR", "designs")
+DESIGNS_ENABLED = os.environ.get("HARNESS_DESIGNS_ENABLED", "auto").strip().lower()
+DESIGNS_PLANNER_VISION_REQUIRED = os.environ.get("HARNESS_DESIGNS_PLANNER_VISION", "1") != "0"
+DESIGNS_BUILDER_VISION_REQUIRED = os.environ.get("HARNESS_DESIGNS_BUILDER_VISION", "1") != "0"
+DESIGNS_EVALUATOR_VISION_REQUIRED = os.environ.get("HARNESS_DESIGNS_EVALUATOR_VISION", "1") != "0"
+DESIGNS_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
+DESIGNS_NOTES_EXTENSION = ".md"
+DESIGNS_UNSUPPORTED_EXTENSIONS = (".fig", ".sketch", ".pdf", ".xd", ".ai", ".psd", ".svg")
+
+# Models with vision input. Substring-matched lowercase against slug. Conservative —
+# False on unknown models. Used by _model_has_vision() to decide whether to inject
+# image content vs notes-only fallback into role contexts.
+VISION_CAPABLE_SLUG_PATTERNS = (
+    "claude-opus-4", "claude-sonnet-4", "claude-haiku-4-5",  # Claude 4.x family
+    "claude-3-5-sonnet", "claude-3-5-haiku", "claude-3-opus", "claude-3-sonnet",  # Claude 3.x
+    "gpt-4o", "gpt-4-vision", "gpt-5",  # OpenAI vision-capable
+    "gemini",  # Gemini family — all current variants are multimodal
+    "kimi-k2.5", "kimi-k2.6",  # Moonshot multimodal K2 variants
+    "qwen2.5-vl", "qwen2-vl", "qwen3-vl", "qwen3.6-27b",  # Qwen vision variants
+    "llama-3.2-11b-vision", "llama-3.2-90b-vision",  # Meta Llama vision
+    "pixtral",  # Mistral vision
+)
+
+
+def _model_has_vision(model_id: str | None) -> bool:
+    """True if `model_id` matches a known vision-capable slug. Conservative — unknown
+    slugs return False. Used to decide whether design images get injected into a
+    role's context (vision-capable) or just the notes fallback (text-only)."""
+    if not model_id:
+        return False
+    s = str(model_id).lower()
+    return any(p in s for p in VISION_CAPABLE_SLUG_PATTERNS)
+
+
+def _scan_designs_folder(workspace_path) -> dict:
+    """Scan `<workspace>/<DESIGNS_DIR>` and return a manifest. Pairs files by basename:
+    image (.png/.jpg/.jpeg/.webp) + notes (.md). Either may exist alone. Other formats
+    (.fig, .sketch, .pdf, …) are listed in `unsupported` and skipped — they require
+    tooling we don't have inline.
+
+    Returns {
+      "enabled": bool,                      # True only if the folder exists with content
+      "folder": str,                        # absolute path of the folder
+      "manifest": [
+         {"basename": str, "image_path": str|None, "notes_path": str|None,
+          "image_size_bytes": int|None, "format": str|None}, ...
+      ],
+      "unsupported": [str, ...],            # paths skipped (.fig etc.)
+      "total_count": int,                   # designs in manifest
+    }
+    """
+    from pathlib import Path
+    folder = Path(workspace_path) / DESIGNS_DIR
+    out = {
+        "enabled": False,
+        "folder": str(folder),
+        "manifest": [],
+        "unsupported": [],
+        "total_count": 0,
+    }
+    if DESIGNS_ENABLED == "disabled":
+        return out
+    if not folder.exists() or not folder.is_dir():
+        return out
+    by_base: dict[str, dict] = {}
+    for entry in sorted(folder.iterdir()):
+        if not entry.is_file():
+            continue
+        name = entry.name
+        ext = entry.suffix.lower()
+        base = entry.stem
+        if ext in DESIGNS_IMAGE_EXTENSIONS:
+            slot = by_base.setdefault(base, {"basename": base, "image_path": None,
+                                             "notes_path": None, "image_size_bytes": None,
+                                             "format": None})
+            slot["image_path"] = str(entry)
+            slot["format"] = ext.lstrip(".")
+            try:
+                slot["image_size_bytes"] = entry.stat().st_size
+            except OSError:
+                pass
+        elif ext == DESIGNS_NOTES_EXTENSION:
+            slot = by_base.setdefault(base, {"basename": base, "image_path": None,
+                                             "notes_path": None, "image_size_bytes": None,
+                                             "format": None})
+            slot["notes_path"] = str(entry)
+        elif ext in DESIGNS_UNSUPPORTED_EXTENSIONS:
+            out["unsupported"].append(str(entry))
+        # Files with other extensions are silently ignored (e.g., .DS_Store, README.md
+        # if it ever lands in designs/).
+    out["manifest"] = list(by_base.values())
+    out["total_count"] = len(out["manifest"])
+    out["enabled"] = (DESIGNS_ENABLED in ("auto", "enabled")) and (out["total_count"] > 0 or len(out["unsupported"]) > 0)
+    return out
+
+
+def _load_design_for_role(basename: str, designs_manifest: list[dict],
+                           role_has_vision: bool) -> dict:
+    """Build the injection payload for one design ref + role. Returns:
+      {
+        "basename": str,
+        "found": bool,
+        "image_b64": str|None,    # base64 PNG/JPEG bytes, only if role_has_vision and image exists
+        "image_format": str|None,
+        "notes_text": str|None,
+        "fallback_description": str|None,  # set when neither vision-image nor notes available
+      }
+    """
+    import base64
+    from pathlib import Path
+    payload = {
+        "basename": basename, "found": False, "image_b64": None,
+        "image_format": None, "notes_text": None, "fallback_description": None,
+    }
+    entry = next((m for m in designs_manifest if m.get("basename") == basename), None)
+    if not entry:
+        payload["fallback_description"] = (
+            f"design ref '{basename}' is not present in designs/ — neither image nor notes "
+            f"available. Implement based on plan task description and surrounding context."
+        )
+        return payload
+    payload["found"] = True
+    # Notes (always loadable when present, regardless of role vision)
+    if entry.get("notes_path"):
+        try:
+            with open(entry["notes_path"], "r", encoding="utf-8", errors="replace") as f:
+                payload["notes_text"] = f.read()
+        except OSError:
+            pass
+    # Image (only when role has vision)
+    if role_has_vision and entry.get("image_path"):
+        try:
+            with open(entry["image_path"], "rb") as f:
+                payload["image_b64"] = base64.b64encode(f.read()).decode("ascii")
+            payload["image_format"] = entry.get("format") or Path(entry["image_path"]).suffix.lstrip(".").lower()
+        except OSError:
+            pass
+    if payload["image_b64"] is None and not payload["notes_text"]:
+        # Image exists but role has no vision, and no notes file. Provide a textual stub
+        # so the role at least knows the design exists by name + dimensions.
+        size = entry.get("image_size_bytes")
+        size_str = f"{size} bytes" if size else "unknown size"
+        payload["fallback_description"] = (
+            f"design '{basename}' exists as {entry.get('format', 'image')} ({size_str}) but "
+            f"this role lacks vision capability and no .md notes file is provided. Implement "
+            f"based on the plan task description and route name; flag any ambiguity in your "
+            f"task summary."
+        )
+    return payload
+
+
+def _format_design_block_for_text(payload: dict) -> str:
+    """Render one design payload as a text block suitable for inlining in a role's
+    system message. Image content is referenced by basename (the actual image bytes
+    are passed separately as a multimodal content block when supported).
+    """
+    parts = [f"=== {payload['basename']} ==="]
+    if payload.get("image_b64"):
+        parts.append(f"[image attached: {payload['basename']}.{payload.get('image_format', 'png')} — see multimodal content]")
+    elif payload.get("fallback_description"):
+        parts.append(f"[image: {payload['fallback_description']}]")
+    if payload.get("notes_text"):
+        parts.append(f"\n--- notes ---\n{payload['notes_text']}\n--- end notes ---")
+    parts.append(f"=== end {payload['basename']} ===")
+    return "\n".join(parts)
+
+
+def _parse_design_compliance_from_notes(notes: str, expected_refs: list[str]) -> list[dict]:
+    """Extract a DESIGN_COMPLIANCE block out of evaluator NOTES. The eval skill instructs
+    the evaluator to write a block like:
+
+        DESIGN_COMPLIANCE:
+        - ref: admin-pages-list  compliant: false  observations: Featured column is missing.
+        - ref: homepage-hero     compliant: true   observations: Hero matches mockup layout.
+
+    The parser is permissive — it accepts variants (different separators, mixed case)
+    and only requires that each line has `ref:` (or `- ref:`), `compliant:` and
+    `observations:` markers. Returns a list of dicts:
+        [{"ref": str, "compliant": bool|None, "observations": str}, ...]
+
+    `expected_refs` constrains which refs the parser will report — extra entries the
+    eval invented for refs we didn't inject are ignored. Refs from `expected_refs` that
+    weren't mentioned in the eval's NOTES are returned with `compliant=None` and
+    `observations="(not addressed by evaluator)"` so the harness sees the gap.
+    """
+    out: dict[str, dict] = {}
+    if notes:
+        # Extract just the DESIGN_COMPLIANCE block if present; otherwise scan all of notes.
+        m = re.search(r"DESIGN_COMPLIANCE:\s*\n(.*?)(\n\s*\n|\Z)", notes, re.S | re.I)
+        body = m.group(1) if m else notes
+        # Per-line pattern: optional bullet, ref:..., compliant:..., observations:...
+        line_re = re.compile(
+            r"(?:^[\-\*]\s+|^\s*)ref\s*[:=]\s*([A-Za-z0-9_\-./]+)\s*"
+            r".*?compliant\s*[:=]\s*(true|false|yes|no|1|0|n/?a|null|unknown)"
+            r"\s*.*?observations?\s*[:=]\s*(.*?)$",
+            re.I | re.M,
+        )
+        for match in line_re.finditer(body):
+            ref = match.group(1).strip()
+            comp_raw = match.group(2).strip().lower()
+            obs = match.group(3).strip().rstrip(".,;")
+            if comp_raw in ("true", "yes", "1"):
+                comp = True
+            elif comp_raw in ("false", "no", "0"):
+                comp = False
+            else:
+                comp = None
+            if ref in expected_refs and ref not in out:
+                out[ref] = {"ref": ref, "compliant": comp, "observations": obs[:500]}
+    # Fill in expected refs the eval didn't address.
+    findings = []
+    for ref in expected_refs:
+        if ref in out:
+            findings.append(out[ref])
+        else:
+            findings.append({
+                "ref": ref, "compliant": None,
+                "observations": "(not addressed by evaluator)",
+            })
+    return findings
+
+
+def _build_design_injection(*, role: str, design_refs: list[str],
+                             designs_manifest: list[dict],
+                             role_has_vision: bool) -> tuple[str, list[dict]]:
+    """Build a (text_block, multimodal_image_blocks) tuple for injecting designs into
+    a role's context. text_block is the system-message text; multimodal_image_blocks
+    is a list of LangChain image content blocks ready to attach to a HumanMessage.
+
+    role: "builder" or "evaluator" — affects the directive wording.
+    """
+    if not design_refs:
+        return ("", [])
+    payloads = [_load_design_for_role(ref, designs_manifest, role_has_vision)
+                for ref in design_refs]
+    if role == "builder":
+        header = (
+            "DESIGN REFERENCE FOR THIS TASK\n"
+            "The following designs apply to this task and you MUST consult them before "
+            "implementation. Your code must visually and behaviorally match these designs. "
+            "If a design is ambiguous or conflicts with another requirement, surface the "
+            "ambiguity in your task summary and propose a resolution. Do NOT proceed without "
+            "addressing all referenced designs.\n"
+        )
+        footer = (
+            "\nWhen you call verify_completion, you MUST include a `design_compliance` "
+            "field in evidence — one entry per design ref above, marking it addressed=true "
+            "with notes on how your implementation matches. Missing or addressed=false "
+            "entries cause the advisor to reject your verdict.\n"
+        )
+    elif role == "evaluator":
+        header = (
+            "DESIGN VERIFICATION REQUIRED FOR THIS ITERATION\n"
+            "The builder claims to have addressed the following designs. You MUST verify "
+            "visual and behavioral compliance. For each design ref:\n"
+            "  - What the design specifies (key visual or behavioral elements)\n"
+            "  - What the rendered output shows (from your screenshot/snapshot evidence)\n"
+            "  - Whether they match, with specific differences if not\n"
+            "Mismatches are blockers, not warnings. A `done` verdict requires every design "
+            "ref to be compliant.\n"
+        )
+        footer = (
+            "\nYour verdict NOTES must include a section comparing the rendered output to "
+            "each design above, and your verdict block must include a `design_compliance` "
+            "list — one entry per ref, marking compliant=true|false with specific "
+            "observations. The harness coerces done → continue when any compliant=false.\n"
+        )
+    else:
+        header = "DESIGN REFERENCES\n"
+        footer = ""
+    body_blocks = [_format_design_block_for_text(p) for p in payloads]
+    text_block = header + "\n" + "\n\n".join(body_blocks) + footer
+
+    # Multimodal image blocks (only when role has vision and images exist).
+    image_blocks = []
+    for p in payloads:
+        if p.get("image_b64"):
+            image_blocks.append({
+                "type": "image",
+                "source_type": "base64",
+                "mime_type": f"image/{p.get('image_format') or 'png'}",
+                "data": p["image_b64"],
+            })
+    return (text_block, image_blocks)
+
+
 # Heartbeat thresholds per subagent label. The evaluator routinely takes 30-60s to compose
 # its verdict block (natural-language synthesis over many tool observations) — the 20s
 # default fired idle warnings spuriously and could mask real progress. Eval gets the longer
@@ -374,7 +669,7 @@ RUN_SUMMARY_TASK_SUMMARY_CHARS = 80    # per-iteration title/summary length
 # to start fresh. Bump RESUME_STATE_SCHEMA_VERSION whenever the persisted state shape
 # changes in a non-backward-compatible way.
 RESUME_ENABLED = os.environ.get("RESUME_ENABLED", "1").lower() not in ("0", "false", "no", "")
-RESUME_STATE_SCHEMA_VERSION = 4  # bumped from 3: state.json gained last_evaluator_cost_eur
+RESUME_STATE_SCHEMA_VERSION = 5  # bumped from 4: state.json gained current_iteration_design_refs
 RESUME_STATE_FILENAME = "state.json"
 
 # Test gate. Runs HARNESS_TEST_COMMAND between a successful evaluator verdict and the
@@ -1328,6 +1623,16 @@ def _finalize_iteration_summary(*, state, verdict: str, builder_summary: str = "
 # _save_run_state so the persisted original_task survives across iterations + resumes.
 _run_started_holder: dict = {"original_task": ""}
 
+# Designs scan holder. Populated once at run start (or once per resume) by
+# _scan_designs_folder. Read by planner/builder/evaluator nodes to inject design
+# content into role contexts. Empty/no-op when DESIGNS_ENABLED=disabled or the
+# folder is absent. Layout:
+#   {"enabled": bool, "folder": str, "manifest": [...], "unsupported": [...],
+#    "total_count": int}
+_designs_holder: dict = {
+    "enabled": False, "folder": None, "manifest": [], "unsupported": [], "total_count": 0,
+}
+
 
 # Test-gate runtime state. Populated by the baseline check and the per-iteration gate run.
 # Persisted in state.json (resume schema v2) and restored on resume. Cleared at process
@@ -1606,6 +1911,8 @@ _SCHEMA_CHANGELOG = {
     4: "added last_evaluator_cost_eur (the cumulative cost of the most recent evaluator "
        "invocation in EUR; preserved so resume sees the partial cost when a run was "
        "terminated by HARNESS_EVALUATOR_COST_LIMIT_EUR)",
+    5: "added current_iteration_design_refs (list of design basenames the current "
+       "iteration is addressing — preserved so a resumed iteration sees the same refs)",
 }
 
 
@@ -3773,6 +4080,22 @@ def _select_evaluator_model(state, task: str) -> dict:
                 "reason": "explicit override (prompt marker)",
                 "tier_requested": tier_requested, "tier_used": "cheap"}
 
+    # Designs auto-escalation. When the run has a designs/ folder with content AND the
+    # current iteration's task is design-tagged (or the heuristic fallback is going to
+    # apply), promote auto → strong. Vision-quality verification needs the strongest
+    # tier available; cheap-tier eval misses pixel-level mismatches. Operator can
+    # override by explicitly setting HARNESS_EVALUATOR_TIER=cheap.
+    if _designs_holder.get("enabled"):
+        plan_doc = (state or {}).get("plan") or {}
+        # Either a per-task design_refs is non-empty, or the heuristic fallback (web-app
+        # task with designs available) would attach all designs.
+        any_task_refs = any(t.get("design_refs") for t in plan_doc.get("tasks", []))
+        is_web = _is_web_app_task(state or {}, plan_doc)
+        if any_task_refs or is_web:
+            return {"model": EVALUATOR_STRONG_MODEL,
+                    "reason": "design_refs_present (auto → strong)",
+                    "tier_requested": tier_requested, "tier_used": "strong"}
+
     return {"model": builder_slug, "reason": "default cheap",
             "tier_requested": tier_requested, "tier_used": "cheap"}
 
@@ -5345,6 +5668,41 @@ async def evaluator_node(state: State) -> dict:
             "eval_verdict": cached_verdict,
             "eval_notes": skip_reason + "\n\n" + notes,
         }
+    # Determine design refs applicable to this iteration. Two sources:
+    #   1. Per-task design_refs the planner emitted (if any task carries them — the
+    #      typed-out planner integration is the long-term home for this).
+    #   2. Heuristic fallback — if designs exist and the task is web-app shaped, treat
+    #      every design as applicable. This is the safety net for the V1 cut where the
+    #      planner doesn't yet emit design_refs reliably.
+    iteration_design_refs: list[str] = []
+    if _designs_holder.get("enabled") and is_web_app:
+        # Pull per-task refs first
+        for t in plan_doc.get("tasks", []):
+            for ref in (t.get("design_refs") or []):
+                if ref not in iteration_design_refs:
+                    iteration_design_refs.append(ref)
+        # Heuristic fallback: if no task carried refs but designs exist, attach all
+        if not iteration_design_refs:
+            iteration_design_refs = [m["basename"] for m in _designs_holder["manifest"]]
+
+    eval_role_has_vision = _model_has_vision(chosen_model)
+    design_text_block = ""
+    design_image_blocks: list[dict] = []
+    if iteration_design_refs:
+        design_text_block, design_image_blocks = _build_design_injection(
+            role="evaluator",
+            design_refs=iteration_design_refs,
+            designs_manifest=_designs_holder["manifest"],
+            role_has_vision=eval_role_has_vision,
+        )
+        TRACE.log("design_injected",
+                  role="evaluator",
+                  refs=iteration_design_refs,
+                  vision_used=eval_role_has_vision and bool(design_image_blocks),
+                  fallback_used=not (eval_role_has_vision and design_image_blocks),
+                  text_chars=len(design_text_block),
+                  image_blocks=len(design_image_blocks))
+
     base_prompt = (
         f"REQUIREMENTS (load-bearing contract — verify EACH one is satisfied):\n"
         f"{requirements_render}\n\n"
@@ -5353,7 +5711,8 @@ async def evaluator_node(state: State) -> dict:
         f"{state['evaluator_instructions']}\n\n"
         f"BUILDER SUMMARY (claim is a starting point, NOT evidence — verify by observation):\n"
         f"{state['builder_summary']}\n\n"
-        f"Verify the work and emit your verdict block at the end."
+        + (design_text_block + "\n\n" if design_text_block else "")
+        + f"Verify the work and emit your verdict block at the end."
     )
 
     # Two-track enforcement loop on web-app tasks. Both reject thin verdicts and force a
@@ -5758,12 +6117,45 @@ async def evaluator_node(state: State) -> dict:
                 continue
         break
 
+    # Design-compliance check. When this iteration had design refs injected into the
+    # eval prompt, parse a DESIGN_COMPLIANCE block out of NOTES and coerce verdict
+    # done → continue if any ref is marked compliant=false. Non-negotiable: the eval
+    # cannot ship `done` over its own non-compliance findings.
+    design_compliance_findings: list[dict] = []
+    if iteration_design_refs:
+        design_compliance_findings = _parse_design_compliance_from_notes(
+            notes, iteration_design_refs
+        )
+        non_compliant = [f for f in design_compliance_findings if f.get("compliant") is False]
+        if verdict == "done" and non_compliant:
+            coerce_summary = "; ".join(
+                f"{f['ref']}: {f.get('observations', '(no obs)')[:120]}"
+                for f in non_compliant
+            )
+            TRACE.log("design_compliance_violation",
+                      coerced_from="done", coerced_to="continue",
+                      non_compliant_refs=[f["ref"] for f in non_compliant],
+                      summary=coerce_summary[:500])
+            print(f"\n  DESIGN MISMATCH — coercing verdict done → continue.")
+            print(f"  Non-compliant: {coerce_summary}")
+            verdict = "continue"
+            notes = (
+                f"[harness: verdict coerced from `done` to `continue` because the evaluator "
+                f"reported design non-compliance.]\n\n"
+                f"Non-compliant design refs:\n"
+                + "\n".join(f"  - {f['ref']}: {f.get('observations', '(no observations)')}"
+                            for f in non_compliant)
+                + f"\n\n--- evaluator notes follow ---\n\n{notes}"
+            )
+
     print(f"\n  VERDICT: {verdict}")
     print(f"  NOTES: {_truncate_simple(notes, 400)}")
     TRACE.log("verdict", verdict=verdict, notes=notes[:1000],
               tool_counter=dict(tool_counter), is_web_app=is_web_app,
               evidence_retry_rounds=evidence_retry,
-              empty_notes_retry_rounds=empty_notes_retry)
+              empty_notes_retry_rounds=empty_notes_retry,
+              design_refs=iteration_design_refs,
+              design_compliance=design_compliance_findings)
 
     # Test gate: run between verdict and checkpoint. Iterations that regress tests
     # don't get committed — the builder is asked to fix the regression first. Gate
@@ -6442,6 +6834,28 @@ async def main():
         sys.exit(2)
 
     _check_service_alias_or_warn()
+    # Scan the designs folder once at startup. Populates _designs_holder; downstream
+    # planner/builder/evaluator code reads from there. No-op when the folder is absent
+    # or DESIGNS_ENABLED=disabled.
+    _designs_scan = _scan_designs_folder(WORKSPACE)
+    _designs_holder.update(_designs_scan)
+    if _designs_holder["enabled"]:
+        with_notes = sum(1 for m in _designs_holder["manifest"] if m.get("notes_path"))
+        with_images = sum(1 for m in _designs_holder["manifest"] if m.get("image_path"))
+        print(f"Designs:   {_designs_holder['total_count']} design(s) at {_designs_holder['folder']} "
+              f"({with_images} with image, {with_notes} with notes, "
+              f"{len(_designs_holder['unsupported'])} unsupported)")
+        TRACE.log("designs_scanned",
+                  folder=_designs_holder["folder"],
+                  total_count=_designs_holder["total_count"],
+                  with_images=with_images, with_notes=with_notes,
+                  unsupported_count=len(_designs_holder["unsupported"]))
+        for path in _designs_holder["unsupported"]:
+            TRACE.log("design_format_unsupported", path=path)
+    elif DESIGNS_ENABLED == "enabled":
+        print(f"Designs:   WARNING: HARNESS_DESIGNS_ENABLED=enabled but no designs found at "
+              f"{_designs_holder['folder']}")
+
     print(f"Planner:   {planner_llm.model}  (Anthropic)")
     print(f"Builder:   {builder_llm.model_name}  (via {builder_llm.openai_api_base})")
     print(f"Evaluator: {evaluator_llm.model_name}  (via {evaluator_llm.openai_api_base})")

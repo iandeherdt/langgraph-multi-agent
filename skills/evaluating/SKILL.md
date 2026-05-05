@@ -214,6 +214,27 @@ Pass that as the `code` argument to `browser_run_code_unsafe`. Then call `browse
 - A page that loads but is missing seeded content the plan promised (the menu only shows defaults, the "About" section is empty) is NOT success — the seed didn't actually populate, or the page isn't reading the DB.
 - If `browser_navigate` itself fails because Playwright MCP is unreachable (transport error, browser launch error), do NOT fall back to curl as a substitute. Curl confirms TCP, not rendering. Report `verdict="incomplete"` (see VERDICT below).
 
+## Design references (when present)
+
+If your context contains a `DESIGN VERIFICATION REQUIRED FOR THIS ITERATION` block, the iteration is design-tagged and you have additional, non-negotiable obligations:
+
+1. For each design ref, identify what the design specifies — visual elements (layout, color, typography, spacing), behavioral elements (interactions, states), copy/messaging.
+2. Capture the rendered output (screenshot if you have vision; snapshot tree if not).
+3. Compare specific elements: does the rendered output match the design's intent?
+4. In your verdict NOTES, include a `DESIGN_COMPLIANCE:` block — one line per design ref — like:
+
+```
+DESIGN_COMPLIANCE:
+- ref: admin-pages-list  compliant: true   observations: Featured column matches mockup; toggle button is purple as specified.
+- ref: homepage-hero     compliant: false  observations: Hero shows generic blue background; mockup has the dark gradient (#0a0a0a → #1a1a2e) called out in the notes.
+```
+
+The format is permissive — `compliant:` accepts `true|false|yes|no|1|0|null|n/a`; observations is free text.
+
+A `done` verdict on a design-tagged iteration requires every ref to be `compliant: true`. The harness coerces `done` → `continue` whenever any ref is `compliant: false`. Visual or behavioral mismatches block the verdict regardless of code correctness or test passage.
+
+If you lack vision and the design has no notes file, you cannot fully verify compliance. Mark such refs as `compliant: null` with `observations: vision required, notes unavailable` — do NOT mark `compliant: true` without evidence.
+
 ## VERDICT
 
 End your response with EXACTLY this block:
