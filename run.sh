@@ -23,4 +23,34 @@
 # our flags forward to the Python entrypoint.
 
 set -euo pipefail
+
+# --- Pre-flight: clean up stale port-3000 binders ---------------------------------
+# `docker compose run --rm` is supposed to delete the run container on exit, but if a
+# previous run was killed via `docker kill` (rather than Ctrl-C), or the daemon was
+# overloaded, the orphan can linger holding port 3000 — and our --service-ports below
+# will then fail with "port is already allocated". Detect + offer to remove before we
+# attempt to start. Only kills langgraph-run containers we recognize; never touches
+# anything else binding 3000 (e.g., a host process the user genuinely owns).
+stale=$(docker ps \
+    --filter "label=com.docker.compose.service=langgraph" \
+    --filter "publish=3000" \
+    --format "{{.Names}}" 2>/dev/null || true)
+if [ -n "${stale}" ]; then
+    echo "WARN: stale langgraph-run container(s) still bound to host port 3000:" >&2
+    echo "${stale}" | sed 's/^/  - /' >&2
+    echo "" >&2
+    echo "These will block --service-ports binding. Remove them and re-run:" >&2
+    echo "  docker rm -f $(echo "${stale}" | tr '\n' ' ')" >&2
+    echo "" >&2
+    echo "(Or run with HARNESS_NO_KILL_STALE=1 to skip this check.)" >&2
+    if [ "${HARNESS_NO_KILL_STALE:-0}" != "1" ]; then
+        # shellcheck disable=SC2086
+        docker rm -f ${stale} >/dev/null 2>&1 || true
+        echo "Removed stale containers; continuing." >&2
+        echo "" >&2
+    else
+        exit 1
+    fi
+fi
+
 exec docker compose run --rm --use-aliases --service-ports langgraph python graph.py "$@"
