@@ -55,6 +55,7 @@ A long run (1-2h, 10-30 iterations) produces several artifacts. They're compleme
 | **Per-run git branch** | `harness-run-<UTC>` in the workspace git repo | One commit per iteration with verdict-aware metadata. Review with `git -C workspace log harness-run-<UTC> --oneline`; diff the run end-to-end with `git -C workspace diff <init-commit> harness-run-<UTC>`. |
 | **state.json** | `workspace/.harness/<run-id>/state.json` | Per-run resume snapshot. Loaded by `./run.sh --resume <run-id>` (see Resume section). |
 | **Screenshots** | `workspace/.playwright-mcp/` | Real-time screenshots, snapshot YAMLs, console-message dumps from the evaluator's MCP browser tools. Readable from your host without `docker cp`. |
+| **Reusable prompts** | `prompts/<name>.md` (or `.txt`) | Repo-level. Write a prompt once, re-run it any time with `./run.sh --prompt-name <name>`. Individual files are gitignored; the directory itself is tracked via `.gitkeep`. |
 
 The git branch + RUN_SUMMARY.md are both gitignored at the workspace level (the workspace gitignore excludes `.trace/`, `.servers/`, `.playwright-mcp/`, `.harness/`, `__pycache__/`, `*.pyc`). Project-specific `.gitignore`s under `<project>/.gitignore` get merged automatically.
 
@@ -73,6 +74,33 @@ docker compose build
 - `--service-ports`: `compose run` ignores the service's `ports:` mapping by default (a known compose-run-vs-up difference). Without this, the dev server the builder spawns is reachable inside the container and from playwright-mcp, but NOT from your host browser at `http://localhost:3000`. With it, the declared port is published.
 
 Then at the `Task:` prompt, give it a coding task. Each task runs the full PBE loop (max 5 iterations) and emits a trace file you can grep.
+
+### Prompt input modes
+
+Single-line `Task:` prompts work fine for short tasks but break on anything with newlines, lists, or code samples (paste lands the first line). Four input modes:
+
+```bash
+# Reusable named prompt (recommended for tasks you re-run): writes to prompts/<name>.md
+echo "Build a CMS for a digital agency..." > prompts/agency-cms.md
+./run.sh --prompt-name agency-cms
+
+# Direct file path
+./run.sh --prompt-file ./my-prompt.md
+
+# Pipe stdin until EOF — for "paste a long thing" workflows
+cat long-prompt.txt | ./run.sh --prompt -
+
+# Inline multi-line in the interactive REPL
+./run.sh
+Task: """
+Multi-line input mode — end with """ on its own line.
+Build a CMS with these requirements:
+- Next.js
+- Prisma
+"""
+```
+
+The `prompts/` directory is gitignored at the file level so user prompts (which can be project-specific or sensitive) don't leak into the repo, but the directory itself is tracked via `.gitkeep`. `--prompt-name nonexistent` lists available names. The `--prompt-*` flags are mutually exclusive and can't be combined with `--resume` (resume re-runs the original task from `state.json`).
 
 ## Configuration
 
@@ -98,6 +126,12 @@ All in `.env`:
 | `MCP_RECOVERY_WAIT_SECONDS` | Initial backoff before MCP reconnect attempts | `10` |
 | `MCP_RECOVERY_MAX_RETRIES` | MCP reconnect attempts before giving up | `3` |
 | `RESUME_ENABLED` | Persist `state.json` per iteration; surface in-progress runs | `1` |
+| `HARNESS_TEST_COMMAND` | Test command run between successful eval and git checkpoint. Empty disables the test gate entirely. | (unset) |
+| `HARNESS_TEST_CWD` | CWD for `HARNESS_TEST_COMMAND`. Override or include `cd <subdir> &&` in the command. | `/workspace` |
+| `HARNESS_TEST_TIMEOUT_SECONDS` | Test command timeout (seconds) | `120` |
+| `HARNESS_TEST_GATE_REQUIRED` | `1` blocks checkpoint on failures; `0` is warnings-only mode | `1` |
+| `HARNESS_TEST_GATE_MAX_STREAK` | Consecutive test failures before circuit-breaker terminates the run | `3` |
+| `HARNESS_TEST_OUTPUT_TAIL_LINES` | Lines of test output captured in trace + RUN_SUMMARY | `50` |
 
 OpenRouter routes flakily for tool-calling on some providers (the model returns native XML format, the provider doesn't translate it back). If you see broken tool calls, find a working provider in your OpenRouter activity log and pin via `OPENROUTER_PROVIDERS=...`. To exclude a single bad provider without pinning everything, use `OPENROUTER_IGNORE_PROVIDERS=parasail` (etc.) — the rest of the fallback set still runs.
 
@@ -165,6 +199,38 @@ The running total appears in `RUN_SUMMARY.md`'s Status block:
 
 Default currency is EUR (with `COST_USD_TO_EUR=0.92` factor); set `HARNESS_COST_CCY=USD` for dollar rendering. Costs are restored across resumes from the persisted `cost_tracking` field in `state.json` so the running total stays continuous.
 
+## Test gate
+
+For projects with a test suite, the harness runs `HARNESS_TEST_COMMAND` between a successful evaluator verdict and the git checkpoint. **Iterations that regress tests don't get committed**: the builder is sent back to fix the regression on the next iteration, with the failure output injected into the planner's `BUILDER_INSTRUCTIONS` carryover. After `HARNESS_TEST_GATE_MAX_STREAK` consecutive failures the run terminates (circuit breaker) with bypass commands surfaced in `RUN_SUMMARY.md`'s Termination section. Empty `HARNESS_TEST_COMMAND` disables the feature entirely so existing runs without test suites work unchanged.
+
+```bash
+HARNESS_TEST_COMMAND="cd agency-cms && npm run test" ./run.sh
+```
+
+Run-start baseline check: at startup the harness runs the test command once. A failing baseline disables the gate for the run (you can't regress what's already broken). RUN_SUMMARY.md surfaces this under the Test gate section as "Disabled for this run: tests were already failing at start."
+
+Per-iteration outcomes:
+- **passed** → log `test_gate_passed`, reset streak, normal checkpoint
+- **failed/timeout (REQUIRED=1)**: skip checkpoint, demote `done`→`continue`, append regression notice to `eval_notes` (next planner sees it). Streak ≥ cap → `verdict=incomplete` with marker, run terminates.
+- **failed/timeout (REQUIRED=0)** (warnings-only): log + commit anyway. Iteration history shows `tests: failed; checkpointed anyway`.
+
+Iteration history annotates each line with the gate outcome:
+
+```
+- Iter 5: <summary> ... ✓ (tests: passed in 4.2s)
+- Iter 6: <summary> ... ✗ (tests: failed; not committed; streak 1/3)
+- Iter 7: <summary> ... ✓ (tests: passed in 4.5s)
+```
+
+When the circuit breaker fires, RUN_SUMMARY.md gets a Termination section with the exact bypass commands:
+
+```
+HARNESS_TEST_GATE_REQUIRED=0 ./run.sh --resume <run-id>
+HARNESS_TEST_GATE_MAX_STREAK=<higher> ./run.sh --resume <run-id>
+```
+
+Trace events: `test_gate_baseline_passed`, `test_gate_baseline_failing`, `test_gate_passed`, `test_gate_failed`, `test_gate_timeout`, `test_gate_circuit_breaker_triggered`, `test_gate_skipped`. The streak + disabled-baseline state is persisted in `state.json` so resume preserves the circuit-breaker condition (the operator overrides via the env vars on the resume command).
+
 ## Tunable thresholds
 
 All of these are named constants at the top of `graph.py`:
@@ -226,7 +292,14 @@ RESUME_FRESHNESS_HOURS = 24       # AsyncSqliteSaver checkpoints older than this
 
 # --resume <run-id> path (PBE-iteration-level resume; separate from the above)
 RESUME_ENABLED = True
-RESUME_STATE_SCHEMA_VERSION = 1   # bump on non-backward-compat state.json shape changes
+RESUME_STATE_SCHEMA_VERSION = 2   # bumped from 1: state.json gained test-gate fields
+
+# Test gate — empty TEST_COMMAND disables; set via HARNESS_TEST_COMMAND env
+TEST_COMMAND = ""                  # default unset → gate disabled
+TEST_TIMEOUT_SECONDS = 120
+TEST_GATE_REQUIRED_FOR_CHECKPOINT = True
+TEST_GATE_MAX_STREAK = 3           # consecutive failures → circuit breaker terminates run
+TEST_OUTPUT_TAIL_LINES = 50
 
 VERIFY_COMPLETION_CAP = 3         # advisor verdicts per task before forced give_up
 VERIFY_COMPLETION_ERROR_CAP = 2   # advisor errors (separate budget; doesn't burn verdict cap)
