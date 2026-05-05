@@ -137,6 +137,22 @@ For every page you browsed, NOTES must include:
 
 Verdicts that say only "homepage returned 200" or "all pages loaded" are not acceptable. The `verify_completion` advisor reads your NOTES as the basis for its verdict; it can't tell whether you actually browsed the site without specific content evidence.
 
+## CONSOLE ERROR POLICY — REQUIRED
+
+Console errors are blockers, not warnings. When `browser_console_messages` returns content tagged as `error` (not warnings, not logs), the verdict cannot be `done`.
+
+If the captured output is over 5,000 characters, do not try to read it all. Search for these keywords: `Error:`, `TypeError`, `ReferenceError`, `Cannot`, `Failed to`, `Uncaught`, `exception`, `throw`. Quote the first 3 distinct error messages you find in the verdict NOTES.
+
+The presence of console errors blocks `done` regardless of visual rendering. Next.js and similar frameworks render pages with server errors via error boundaries — the page can look complete while the underlying flow is broken. **Trust console errors over visual snapshots.**
+
+If the run is genuinely producing intentional errors (e.g., testing error boundaries deliberately), the builder must explicitly call this out in the iteration's `task_summary` to `verify_completion`. Otherwise, treat all console errors as bugs.
+
+Concrete examples of how to read a large `browser_console_messages` result:
+
+- The result starts with `### Result\nTotal messages: N (Errors: E, Warnings: W)`. If `E > 0`, you MUST surface at least the error count + a quoted sample. Don't summarize as "no critical issues".
+- If the body contains `TypeError: Cannot read property 'foo' of undefined at ...`, that's a runtime error. Quote the line; verdict is `continue` (or `replan` if the architecture is the cause).
+- If the body contains hydration warnings, they're errors in production but warnings in dev — surface them; mention in NOTES that they need investigating before deploy.
+
 ## WHAT COUNTS AS VERIFICATION FAILURE
 
 - HTTP 200 with empty / skeleton content (a placeholder page, an unstyled layout) is NOT success.

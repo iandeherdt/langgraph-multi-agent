@@ -296,7 +296,7 @@ RUN_SUMMARY_TASK_SUMMARY_CHARS = 80    # per-iteration title/summary length
 # to start fresh. Bump RESUME_STATE_SCHEMA_VERSION whenever the persisted state shape
 # changes in a non-backward-compatible way.
 RESUME_ENABLED = os.environ.get("RESUME_ENABLED", "1").lower() not in ("0", "false", "no", "")
-RESUME_STATE_SCHEMA_VERSION = 2  # bumped from 1: state.json gained test-gate fields
+RESUME_STATE_SCHEMA_VERSION = 3  # bumped from 2: state.json gained evaluator_model_used
 RESUME_STATE_FILENAME = "state.json"
 
 # Test gate. Runs HARNESS_TEST_COMMAND between a successful evaluator verdict and the
@@ -343,6 +343,35 @@ VERIFY_COMPLETION_CAP = 3            # verdicts (done | not_done) per task
 VERIFY_COMPLETION_ERROR_CAP = 2      # advisor errors per task; doesn't burn verdict cap
 SHELL_HISTORY_FOR_VERIFY = 10        # ring buffer of recent shell outputs for the advisor
 ADVISOR_OUTPUT_CHARS = 4000          # clip recent verify output to this many chars in the advisor message
+
+# Tiered evaluator. The evaluator can run on a different (typically stronger) model than
+# the builder — important when the eval needs to read large evidence buffers carefully
+# (e.g., a 64KB browser_console_messages dump where the failure mode is "Qwen captured
+# the error then summarized it as 'no issues' in the verdict"). Three configuration
+# knobs, in precedence order:
+#   1. HARNESS_EVALUATOR_MODEL — explicit slug ("claude-sonnet-4-6", "qwen/qwen3.6-27b").
+#      Highest precedence; bypasses tier logic entirely.
+#   2. HARNESS_EVALUATOR_TIER — "cheap" (use builder model), "strong" (use Sonnet 4.6),
+#      or "auto" (heuristic — see _select_evaluator_model). Default "auto".
+#   3. HARNESS_EVALUATOR_FALLBACK_MODEL — fallback if the primary evaluator errors out
+#      (rate limit / API outage). Empty disables fallback; primary errors fall through
+#      to the existing verdict=incomplete path.
+EVALUATOR_MODEL = os.environ.get("HARNESS_EVALUATOR_MODEL", "").strip()
+EVALUATOR_FALLBACK_MODEL = os.environ.get("HARNESS_EVALUATOR_FALLBACK_MODEL", "").strip()
+EVALUATOR_TIER = os.environ.get("HARNESS_EVALUATOR_TIER", "auto").strip().lower()
+# Default model for the "strong" tier. Mirrors ADVISOR_MODEL by default — same model the
+# advisor uses. Override via HARNESS_EVALUATOR_STRONG_MODEL if you want them different.
+EVALUATOR_STRONG_MODEL = os.environ.get("HARNESS_EVALUATOR_STRONG_MODEL", "claude-sonnet-4-6").strip()
+# Auto-tier escalation triggers. Substring matched case-insensitive against the task
+# description. The list reflects "stakes worth paying for stronger verification": shipping,
+# user data, money, regulated domains.
+EVALUATOR_AUTO_STRONG_KEYWORDS = (
+    "production", "deploy", "release", "payment", "auth", "security",
+    "user data", "gdpr", "compliance", "hipaa",
+)
+# Budget-based escalation: HARNESS_BUDGET_EUR ≥ this → strong tier. Forward-compatible
+# with the (not-yet-implemented) budget circuit breaker.
+EVALUATOR_AUTO_STRONG_BUDGET_EUR = 10.0
 
 # File editor
 FILE_VIEW_DEFAULT_MAX_LINES = 800     # if file ≤ this, return whole file by default (was 400 — too aggressive for code; ~95% of source files <800 lines)
@@ -1086,7 +1115,9 @@ def _update_run_summary(state) -> None:
             f"- Plan tasks: {done_n} done / {total_n} total\n"
             f"- Iterations: {iterations_n}\n"
             f"- Last successful checkpoint: {last_ckpt_line}\n"
-            f"- Estimated cost so far: {cost_line}\n\n"
+            f"- Estimated cost so far: {cost_line}\n"
+            + _format_evaluator_model_line()
+            + "\n"
             + test_gate_block
             + f"## Iteration history\n"
             + "\n".join(history_lines) + "\n\n"
@@ -1327,6 +1358,11 @@ def _serialize_state_for_resume(state, *, original_task: str) -> dict:
         "test_gate_disabled_baseline": _test_gate_state.get("disabled_baseline", False),
         "last_test_gate_status": _test_gate_state.get("last_status"),
         "last_test_gate_duration_seconds": _test_gate_state.get("last_duration_seconds"),
+        # Schema v3: which evaluator model the tier selector picked for the most recent
+        # iteration. Preserved across resume so the same model continues unless the user
+        # overrides via HARNESS_EVALUATOR_TIER / HARNESS_EVALUATOR_MODEL on the resume
+        # command line. Read by main()'s resume path to seed the cached agent.
+        "evaluator_model_used": _evaluator_holder.get("agent_model_id"),
     }
 
 
@@ -1413,6 +1449,8 @@ _SCHEMA_CHANGELOG = {
     1: "initial state.json shape",
     2: "added test-gate fields (test_gate_failure_streak, test_gate_disabled_baseline, "
        "last_test_gate_status, last_test_gate_duration_seconds)",
+    3: "added evaluator_model_used (the per-iteration evaluator model picked by the "
+       "tier selector — preserved across resume so the same model continues)",
 }
 
 
@@ -1495,6 +1533,10 @@ def _restore_module_state_from_resume(state: dict) -> None:
     _test_gate_state["last_status"] = state.get("last_test_gate_status")
     _test_gate_state["last_duration_seconds"] = state.get("last_test_gate_duration_seconds")
     _test_gate_state["last_output_tail"] = ""  # not persisted; will repopulate on next gate run
+    # Evaluator model identity. Just pre-seed agent_model_id so the next evaluator_node
+    # call's cache check sees a "same model" hit and doesn't rebuild the agent on a
+    # spurious miss (the actual agent is built lazily on first eval call).
+    _evaluator_holder["agent_model_id"] = state.get("evaluator_model_used")
 
 
 # ────────────────────────── helpers ──────────────────────────
@@ -3414,7 +3456,90 @@ advisor_llm = ChatAnthropic(
     max_tokens=2000,
 )
 builder_llm = _openrouter_llm(os.environ.get("BUILDER_MODEL", "qwen/qwen3-coder-next"))
+# evaluator_llm — preserved as the legacy / cheap-tier default for callers that haven't
+# adopted _make_llm_for_model. The evaluator_node selects per-call via tier logic; this
+# global is used by _select_evaluator_model when the chosen tier is "cheap" (and no
+# explicit override was set), and is the backstop fallback when the selector returns
+# the same builder model.
 evaluator_llm = _openrouter_llm(os.environ.get("EVAL_MODEL", "qwen/qwen3.6-27b"))
+
+
+def _make_llm_for_model(model_id: str):
+    """Pick the right LangChain wrapper for a model slug. Anthropic native API for
+    `claude-*` (consistent with the planner + advisor); OpenRouter's OpenAI-compat shim
+    otherwise. Both return objects that the evaluator agent can drive via create_agent.
+
+    Used to construct evaluator LLMs on-the-fly per the tier selector — the global
+    evaluator_llm is one slug; this lets the harness escalate to Sonnet (or any other
+    model) per evaluator invocation without duplicating wrapper boilerplate.
+    """
+    slug = (model_id or "").strip()
+    if not slug:
+        raise ValueError("_make_llm_for_model requires a non-empty model id")
+    if slug.startswith("claude-") or "anthropic/" in slug:
+        # Strip the optional "anthropic/" prefix that some configs use.
+        clean = slug.split("/", 1)[-1] if "/" in slug else slug
+        return ChatAnthropic(model=clean, max_tokens=4000)
+    return _openrouter_llm(slug)
+
+
+def _select_evaluator_model(state, task: str) -> dict:
+    """Pick the evaluator model + record why. Precedence:
+    1. HARNESS_EVALUATOR_MODEL set → explicit override (tier_used="explicit").
+    2. HARNESS_EVALUATOR_TIER=cheap → builder model.
+    3. HARNESS_EVALUATOR_TIER=strong → EVALUATOR_STRONG_MODEL.
+    4. HARNESS_EVALUATOR_TIER=auto (default) → heuristic:
+       - any EVALUATOR_AUTO_STRONG_KEYWORDS substring in task → strong
+       - HARNESS_BUDGET_EUR ≥ 10 → strong
+       - is_web_app + ≥1 prior non-ok iteration in history → strong
+       - otherwise → cheap (builder model)
+
+    Returns a dict {model, reason, tier_requested, tier_used}.
+    """
+    tier_requested = EVALUATOR_TIER
+    builder_slug = (getattr(builder_llm, "model_name", None)
+                    or getattr(builder_llm, "model", None)
+                    or "qwen/qwen3-coder-next")
+
+    if EVALUATOR_MODEL:
+        return {"model": EVALUATOR_MODEL, "reason": "HARNESS_EVALUATOR_MODEL set",
+                "tier_requested": tier_requested, "tier_used": "explicit"}
+
+    if tier_requested == "cheap":
+        return {"model": builder_slug, "reason": "tier=cheap",
+                "tier_requested": tier_requested, "tier_used": "cheap"}
+
+    if tier_requested == "strong":
+        return {"model": EVALUATOR_STRONG_MODEL, "reason": "tier=strong",
+                "tier_requested": tier_requested, "tier_used": "strong"}
+
+    # tier_requested == "auto" (or unrecognized — treat as auto)
+    task_lc = (task or "").lower()
+    matched_kw = next((kw for kw in EVALUATOR_AUTO_STRONG_KEYWORDS if kw in task_lc), None)
+    if matched_kw:
+        return {"model": EVALUATOR_STRONG_MODEL,
+                "reason": f"task contains {matched_kw!r}",
+                "tier_requested": tier_requested, "tier_used": "strong"}
+
+    try:
+        budget_eur = float(os.environ.get("HARNESS_BUDGET_EUR", "0") or "0")
+    except ValueError:
+        budget_eur = 0.0
+    if budget_eur >= EVALUATOR_AUTO_STRONG_BUDGET_EUR:
+        return {"model": EVALUATOR_STRONG_MODEL,
+                "reason": f"HARNESS_BUDGET_EUR={budget_eur} >= {EVALUATOR_AUTO_STRONG_BUDGET_EUR}",
+                "tier_requested": tier_requested, "tier_used": "strong"}
+
+    plan_doc = (state or {}).get("plan") or {}
+    if _is_web_app_task(state or {}, plan_doc):
+        non_ok_prior = sum(1 for entry in _iteration_history if entry.get("status") != "ok")
+        if non_ok_prior >= 1:
+            return {"model": EVALUATOR_STRONG_MODEL,
+                    "reason": f"web-app task + {non_ok_prior} prior non-ok iteration(s)",
+                    "tier_requested": tier_requested, "tier_used": "strong"}
+
+    return {"model": builder_slug, "reason": "default cheap (no escalation triggers)",
+            "tier_requested": tier_requested, "tier_used": "cheap"}
 
 
 # ────────────────────────── prompts ──────────────────────────
@@ -4199,7 +4324,26 @@ async def planner_node(state: State) -> dict:
 # every call after browser_navigate sees Page URL: about:blank. Page state is destroyed
 # between calls. Reproduced cleanly with a manual nav→snapshot probe; fixed by opening
 # `async with client.session(...)` once and binding tools via load_mcp_tools(session).
-_evaluator_holder: dict = {"agent": None, "mcp_session_cm": None, "mcp_session": None}
+_evaluator_holder: dict = {
+    "agent": None, "mcp_session_cm": None, "mcp_session": None,
+    # Track which model the cached agent was built for so the tier selector can
+    # detect a model change and trigger a rebuild (different LLM → different agent).
+    # The MCP session itself is reusable across model changes — we only swap the agent.
+    "agent_model_id": None,
+    # Most recent tier selector decision, captured for RUN_SUMMARY rendering.
+    "last_selection": None,  # {model, tier_used, tier_requested, reason} or None
+}
+
+
+def _format_evaluator_model_line() -> str:
+    """Render the RUN_SUMMARY 'Evaluator model' line. Returns empty string when no eval
+    has run yet (so the Status block doesn't carry a misleading default before the first
+    iteration completes)."""
+    sel = _evaluator_holder.get("last_selection")
+    if not sel:
+        return ""
+    return (f"- Evaluator model: {sel.get('model','?')} "
+            f"(tier={sel.get('tier_used','?')}, reason={sel.get('reason','?')!r})\n")
 
 # In-memory record of recent eval tool calls + their (truncated) bodies. The recursion-limit
 # handler scans this for findings (console errors, runtime-error dialogs, broken navigation,
@@ -4255,11 +4399,16 @@ def _iteration_affects_ui(touched_files) -> bool:
     return False
 
 
-async def build_evaluator_subagent():
+async def build_evaluator_subagent(llm=None):
+    """Build (or rebuild) the evaluator agent. The optional `llm` parameter lets the
+    tier selector pass a per-call-chosen model; default falls back to the legacy
+    cheap-tier `evaluator_llm` global.
+
+    Reuses the existing MCP session if one is already open (only the agent rebuilds
+    when the model changes; the SSE session is reusable across model swaps). Builds
+    a new session only if none exists or the prior one was closed."""
     mcp_url = os.environ.get("PLAYWRIGHT_MCP_URL", "http://playwright-mcp:8931/sse")
-    client = MultiServerMCPClient({
-        "playwright": {"url": mcp_url, "transport": "sse"},
-    })
+    chosen_llm = llm or evaluator_llm
 
     # Persistent MCP session: open ONE session for the lifetime of the evaluator subagent.
     # langchain-mcp-adapters has two modes:
@@ -4269,38 +4418,43 @@ async def build_evaluator_subagent():
     #      calls. browser_navigate succeeds, then browser_snapshot returns about:blank.
     #   2. async with client.session(name) → load_mcp_tools(session) — tools are bound to
     #      a single persistent session, so all calls share browser state. We use this.
-    # Manual context-manager management: we enter the cm here and rely on process exit to
-    # close the SSE connection. _close_evaluator_mcp_session() in main()'s finally handles
-    # graceful close. Reconnect-on-error is a v2 concern; if the session dies the eval
-    # node's existing exception path catches it and routes to verdict=incomplete.
+    # Reuse: if the holder already has a live session, reuse it (only the agent needs to
+    # be rebuilt when the model changes). Otherwise open a new one.
     mcp_tools: list = []
-    try:
-        session_cm = client.session("playwright")
-        session = await session_cm.__aenter__()
-        _evaluator_holder["mcp_session_cm"] = session_cm
-        _evaluator_holder["mcp_session"] = session
-        mcp_tools = await load_mcp_tools(session)
-        print(f"  Loaded {len(mcp_tools)} Playwright MCP tools (persistent session)")
-    except Exception as e:
-        print(f"  WARN: failed to connect to Playwright MCP at {mcp_url}: {type(e).__name__}: {e}")
-        # asyncio.TaskGroup wraps real causes; surface them so we know what to fix.
-        for sub in getattr(e, "exceptions", ()):
-            print(f"    cause: {type(sub).__name__}: {sub}")
-        print("  WARN: evaluator will run with code-only tools (no screenshots).")
+    if _evaluator_holder.get("mcp_session") is not None:
+        try:
+            mcp_tools = await load_mcp_tools(_evaluator_holder["mcp_session"])
+        except Exception as e:
+            print(f"  WARN: failed to reuse MCP session, opening new: {type(e).__name__}: {e}")
+            _evaluator_holder["mcp_session"] = None
+
+    if not mcp_tools:
+        client = MultiServerMCPClient({
+            "playwright": {"url": mcp_url, "transport": "sse"},
+        })
+        try:
+            session_cm = client.session("playwright")
+            session = await session_cm.__aenter__()
+            _evaluator_holder["mcp_session_cm"] = session_cm
+            _evaluator_holder["mcp_session"] = session
+            mcp_tools = await load_mcp_tools(session)
+            print(f"  Loaded {len(mcp_tools)} Playwright MCP tools (persistent session)")
+        except Exception as e:
+            print(f"  WARN: failed to connect to Playwright MCP at {mcp_url}: {type(e).__name__}: {e}")
+            for sub in getattr(e, "exceptions", ()):
+                print(f"    cause: {type(sub).__name__}: {sub}")
+            print("  WARN: evaluator will run with code-only tools (no screenshots).")
 
     # Make individual tool failures recoverable. By default, BaseTool.handle_tool_error
     # is False and a ToolException raised by a tool propagates through .ainvoke / .astream
     # and out of the subagent, terminating the entire eval. With True, the exception's str()
     # is returned to the agent as the tool result instead, so the model sees the error
     # message and can retry with different args (e.g., screenshot with a valid filename).
-    # Real infrastructure failures (MCP transport down, browser not installed) still
-    # surface — those raise different exception types (ConnectError, missing browser
-    # bundles) at connection time, not as ToolException at call time.
     for t in mcp_tools:
         t.handle_tool_error = True
 
     return create_agent(
-        evaluator_llm,
+        chosen_llm,
         tools=[view_file, list_dir, run_shell_oneshot, serve_in_background, stop_servers] + mcp_tools,
         **{_AGENT_PROMPT_KWARG: EVALUATOR_SYSTEM_PROMPT},
     )
@@ -4742,10 +4896,38 @@ def _eval_notes_too_short(notes: str) -> bool:
 
 
 async def evaluator_node(state: State) -> dict:
-    if _evaluator_holder["agent"] is None:
-        _evaluator_holder["agent"] = await build_evaluator_subagent()
-    print(f"\n━━━ EVALUATOR (iteration {state['iteration']}) ━━━")
-    TRACE.log("evaluator_start", iteration=state["iteration"])
+    # Tier-aware model selection. Picks the evaluator model per-call from
+    # HARNESS_EVALUATOR_MODEL / HARNESS_EVALUATOR_TIER and the auto heuristic. Most runs
+    # land on the same model across iterations; the agent is cached + rebuilt only when
+    # the chosen model differs from what's cached.
+    chosen = _select_evaluator_model(state, state.get("task", ""))
+    chosen_model = chosen["model"]
+    _evaluator_holder["last_selection"] = dict(chosen)  # for RUN_SUMMARY rendering
+    TRACE.log("evaluator_model_chosen",
+              iteration=state["iteration"],
+              tier_requested=chosen["tier_requested"],
+              tier_used=chosen["tier_used"],
+              model=chosen_model,
+              reason=chosen["reason"])
+
+    if (_evaluator_holder.get("agent") is None
+            or _evaluator_holder.get("agent_model_id") != chosen_model):
+        try:
+            chosen_llm = _make_llm_for_model(chosen_model)
+        except Exception as e:
+            # Bad slug. Fall back to the legacy cheap-tier global. Logged so the operator
+            # notices via grep on the trace.
+            TRACE.log("evaluator_model_build_failed",
+                      model=chosen_model, error=str(e)[:300])
+            chosen_llm = evaluator_llm
+            chosen_model = (getattr(evaluator_llm, "model_name", None)
+                            or getattr(evaluator_llm, "model", None) or "unknown")
+        _evaluator_holder["agent"] = await build_evaluator_subagent(llm=chosen_llm)
+        _evaluator_holder["agent_model_id"] = chosen_model
+    print(f"\n━━━ EVALUATOR (iteration {state['iteration']}) [{chosen_model} / "
+          f"tier={chosen['tier_used']}] ━━━")
+    print(f"  Selection: {chosen['reason']}")
+    TRACE.log("evaluator_start", iteration=state["iteration"], model=chosen_model)
     # Reset per-iteration findings buffer. _stream_subagent populates it as eval tool
     # results arrive; the recursion-limit handler reads it to salvage findings into the
     # verdict notes when the eval times out without writing its own verdict block.
@@ -4893,10 +5075,51 @@ async def evaluator_node(state: State) -> dict:
                 + base_prompt
             )
         try:
-            text = await _stream_subagent(
-                _evaluator_holder["agent"], prompt, "eval", EVAL_RECURSION_LIMIT,
-                tool_counter=tool_counter,
-            )
+            try:
+                text = await _stream_subagent(
+                    _evaluator_holder["agent"], prompt, "eval", EVAL_RECURSION_LIMIT,
+                    tool_counter=tool_counter,
+                )
+            except (GraphRecursionError, *_MODEL_RETRY_EXCEPTIONS) as primary_err:
+                # GraphRecursionError doesn't fall back (a recursion timeout is the eval's
+                # own internal budget; switching models won't help). Other model API errors
+                # (rate limit / transient 5xx / connection drop) DO benefit from a
+                # fallback if one is configured.
+                if isinstance(primary_err, GraphRecursionError):
+                    raise
+                if not EVALUATOR_FALLBACK_MODEL:
+                    raise
+                fallback_slug = EVALUATOR_FALLBACK_MODEL
+                TRACE.log("evaluator_model_fallback_used",
+                          iteration=state["iteration"],
+                          primary_model=chosen_model,
+                          fallback_model=fallback_slug,
+                          primary_error_type=type(primary_err).__name__,
+                          primary_error=str(primary_err)[:300])
+                print(f"\n  EVALUATOR PRIMARY MODEL FAILED ({type(primary_err).__name__}); "
+                      f"retrying with fallback {fallback_slug!r}...")
+                try:
+                    fb_llm = _make_llm_for_model(fallback_slug)
+                    fb_agent = await build_evaluator_subagent(llm=fb_llm)
+                    # Cache: subsequent iterations within the run will reuse the fallback
+                    # if the primary keeps failing. Selector logic still runs at top of
+                    # each evaluator_node call; a recovered primary will rebuild back.
+                    _evaluator_holder["agent"] = fb_agent
+                    _evaluator_holder["agent_model_id"] = fallback_slug
+                    text = await _stream_subagent(
+                        fb_agent, prompt, "eval", EVAL_RECURSION_LIMIT,
+                        tool_counter=tool_counter,
+                    )
+                except Exception as fb_err:
+                    TRACE.log("evaluator_model_fallback_exhausted",
+                              iteration=state["iteration"],
+                              primary_model=chosen_model,
+                              fallback_model=fallback_slug,
+                              fallback_error_type=type(fb_err).__name__,
+                              fallback_error=str(fb_err)[:300])
+                    print(f"  FALLBACK ALSO FAILED ({type(fb_err).__name__}: {str(fb_err)[:200]}); "
+                          f"falling through to verdict=incomplete path.")
+                    raise fb_err
         except GraphRecursionError:
             # Eval ran out of internal-step budget without producing a verdict. Don't crash
             # the whole run — return 'continue' with notes salvaged from the tool history.
