@@ -288,6 +288,21 @@ RUN_SUMMARY_PATH = HARNESS_DIR / "RUN_SUMMARY.md"
 RUN_SUMMARY_NOTES_PREVIEW_CHARS = 240  # per-iteration notes preview length in the summary
 RUN_SUMMARY_TASK_SUMMARY_CHARS = 80    # per-iteration title/summary length
 
+# Resume support: per-run state.json under workspace/.harness/<run_id>/. Written at every
+# iteration end so a Ctrl-C kill, OOM, or transient crash can be resumed via
+# `./run.sh --resume <run_id>`. The run_id is the timestamp portion of the per-run git
+# branch (`harness-run-20260505T091530Z` → run_id `20260505T091530Z`). Resume validates
+# schema_version against the current build before loading; mismatch → refuse + ask user
+# to start fresh. Bump RESUME_STATE_SCHEMA_VERSION whenever the persisted state shape
+# changes in a non-backward-compatible way.
+RESUME_ENABLED = os.environ.get("RESUME_ENABLED", "1").lower() not in ("0", "false", "no", "")
+RESUME_STATE_SCHEMA_VERSION = 1
+RESUME_STATE_FILENAME = "state.json"
+# A "fresh" candidate for in-progress detection — older state.json files are surfaced
+# but with a stale-warning. The threshold is just for the printed list; resume itself
+# accepts any age (subject to schema_version match).
+RESUME_FRESH_HOURS = 24
+
 # Checkpointing: persist outer + inner graph state to .trace/checkpoints.db so a crash
 # doesn't lose in-progress builder work. Bump CHECKPOINT_SCHEMA_VERSION whenever the State
 # or BuilderState TypedDict changes shape — old checkpoints will be rejected (load fails
@@ -938,12 +953,26 @@ def _update_run_summary(state) -> None:
         if len(truncated_task) > 200:
             truncated_task = truncated_task[:197] + "..."
 
+        # Resume hint — only shown when checkpointing produced a real branch (which means
+        # state.json is being persisted by _save_run_state). The exact command makes resume
+        # one-paste-from-the-summary.
+        run_id = _current_run_id()
+        if run_id and RESUME_ENABLED:
+            resume_block = (
+                f"## Resume\n"
+                f"This run can be resumed (after a crash, Ctrl-C, or budget exhaustion) with:\n\n"
+                f"    ./run.sh --resume {run_id}\n\n"
+            )
+        else:
+            resume_block = ""
+
         md = (
             f"# Run summary: {truncated_task}\n\n"
             f"Started: {started}\n"
             f"Last updated: {now}\n"
             f"Run branch: {branch}\n\n"
-            f"## Status\n"
+            + resume_block
+            + f"## Status\n"
             f"- Plan tasks: {done_n} done / {total_n} total\n"
             f"- Iterations: {iterations_n}\n"
             f"- Last successful checkpoint: {last_ckpt_line}\n"
@@ -970,10 +999,11 @@ def _update_run_summary(state) -> None:
 def _finalize_iteration_summary(*, state, verdict: str, builder_summary: str = "",
                                 exit_signal: str | None = None,
                                 exit_payload: dict | None = None) -> None:
-    """Record the iteration in history + rewrite RUN_SUMMARY.md. Idempotent. Called from
-    every return path in evaluator_node and from builder_node early-exit returns. The
-    iteration history's status is derived from the verdict via _VERDICT_TO_STATUS; for
-    builder-side early exits (e.g., 'builder_exit:give_up') the status is 'early-exit'."""
+    """Record the iteration in history + rewrite RUN_SUMMARY.md + persist state.json.
+    Idempotent. Called from every return path in evaluator_node and from builder_node
+    early-exit returns. The iteration history's status is derived from the verdict via
+    _VERDICT_TO_STATUS; for builder-side early exits (e.g., 'builder_exit:give_up') the
+    status is 'early-exit'."""
     if verdict.startswith("builder_exit:"):
         status = "early-exit"
     else:
@@ -991,7 +1021,17 @@ def _finalize_iteration_summary(*, state, verdict: str, builder_summary: str = "
         plan_doc=(state or {}).get("plan") or {},
     )
     _update_run_summary(state)
+    # Persist a per-run state.json so a Ctrl-C / OOM / container-restart can be resumed
+    # via `./run.sh --resume <run_id>`. Originated task (the user's first input on the
+    # original run start) is captured by main() into _run_started_holder; subsequent
+    # iterations + resumes preserve it across the full life of the run.
+    _save_run_state(state, original_task=_run_started_holder.get("original_task", ""))
     _reset_iteration_summary_holder()
+
+
+# Captures the run's originating task. Populated once in main() at task start; used by
+# _save_run_state so the persisted original_task survives across iterations + resumes.
+_run_started_holder: dict = {"original_task": ""}
 
 
 def _read_run_summary_for_builder() -> str:
@@ -1004,6 +1044,246 @@ def _read_run_summary_for_builder() -> str:
     except Exception:
         pass
     return ""
+
+
+# ────────────────────────── resume: per-run state persistence ──────────────────────────
+
+
+def _current_run_id() -> str | None:
+    """Derive the run_id from the active harness branch. Format: timestamp (e.g.,
+    `20260505T091530Z`) — the suffix of `harness-run-<timestamp>`. Returns None when no
+    branch is active (checkpointing disabled, init failed, etc.) so callers can no-op."""
+    branch = (_git_checkpoint_state or {}).get("branch") or ""
+    if branch.startswith(GIT_CHECKPOINT_BRANCH_PREFIX):
+        return branch[len(GIT_CHECKPOINT_BRANCH_PREFIX):]
+    return None
+
+
+def _state_save_dir(run_id: str) -> Path:
+    """Path to the per-run state directory."""
+    return HARNESS_DIR / run_id
+
+
+def _state_save_path(run_id: str) -> Path:
+    """Path to the per-run state.json file."""
+    return _state_save_dir(run_id) / RESUME_STATE_FILENAME
+
+
+def _serialize_state_for_resume(state, *, original_task: str) -> dict:
+    """Build a JSON-serializable snapshot of everything needed to resume.
+
+    Captures: outer-graph state subset (task, plan, iteration_count, last_successful_eval,
+    iteration_files_touched), module-level state (cost_tracker, iteration_history,
+    git_checkpoint_state.branch + last_commit), and the model identifiers in use so a
+    resume picks up with the SAME models the original run used (not whatever the env vars
+    happen to be set to at resume time — which would silently drift the experiment).
+
+    State's `messages`-shaped fields and any LangChain object references are omitted — the
+    builder/evaluator state machines reset per iteration, so resume restarts clean from
+    the next iteration boundary. The git branch holds the file-system state.
+    """
+    branch = (_git_checkpoint_state or {}).get("branch") or ""
+    run_id = _current_run_id() or ""
+    last_commit = (_git_checkpoint_state or {}).get("last_commit") or {}
+    iteration_count = (state or {}).get("iteration", 0)
+
+    return {
+        "schema_version": RESUME_STATE_SCHEMA_VERSION,
+        "run_id": run_id,
+        "branch_name": branch,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        # Original task as given on the run start. Preserved across resumes so the planner
+        # always sees the "why" rather than the resume-time CLI input (which is just
+        # `--resume <id>`).
+        "original_task": original_task or (state or {}).get("task") or "",
+        # Future hook for tasks the user extends mid-run; currently always empty list.
+        "task_history": [],
+        # Plan doc — full JSON, includes requirements/architecture/tasks/pending_proposals.
+        "plan": (state or {}).get("plan") or {},
+        "iteration_count": iteration_count,
+        # Cached eval verdict for skip-eval logic — preserve so resumed iterations still
+        # benefit from the skip path on non-UI iterations.
+        "last_successful_eval": (state or {}).get("last_successful_eval") or {},
+        # Files touched in the iteration that just ended (or in-progress at crash time).
+        "iteration_files_touched": list((state or {}).get("iteration_files_touched") or []),
+        # Cost: per-model breakdown + cumulative USD. Resume restores so the running total
+        # in subsequent iterations / the RUN_SUMMARY's cost line stays continuous.
+        "cost_tracking": {
+            "by_model": {k: dict(v) for k, v in _cost_tracker.get("by_model", {}).items()},
+            "total_usd": _cost_tracker.get("total_usd", 0.0),
+            "started_at": _cost_tracker.get("started_at"),
+        },
+        # Model identifiers in use. On resume we refuse to silently swap models (a different
+        # builder mid-run would invalidate the iteration history). Currently informational —
+        # the comparison + warning lives in _validate_resume.
+        "model_identifiers": {
+            "planner": getattr(planner_llm, "model", None),
+            "builder": getattr(builder_llm, "model_name", None) or getattr(builder_llm, "model", None),
+            "evaluator": getattr(evaluator_llm, "model_name", None) or getattr(evaluator_llm, "model", None),
+            "advisor": ADVISOR_MODEL,
+        },
+        # The full iteration_history list rendered into RUN_SUMMARY's history section so
+        # resumed runs continue the history rather than starting a fresh one.
+        "iteration_history": list(_iteration_history),
+        # Last successful checkpoint timestamp for budget-no-progress checks (the budget
+        # circuit breaker isn't implemented yet but persisting the field now means resume
+        # is forward-compatible when it lands).
+        "last_successful_checkpoint_at": last_commit.get("ts") or "",
+        "last_successful_checkpoint_hash": last_commit.get("hash") or "",
+        "last_successful_checkpoint_iter": last_commit.get("iter"),
+        # Counter for the (not-yet-implemented) budget circuit breaker. Default 0 keeps
+        # resume forward-compatible.
+        "consecutive_failures": 0,
+        # Open advisor concerns — the user spec asked for these to be in state.json. We
+        # extract from the most recent non-ok iteration in iteration_history.
+        "last_advisor_concerns": _gather_open_concerns(state),
+        # replan_count is part of outer State; carry through so revise_plan caps still apply.
+        "replan_count": (state or {}).get("replan_count", 0),
+        "planner_path": (state or {}).get("planner_path", ""),
+    }
+
+
+def _save_run_state(state, *, original_task: str) -> None:
+    """Write per-iteration state.json. Idempotent. Fail-soft (logs but doesn't propagate)."""
+    if not RESUME_ENABLED:
+        return
+    run_id = _current_run_id()
+    if not run_id:
+        return  # checkpointing disabled / branch not yet established
+    try:
+        save_dir = _state_save_dir(run_id)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        payload = _serialize_state_for_resume(state, original_task=original_task)
+        path = _state_save_path(run_id)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, default=str))
+        tmp.replace(path)
+        TRACE.log("state_saved", run_id=run_id, path=str(path),
+                  iteration=payload["iteration_count"],
+                  schema_version=RESUME_STATE_SCHEMA_VERSION)
+    except Exception as e:
+        TRACE.log("state_save_failed", error=str(e)[:300])
+
+
+def _load_run_state(run_id: str) -> dict | None:
+    """Load state.json for a run_id. Returns the parsed dict, or None on missing/corrupt.
+    Validation (schema_version, branch existence) is the caller's job."""
+    path = _state_save_path(run_id)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except Exception as e:
+        TRACE.log("run_resumed_failed", reason="state_unparseable",
+                  run_id=run_id, error=str(e)[:300])
+        return None
+
+
+def _list_available_run_ids() -> list[str]:
+    """Discover run_ids by scanning HARNESS_DIR for subdirs containing state.json. Sorted
+    by mtime descending (most recent first) so the error message in resume-not-found
+    surfaces the latest first."""
+    if not HARNESS_DIR.exists():
+        return []
+    candidates = []
+    for child in HARNESS_DIR.iterdir():
+        if not child.is_dir():
+            continue
+        sf = child / RESUME_STATE_FILENAME
+        if sf.exists():
+            candidates.append((sf.stat().st_mtime, child.name))
+    candidates.sort(key=lambda x: -x[0])
+    return [name for _, name in candidates]
+
+
+def _detect_in_progress_runs() -> list[dict]:
+    """For each run_id with a state.json, build a one-line summary for the no-flag startup
+    detection. Filters out runs whose state shows verdict=done in the most recent iteration
+    (treated as completed) — only show genuinely in-progress runs."""
+    out: list[dict] = []
+    for run_id in _list_available_run_ids():
+        state = _load_run_state(run_id)
+        if not state:
+            continue
+        # Skip runs whose final iteration was 'done' — those completed cleanly.
+        history = state.get("iteration_history") or []
+        last_status = (history[-1] if history else {}).get("status") or ""
+        last_verdict = (history[-1] if history else {}).get("verdict") or ""
+        if last_status == "ok" and last_verdict == "done":
+            continue
+        out.append({
+            "run_id": run_id,
+            "task": (state.get("original_task") or "")[:120],
+            "iterations": state.get("iteration_count", 0),
+            "cost_usd": (state.get("cost_tracking") or {}).get("total_usd", 0.0),
+            "saved_at": state.get("saved_at", ""),
+            "branch_name": state.get("branch_name", ""),
+        })
+    return out
+
+
+def _validate_resume(state: dict, run_id: str) -> tuple[bool, str]:
+    """Pre-flight checks before loading. Returns (ok, error_message)."""
+    if not state:
+        return False, f"State for run {run_id!r} not found or unparseable."
+    sv = state.get("schema_version")
+    if sv != RESUME_STATE_SCHEMA_VERSION:
+        return False, (
+            f"State schema version {sv!r} does not match current "
+            f"version {RESUME_STATE_SCHEMA_VERSION}. Cannot resume — start a new run "
+            f"with the same task to retry."
+        )
+    branch = state.get("branch_name") or ""
+    if not branch:
+        return False, f"State has no branch_name; cannot reset workspace to last checkpoint."
+    # Does the branch still exist?
+    rv = _git(["rev-parse", "--verify", branch], cwd=WORKSPACE)
+    if rv.returncode != 0:
+        return False, (
+            f"Branch {branch!r} not found in {WORKSPACE}. Resume requires the original "
+            f"run's harness branch — was the workspace reset, or was the repo deleted?"
+        )
+    return True, ""
+
+
+def _reset_workspace_to_branch(branch: str) -> tuple[bool, str]:
+    """Check out the resumed branch and hard-reset the workspace to its tip. Returns
+    (ok, message). On failure the harness should refuse to resume rather than leave the
+    user in a confusing half-checked-out state."""
+    co = _git(["checkout", branch], cwd=WORKSPACE)
+    if co.returncode != 0:
+        return False, f"git checkout {branch} failed: {co.stderr.strip()}"
+    rs = _git(["reset", "--hard", branch], cwd=WORKSPACE)
+    if rs.returncode != 0:
+        return False, f"git reset --hard {branch} failed: {rs.stderr.strip()}"
+    return True, ""
+
+
+def _restore_module_state_from_resume(state: dict) -> None:
+    """Populate module-level globals (cost tracker, iteration history, git_checkpoint_state)
+    from a loaded state dict so subsequent iterations continue the running totals + history.
+    Called once at resume time before the outer graph starts."""
+    # Cost tracker
+    ct = state.get("cost_tracking") or {}
+    _cost_tracker["by_model"] = {k: dict(v) for k, v in (ct.get("by_model") or {}).items()}
+    _cost_tracker["total_usd"] = ct.get("total_usd", 0.0)
+    _cost_tracker["started_at"] = ct.get("started_at")
+    # Iteration history
+    _iteration_history.clear()
+    _iteration_history.extend(state.get("iteration_history") or [])
+    # Git checkpoint state — branch + last_commit. The branch was already validated;
+    # init_commit isn't preserved across resumes (it's the original run-start commit).
+    _git_checkpoint_state["branch"] = state.get("branch_name") or _git_checkpoint_state.get("branch")
+    _git_checkpoint_state["enabled"] = bool(_git_checkpoint_state["branch"])
+    _git_checkpoint_state["workspace"] = _git_checkpoint_state.get("workspace") or str(WORKSPACE)
+    if state.get("last_successful_checkpoint_hash"):
+        _git_checkpoint_state["last_commit"] = {
+            "iter": state.get("last_successful_checkpoint_iter"),
+            "hash": state.get("last_successful_checkpoint_hash"),
+        }
+    # Commit count is informational; reset to len(iteration_history) so the end-of-run
+    # summary doesn't report a misleading 0.
+    _git_checkpoint_state["commit_count"] = len(state.get("iteration_history") or [])
 
 
 # ────────────────────────── helpers ──────────────────────────
@@ -4929,13 +5209,30 @@ def _check_service_alias_or_warn() -> None:
         )
 
 
+def _parse_resume_arg() -> str | None:
+    """Inline parser for --resume <run-id>. Removes both tokens from sys.argv. Returns
+    the run_id string when present, else None. Errors out (sys.exit) on `--resume` with
+    no following value."""
+    if "--resume" not in sys.argv:
+        return None
+    idx = sys.argv.index("--resume")
+    if idx + 1 >= len(sys.argv):
+        print("ERROR: --resume requires a run-id (e.g., 20260505T091530Z).", file=sys.stderr)
+        sys.exit(2)
+    run_id = sys.argv[idx + 1]
+    del sys.argv[idx:idx + 2]
+    return run_id
+
+
 async def main():
-    # Parse --no-checkpoint inline; argparse would be overkill for one bool flag. The env
-    # var HARNESS_GIT_CHECKPOINTS=0 takes precedence (see top-of-file constant).
+    # Inline arg parsing — argparse would be overkill for two bool/string flags. Env vars
+    # HARNESS_GIT_CHECKPOINTS=0 / RESUME_ENABLED=0 take precedence over the matching CLI
+    # flags (see top-of-file constants).
     global ENABLE_GIT_CHECKPOINTS
     if "--no-checkpoint" in sys.argv:
         ENABLE_GIT_CHECKPOINTS = False
         sys.argv.remove("--no-checkpoint")
+    resume_run_id = _parse_resume_arg()
 
     _check_service_alias_or_warn()
     print(f"Planner:   {planner_llm.model}  (Anthropic)")
@@ -4947,10 +5244,74 @@ async def main():
     print("Ctrl-D to exit.\n")
 
     TRACE_DIR.mkdir(parents=True, exist_ok=True)
-    # Set up the per-run git branch BEFORE any model work so we can checkpoint after every
-    # iteration. Failure-soft: on any error (no git, no perms, etc.) the harness keeps
-    # running uncheckpointed — see _init_workspace_git_repo().
-    _init_workspace_git_repo()
+
+    # Resume vs fresh-run path divergence. Resume validates state.json + branch existence
+    # BEFORE the standard _init_workspace_git_repo() (which would create a new branch).
+    # On valid resume we skip _init_workspace_git_repo, restore module state from the
+    # persisted file, hard-reset the workspace to the resume branch's tip, and seed the
+    # outer graph's initial state from the loaded values.
+    resume_state: dict | None = None
+    if resume_run_id is not None:
+        if not RESUME_ENABLED:
+            print("ERROR: --resume passed but RESUME_ENABLED=0. Unset the env var or remove the flag.",
+                  file=sys.stderr)
+            sys.exit(2)
+        candidate = _load_run_state(resume_run_id)
+        ok, err = _validate_resume(candidate or {}, resume_run_id)
+        if not ok:
+            avail = _list_available_run_ids()
+            print(f"\nERROR: cannot resume run {resume_run_id!r}: {err}", file=sys.stderr)
+            if avail:
+                print(f"\nAvailable runs:", file=sys.stderr)
+                for r in avail:
+                    print(f"  - {r}", file=sys.stderr)
+            else:
+                print(f"\nNo runs found in {HARNESS_DIR}.", file=sys.stderr)
+            TRACE.log("run_resumed_failed", run_id=resume_run_id, reason=err)
+            sys.exit(2)
+        # Hard-reset workspace to the run's branch tip.
+        ok, err = _reset_workspace_to_branch(candidate["branch_name"])
+        if not ok:
+            print(f"\nERROR: workspace reset failed: {err}", file=sys.stderr)
+            TRACE.log("run_resumed_failed", run_id=resume_run_id, reason=err)
+            sys.exit(2)
+        _restore_module_state_from_resume(candidate)
+        # Resume preserves the original task — the holder is read by _save_run_state on
+        # subsequent iterations to keep the original_task field stable across resumes.
+        _run_started_holder["original_task"] = candidate.get("original_task") or ""
+        resume_state = candidate
+        TRACE.log("run_resumed",
+                  run_id=resume_run_id,
+                  branch_name=candidate["branch_name"],
+                  iterations_loaded=candidate.get("iteration_count", 0),
+                  cost_usd_loaded=(candidate.get("cost_tracking") or {}).get("total_usd", 0.0))
+        print()
+        truncated_task = (candidate.get("original_task") or "")[:200]
+        print(f"━━━ Resuming run {resume_run_id} ━━━")
+        print(f"Original task: {truncated_task}")
+        print(f"Iterations completed: {candidate.get('iteration_count', 0)}")
+        last_h = candidate.get("last_successful_checkpoint_hash") or "(none)"
+        print(f"Last successful checkpoint: {last_h}")
+        cost_total = (candidate.get("cost_tracking") or {}).get("total_usd", 0.0)
+        cost_eur = cost_total * COST_USD_TO_EUR
+        print(f"Cost so far: €{cost_eur:.4f}")
+        print(f"Branch: {candidate['branch_name']}")
+        print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+    else:
+        # Fresh-run path. Init the workspace git repo + per-run branch as usual.
+        _init_workspace_git_repo()
+        # Heads-up about in-progress runs the user might mean to resume. Doesn't
+        # auto-resume — the user picks deliberately by re-running with --resume.
+        if RESUME_ENABLED:
+            in_progress = _detect_in_progress_runs()
+            if in_progress:
+                print("\nDetected in-progress runs (not yet finished with verdict=done):")
+                for r in in_progress[:10]:
+                    cost_eur = (r["cost_usd"] or 0) * COST_USD_TO_EUR
+                    print(f"  - {r['run_id']}: {r['task'][:80]!r}, {r['iterations']} iter(s), "
+                          f"€{cost_eur:.4f}, saved {r['saved_at']}")
+                print("\nResume one with: ./run.sh --resume <run-id>")
+                print("Or start fresh by entering a new task below.\n")
     # AsyncExitStack lets us register the MCP-session cleanup as a callback alongside the
     # saver context manager, so both run on exit (normal or exception) without nesting more
     # try/finally blocks. The MCP session is opened later (lazily, when the evaluator first
@@ -4970,10 +5331,33 @@ async def main():
         resume = await _maybe_resume(saver)
 
         while True:
-            if resume is not None:
+            initial_state: dict
+            if resume_state is not None:
+                # The new --resume path. Seed the outer graph from the loaded state.json
+                # (NOT the legacy AsyncSqliteSaver checkpointer resume which works at the
+                # builder-step level inside ONE iteration). The next iteration starts at
+                # iteration_count + 1 and the planner sees the existing plan.
+                user_input = resume_state.get("original_task") or ""
+                trace_path = TRACE.start_task(f"[resumed] {user_input}")
+                thread_id = trace_path.stem
+                print(f"Trace: {trace_path}\n")
+                _run_started_holder["original_task"] = user_input
+                initial_state = {
+                    "task": user_input,
+                    "iteration": resume_state.get("iteration_count", 0),
+                    "plan": resume_state.get("plan") or _empty_plan_doc(),
+                    "replan_count": resume_state.get("replan_count", 0),
+                    "planner_path": "",
+                    "last_successful_eval": resume_state.get("last_successful_eval") or {},
+                    "iteration_files_touched": resume_state.get("iteration_files_touched") or [],
+                }
+                resume_state = None  # only seed once
+            elif resume is not None:
+                # Legacy AsyncSqliteSaver checkpointer-resume path (from _maybe_resume).
+                # Works at the inner-builder step level — resumes mid-iteration. The new
+                # --resume <run-id> path above is at the outer-iteration level, with a git
+                # workspace reset. Both can coexist.
                 user_input = resume["task_text"]
-                # Re-attach the existing trace file as the active one (append, don't overwrite).
-                # The thread_id matches the trace stem, so we reconstruct the path.
                 trace_path = TRACE_DIR / f"{resume['thread_id']}.jsonl"
                 TRACE.path = trace_path
                 TRACE.fh = open(trace_path, "a")
@@ -4981,7 +5365,10 @@ async def main():
                 print(f"\n  Resuming: {user_input!r}")
                 print(f"  Trace (appending): {trace_path}\n")
                 thread_id = resume["thread_id"]
-                resume = None  # only resume once per startup
+                _run_started_holder["original_task"] = user_input
+                initial_state = {"task": user_input, "iteration": 0, "plan": _empty_plan_doc(),
+                                 "replan_count": 0, "planner_path": ""}
+                resume = None
             else:
                 try:
                     user_input = input("Task: ")
@@ -4991,10 +5378,11 @@ async def main():
                 if not user_input.strip():
                     continue
                 trace_path = TRACE.start_task(user_input)
-                # Thread ID = trace file basename (no .jsonl). Already timestamped → unique per
-                # task launch. Same task text → fresh thread by default; resume is opt-in only.
                 thread_id = trace_path.stem
                 print(f"Trace: {trace_path}\n")
+                _run_started_holder["original_task"] = user_input
+                initial_state = {"task": user_input, "iteration": 0, "plan": _empty_plan_doc(),
+                                 "replan_count": 0, "planner_path": ""}
 
             config = {
                 "recursion_limit": 200,
@@ -5002,11 +5390,7 @@ async def main():
                 "metadata": {"schema_version": CHECKPOINT_SCHEMA_VERSION},
             }
             try:
-                final = await outer_graph.ainvoke(
-                    {"task": user_input, "iteration": 0, "plan": _empty_plan_doc(),
-                     "replan_count": 0, "planner_path": ""},
-                    config=config,
-                )
+                final = await outer_graph.ainvoke(initial_state, config=config)
                 TRACE.end_task(reason="completed", final_iter=final.get("iteration"),
                                final_verdict=final.get("eval_verdict"),
                                builder_exit=final.get("builder_exit_signal"))
