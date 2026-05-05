@@ -200,43 +200,14 @@ EVAL_MAX_TOKENS = os.environ.get("HARNESS_EVAL_MAX_TOKENS", "4000").strip()
 _eval_re_raw = os.environ.get("HARNESS_EVAL_REASONING_EFFORT", "medium").strip().lower()
 EVAL_REASONING_EFFORT = _eval_re_raw if _eval_re_raw in ("minimal", "low", "medium", "high") else "medium"
 
-# Models known to accept the OpenRouter `reasoning` parameter alongside tool_calls
-# and provider.require_parameters=true. Substring-matched against the slug
-# (lowercased). Conservative list — has been narrowed twice after live failures.
-#
-# Setting `reasoning` on a model whose OpenRouter providers don't accept it causes:
-#   404 - {'error': {'message': 'No endpoints found that can handle the requested
-#   parameters', 'code': 404}}
-# because `provider.require_parameters: true` (which we always set so tool_calls
-# route to capable providers) blocks silent-drop routing.
-#
-# Confirmed-failing patterns — DO NOT re-add without re-testing:
-#   - "kimi-k2"           — matches K2.6 (chat/multimodal) which 404s. Only the
-#                           explicit `kimi-k2-thinking` variant is confirmed.
-#   - "deepseek-v3.2"     — 404s. Use deepseek-r1 / r1-0528 for reasoning.
-REASONING_CAPABLE_SLUG_PATTERNS = (
-    "kimi-k2-thinking",     # Moonshot's explicit reasoning variant
-    "deepseek-r1",           # DeepSeek R1 family — matches r1, r1-0528, etc.
-    "/o1", "/o3", "/o4-mini",  # OpenAI o-series (anchored on `/` to avoid matching e.g. "...01")
-)
-
-# Master off-switch. Set HARNESS_EVAL_REASONING_OFF=1 to skip the `reasoning`
-# parameter entirely on every eval call regardless of slug — useful when:
-#   - testing a new model where you're not sure if reasoning works
-#   - debugging unrelated 404s and want to rule out the reasoning path
-#   - cost-tuning (reasoning tokens are billed)
+# Master off-switch for the OpenRouter `reasoning` parameter on eval calls. Set
+# HARNESS_EVAL_REASONING_OFF=1 to skip the parameter entirely — useful for cost
+# tuning, A/B testing reasoning vs no-reasoning, or debugging unrelated 404s.
+# Default: reasoning is always sent on eval calls (per the OpenRouter spec for
+# the universal `reasoning` parameter — silently dropped on providers that
+# don't support it, *as long as we don't set provider.require_parameters=true,
+# which we don't on eval calls; see _openrouter_llm).
 EVAL_REASONING_OFF = os.environ.get("HARNESS_EVAL_REASONING_OFF", "0").strip().lower() in ("1", "true", "yes")
-
-
-def _slug_supports_reasoning(slug: str) -> bool:
-    """True if `slug` matches a known reasoning-capable model pattern. Used to gate
-    the OpenRouter `reasoning` parameter — non-reasoning models 404 if the param
-    is set together with provider.require_parameters=true.
-    """
-    if not slug or EVAL_REASONING_OFF:
-        return False
-    s = slug.lower()
-    return any(p in s for p in REASONING_CAPABLE_SLUG_PATTERNS)
 # Anthropic extended thinking budget (tokens). Off by default — Anthropic's thinking
 # parameter has constraints around temperature (recommendation: temperature=1.0 with
 # thinking) and we don't want to surprise existing runs with cost or behavior changes.
@@ -3625,7 +3596,18 @@ def _openrouter_llm(model: str, *, for_eval: bool = False) -> ChatOpenAI:
     extra: dict = {}
     extra_body: dict = {}
     if "openrouter" in base:
-        provider_cfg: dict = {"require_parameters": True, "allow_fallbacks": True}
+        # provider.require_parameters: true filters routing to providers that have
+        # formally declared support for EVERY parameter in the request. We use it
+        # for the builder so tool_call routing lands on a provider that actually
+        # exposes tool-call format correctly. We do NOT set it on eval calls —
+        # the eval payload includes `reasoning`, and many providers that accept
+        # the param at runtime haven't declared support in OpenRouter's metadata,
+        # causing 404 "No endpoints found that can handle the requested
+        # parameters." Per the OpenRouter universal-reasoning spec, with
+        # require_parameters off, unsupported `reasoning` is silently dropped.
+        provider_cfg: dict = {"allow_fallbacks": True}
+        if not for_eval:
+            provider_cfg["require_parameters"] = True
         pinned = os.environ.get("OPENROUTER_PROVIDERS", "").strip()
         if pinned:
             provider_cfg["order"] = [p.strip() for p in pinned.split(",") if p.strip()]
@@ -3634,15 +3616,10 @@ def _openrouter_llm(model: str, *, for_eval: bool = False) -> ChatOpenAI:
         if ignored:
             provider_cfg["ignore"] = [p.strip() for p in ignored.split(",") if p.strip()]
         extra_body["provider"] = provider_cfg
-        # OpenRouter Universal Reasoning. Gated on _slug_supports_reasoning(model)
-        # because OpenRouter does NOT silently ignore `reasoning` when
-        # `provider.require_parameters: true` is set (which we always set above) —
-        # instead it returns 404 "No endpoints found that can handle the requested
-        # parameters" if no provider for the model accepts `reasoning`. Observed
-        # live on deepseek/deepseek-v3.2 (chat). Allow-list approach: pass only on
-        # models confirmed reasoning-capable (Kimi K2.x, DeepSeek R1, GPT-OSS,
-        # OpenAI o-series, DeepSeek-v3.2-speciale).
-        if for_eval and _slug_supports_reasoning(model):
+        # OpenRouter Universal Reasoning. Sent unconditionally on eval calls (the
+        # spec defines this as a universal param that providers either honor or
+        # silently drop). Gated only by HARNESS_EVAL_REASONING_OFF=1 master switch.
+        if for_eval and not EVAL_REASONING_OFF:
             extra_body["reasoning"] = {"effort": EVAL_REASONING_EFFORT}
     if extra_body:
         extra["extra_body"] = extra_body
