@@ -296,8 +296,25 @@ RUN_SUMMARY_TASK_SUMMARY_CHARS = 80    # per-iteration title/summary length
 # to start fresh. Bump RESUME_STATE_SCHEMA_VERSION whenever the persisted state shape
 # changes in a non-backward-compatible way.
 RESUME_ENABLED = os.environ.get("RESUME_ENABLED", "1").lower() not in ("0", "false", "no", "")
-RESUME_STATE_SCHEMA_VERSION = 1
+RESUME_STATE_SCHEMA_VERSION = 2  # bumped from 1: state.json gained test-gate fields
 RESUME_STATE_FILENAME = "state.json"
+
+# Test gate. Runs HARNESS_TEST_COMMAND between a successful evaluator verdict and the
+# git checkpoint. Iterations that regress tests don't commit — the builder is sent back
+# with a regression notice on its next iteration. After TEST_GATE_MAX_STREAK consecutive
+# failures the run terminates (circuit breaker). Empty HARNESS_TEST_COMMAND disables
+# the feature entirely so existing runs on projects without test suites work unchanged.
+TEST_COMMAND = os.environ.get("HARNESS_TEST_COMMAND", "").strip()
+TEST_TIMEOUT_SECONDS = int(os.environ.get("HARNESS_TEST_TIMEOUT_SECONDS", "120"))
+TEST_GATE_REQUIRED_FOR_CHECKPOINT = os.environ.get("HARNESS_TEST_GATE_REQUIRED", "1") != "0"
+TEST_GATE_MAX_STREAK = int(os.environ.get("HARNESS_TEST_GATE_MAX_STREAK", "3"))
+TEST_OUTPUT_TAIL_LINES = int(os.environ.get("HARNESS_TEST_OUTPUT_TAIL_LINES", "50"))
+# Where to run the test command. Defaults to /workspace; override if your test command
+# expects a different cwd (e.g., a project subdirectory). Either way, the command itself
+# can include `cd <subdir> && ...` if it needs a different working dir than the configured
+# default.
+TEST_CWD = os.environ.get("HARNESS_TEST_CWD", str(WORKSPACE)).strip() or str(WORKSPACE)
+TEST_GATE_ENABLED = bool(TEST_COMMAND)
 # A "fresh" candidate for in-progress detection — older state.json files are surfaced
 # but with a stale-warning. The threshold is just for the printed list; resume itself
 # accepts any age (subject to schema_version match).
@@ -761,7 +778,8 @@ def _record_iteration_history(*, iteration: int, status: str, verdict: str,
                               builder_summary: str = "",
                               exit_signal: str | None = None,
                               exit_payload: dict | None = None,
-                              plan_doc: dict | None = None) -> None:
+                              plan_doc: dict | None = None,
+                              test_gate_info: dict | None = None) -> None:
     """Append one entry to _iteration_history with a one-line summary line.
 
     Summary precedence: for early-exit status, generate from exit_signal + payload +
@@ -804,6 +822,8 @@ def _record_iteration_history(*, iteration: int, status: str, verdict: str,
         # a missing list to surface.
         "exit_signal": exit_signal or "",
         "exit_payload_detail": _shorten_exit_payload(exit_signal, exit_payload),
+        # Test-gate annotation for the iteration-history line. None when gate didn't run.
+        "test_gate": dict(test_gate_info) if test_gate_info else None,
     })
 
 
@@ -956,9 +976,24 @@ def _update_run_summary(state) -> None:
                 if v.startswith("builder_exit:"):
                     v = v[len("builder_exit:"):]
                 file_word = "file" if entry["touched_count"] == 1 else "files"
+                # Test-gate annotation when the gate ran for this iteration.
+                tg = entry.get("test_gate") or None
+                tg_part = ""
+                if tg:
+                    if tg["status"] == "passed":
+                        tg_part = f"; tests: passed in {tg['duration_seconds']}s"
+                    elif tg.get("circuit_breaker"):
+                        tg_part = (f"; tests: {tg['status']}; circuit breaker fired "
+                                   f"(streak {tg['streak']}/{TEST_GATE_MAX_STREAK})")
+                    elif tg.get("checkpointed"):
+                        tg_part = (f"; tests: {tg['status']}; checkpointed anyway "
+                                   f"(streak {tg['streak']}/{TEST_GATE_MAX_STREAK})")
+                    else:
+                        tg_part = (f"; tests: {tg['status']}; not committed "
+                                   f"(streak {tg['streak']}/{TEST_GATE_MAX_STREAK})")
                 history_lines.append(
                     f"- Iter {entry['iter']}: {entry['summary']} "
-                    f"({v}, {entry['touched_count']} {file_word}){hash_str} {marker}"
+                    f"({v}, {entry['touched_count']} {file_word}{tg_part}){hash_str} {marker}"
                 )
 
         concerns = _gather_open_concerns(state)
@@ -991,18 +1026,69 @@ def _update_run_summary(state) -> None:
         else:
             resume_block = ""
 
+        # Test gate section — only when the gate is configured. Includes the disabled-
+        # baseline notice when applicable.
+        if TEST_GATE_ENABLED:
+            tg = _test_gate_state
+            required_str = "Yes" if TEST_GATE_REQUIRED_FOR_CHECKPOINT else "No (warnings only)"
+            last_status = tg.get("last_status") or "(not run yet)"
+            last_dur = tg.get("last_duration_seconds")
+            last_dur_s = f"{last_dur}s" if last_dur is not None else "—"
+            test_gate_block = (
+                f"## Test gate\n"
+                f"- Command: `{TEST_COMMAND}`\n"
+                f"- CWD: `{TEST_CWD}`\n"
+                f"- Timeout: {TEST_TIMEOUT_SECONDS}s\n"
+                f"- Required for checkpoint: {required_str}\n"
+                f"- Failure streak: {tg.get('failure_streak', 0)}/{TEST_GATE_MAX_STREAK}\n"
+                f"- Last result: {last_status}\n"
+                f"- Last duration: {last_dur_s}\n"
+            )
+            if tg.get("disabled_baseline"):
+                test_gate_block += (
+                    f"\n**Disabled for this run:** tests were already failing at start.\n\n"
+                    f"Last test output (tail):\n```\n{tg.get('last_output_tail', '')[:1500]}\n```\n"
+                )
+            test_gate_block += "\n"
+        else:
+            test_gate_block = ""
+
+        # Termination section — fires when the test-gate circuit breaker tripped on the
+        # latest iteration. Surfaces the bypass commands the spec requires.
+        last_entry = _iteration_history[-1] if _iteration_history else None
+        termination_block = ""
+        if last_entry and (last_entry.get("test_gate") or {}).get("circuit_breaker"):
+            tgc = last_entry["test_gate"]
+            last_h = last_commit.get("hash") or "(none)"
+            run_id_for_resume = run_id or "<run-id>"
+            termination_block = (
+                f"## Termination\n"
+                f"Run terminated by test gate.\n\n"
+                f"- Reason: tests failing for {tgc['streak']} consecutive iteration(s) "
+                f"(cap={TEST_GATE_MAX_STREAK})\n"
+                f"- Test command: `{TEST_COMMAND}`\n"
+                f"- Last successful checkpoint: iter {last_commit.get('iter','?')}, "
+                f"commit {last_h}\n\n"
+                f"To bypass tests for the resumed run:\n\n"
+                f"    HARNESS_TEST_GATE_REQUIRED=0 ./run.sh --resume {run_id_for_resume}\n\n"
+                f"To increase tolerance:\n\n"
+                f"    HARNESS_TEST_GATE_MAX_STREAK=<higher> ./run.sh --resume {run_id_for_resume}\n\n"
+            )
+
         md = (
             f"# Run summary: {truncated_task}\n\n"
             f"Started: {started}\n"
             f"Last updated: {now}\n"
             f"Run branch: {branch}\n\n"
             + resume_block
+            + termination_block
             + f"## Status\n"
             f"- Plan tasks: {done_n} done / {total_n} total\n"
             f"- Iterations: {iterations_n}\n"
             f"- Last successful checkpoint: {last_ckpt_line}\n"
             f"- Estimated cost so far: {cost_line}\n\n"
-            f"## Iteration history\n"
+            + test_gate_block
+            + f"## Iteration history\n"
             + "\n".join(history_lines) + "\n\n"
             f"## Open concerns\n"
             f"{concerns_block}\n\n"
@@ -1023,12 +1109,18 @@ def _update_run_summary(state) -> None:
 
 def _finalize_iteration_summary(*, state, verdict: str, builder_summary: str = "",
                                 exit_signal: str | None = None,
-                                exit_payload: dict | None = None) -> None:
+                                exit_payload: dict | None = None,
+                                test_gate_info: dict | None = None) -> None:
     """Record the iteration in history + rewrite RUN_SUMMARY.md + persist state.json.
     Idempotent. Called from every return path in evaluator_node and from builder_node
     early-exit returns. The iteration history's status is derived from the verdict via
     _VERDICT_TO_STATUS; for builder-side early exits (e.g., 'builder_exit:give_up') the
-    status is 'early-exit'."""
+    status is 'early-exit'.
+
+    test_gate_info: optional dict {status, duration_seconds, streak, checkpointed,
+    error?, circuit_breaker?} for the iteration history's test-gate annotation. None
+    when the gate didn't run for this iteration (early-exit, replan, gate disabled, etc.).
+    """
     if verdict.startswith("builder_exit:"):
         status = "early-exit"
     else:
@@ -1044,6 +1136,7 @@ def _finalize_iteration_summary(*, state, verdict: str, builder_summary: str = "
         exit_signal=exit_signal,
         exit_payload=exit_payload,
         plan_doc=(state or {}).get("plan") or {},
+        test_gate_info=test_gate_info,
     )
     _update_run_summary(state)
     # Persist a per-run state.json so a Ctrl-C / OOM / container-restart can be resumed
@@ -1057,6 +1150,66 @@ def _finalize_iteration_summary(*, state, verdict: str, builder_summary: str = "
 # Captures the run's originating task. Populated once in main() at task start; used by
 # _save_run_state so the persisted original_task survives across iterations + resumes.
 _run_started_holder: dict = {"original_task": ""}
+
+
+# Test-gate runtime state. Populated by the baseline check and the per-iteration gate run.
+# Persisted in state.json (resume schema v2) and restored on resume. Cleared at process
+# start; resume seeds it from the loaded state.
+_test_gate_state: dict = {
+    "disabled_baseline": False,    # True if baseline failed → gates suppressed for this run
+    "failure_streak": 0,           # consecutive failures since last pass
+    "last_status": None,           # "passed" | "failed" | "timeout" | "skipped" | None
+    "last_duration_seconds": None, # float; for the Test gate section
+    "last_output_tail": "",        # for surfacing in builder context on next iteration
+}
+
+
+def _run_test_gate(workspace_path: str = TEST_CWD) -> tuple[str, str | None, str]:
+    """Run the configured test command under a timeout. Returns (status, error, output).
+
+    status one of:
+      - "skipped" — TEST_GATE_ENABLED is False (no command configured)
+      - "passed" — exit 0
+      - "failed" — non-zero exit
+      - "timeout" — exceeded TEST_TIMEOUT_SECONDS
+
+    output is a TEST_OUTPUT_TAIL_LINES tail of stdout+stderr combined; empty string when
+    the run produced nothing. Smart truncation: if total output ≤ tail, returns all of it.
+    """
+    if not TEST_GATE_ENABLED:
+        return "skipped", "no test command configured", ""
+    try:
+        proc = subprocess.run(
+            TEST_COMMAND,
+            shell=True,
+            cwd=workspace_path,
+            capture_output=True,
+            text=True,
+            timeout=TEST_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as e:
+        partial = ((e.stdout or "") + (e.stderr or ""))
+        return ("timeout", f"test command exceeded {TEST_TIMEOUT_SECONDS}s",
+                _tail_lines(partial, TEST_OUTPUT_TAIL_LINES))
+    except Exception as e:
+        return "failed", f"{type(e).__name__}: {str(e)[:200]}", ""
+
+    output = (proc.stdout or "") + (proc.stderr or "")
+    tail = _tail_lines(output, TEST_OUTPUT_TAIL_LINES)
+    if proc.returncode == 0:
+        return "passed", None, tail
+    return "failed", f"exit code {proc.returncode}", tail
+
+
+def _tail_lines(s: str, n: int) -> str:
+    """Return the last n lines of s. Cheap; no truncation marker because the gate output
+    is intended for human + model consumption, not byte-exact diff."""
+    if not s:
+        return ""
+    lines = s.splitlines()
+    if len(lines) <= n:
+        return s
+    return "\n".join(lines[-n:])
 
 
 def _read_run_summary_for_builder() -> str:
@@ -1165,6 +1318,15 @@ def _serialize_state_for_resume(state, *, original_task: str) -> dict:
         # replan_count is part of outer State; carry through so revise_plan caps still apply.
         "replan_count": (state or {}).get("replan_count", 0),
         "planner_path": (state or {}).get("planner_path", ""),
+        # Schema v2: test-gate state. Persisting the streak + disabled_baseline means
+        # resuming a run with a tripped circuit breaker doesn't reset the counter; the
+        # operator overrides via HARNESS_TEST_GATE_MAX_STREAK / HARNESS_TEST_GATE_REQUIRED=0
+        # on the resume command. disabled_baseline preserved so we don't re-test a known-
+        # broken baseline on every resume.
+        "test_gate_failure_streak": _test_gate_state.get("failure_streak", 0),
+        "test_gate_disabled_baseline": _test_gate_state.get("disabled_baseline", False),
+        "last_test_gate_status": _test_gate_state.get("last_status"),
+        "last_test_gate_duration_seconds": _test_gate_state.get("last_duration_seconds"),
     }
 
 
@@ -1247,16 +1409,31 @@ def _detect_in_progress_runs() -> list[dict]:
     return out
 
 
+_SCHEMA_CHANGELOG = {
+    1: "initial state.json shape",
+    2: "added test-gate fields (test_gate_failure_streak, test_gate_disabled_baseline, "
+       "last_test_gate_status, last_test_gate_duration_seconds)",
+}
+
+
 def _validate_resume(state: dict, run_id: str) -> tuple[bool, str]:
     """Pre-flight checks before loading. Returns (ok, error_message)."""
     if not state:
         return False, f"State for run {run_id!r} not found or unparseable."
     sv = state.get("schema_version")
     if sv != RESUME_STATE_SCHEMA_VERSION:
+        # Spell out what changed between the persisted version and the running one so
+        # the operator understands why the resume can't happen.
+        delta_lines = []
+        if isinstance(sv, int) and sv < RESUME_STATE_SCHEMA_VERSION:
+            for v in range(sv + 1, RESUME_STATE_SCHEMA_VERSION + 1):
+                if v in _SCHEMA_CHANGELOG:
+                    delta_lines.append(f"  v{v}: {_SCHEMA_CHANGELOG[v]}")
+        delta_str = ("\nSchema changes since:\n" + "\n".join(delta_lines)) if delta_lines else ""
         return False, (
             f"State schema version {sv!r} does not match current "
             f"version {RESUME_STATE_SCHEMA_VERSION}. Cannot resume — start a new run "
-            f"with the same task to retry."
+            f"with the same task to retry.{delta_str}"
         )
     branch = state.get("branch_name") or ""
     if not branch:
@@ -1309,6 +1486,15 @@ def _restore_module_state_from_resume(state: dict) -> None:
     # Commit count is informational; reset to len(iteration_history) so the end-of-run
     # summary doesn't report a misleading 0.
     _git_checkpoint_state["commit_count"] = len(state.get("iteration_history") or [])
+    # Test-gate state. Streak + disabled_baseline preserved so resume doesn't re-test a
+    # known-broken baseline and so the operator can override via env vars on the resume
+    # command (HARNESS_TEST_GATE_REQUIRED=0 / HARNESS_TEST_GATE_MAX_STREAK=<higher>) to
+    # break out of a circuit-breaker termination.
+    _test_gate_state["failure_streak"] = state.get("test_gate_failure_streak", 0)
+    _test_gate_state["disabled_baseline"] = state.get("test_gate_disabled_baseline", False)
+    _test_gate_state["last_status"] = state.get("last_test_gate_status")
+    _test_gate_state["last_duration_seconds"] = state.get("last_test_gate_duration_seconds")
+    _test_gate_state["last_output_tail"] = ""  # not persisted; will repopulate on next gate run
 
 
 # ────────────────────────── helpers ──────────────────────────
@@ -4917,30 +5103,128 @@ async def evaluator_node(state: State) -> dict:
               tool_counter=dict(tool_counter), is_web_app=is_web_app,
               evidence_retry_rounds=evidence_retry,
               empty_notes_retry_rounds=empty_notes_retry)
-    # Per-iteration checkpoint: capture the workspace state with verdict-aware metadata.
-    # Runs AFTER the verdict trace event so checkpoint_failed (if it fires) sits next to the
-    # iteration's actual outcome in the trace, not before. No-op when checkpointing disabled
-    # or git unavailable.
-    _create_checkpoint(
-        iteration=state["iteration"],
-        task=state.get("task", ""),
-        plan_doc=plan_doc,
-        verdict=verdict,
-        builder_model=builder_llm.model_name,
-    )
+
+    # Test gate: run between verdict and checkpoint. Iterations that regress tests
+    # don't get committed — the builder is asked to fix the regression first. Gate
+    # only runs on claimed-success verdicts (done | continue) and only when enabled +
+    # baseline wasn't already broken. Other verdicts (replan / incomplete / builder-
+    # exit) skip the gate because there's no claimed completion to verify against.
+    test_gate_info: dict | None = None  # passed into _finalize_iteration_summary for history
+    skip_checkpoint = False
+    if (TEST_GATE_ENABLED
+            and not _test_gate_state["disabled_baseline"]
+            and verdict in ("done", "continue")):
+        print(f"\n  Running test gate ({TEST_COMMAND!r}, cwd={TEST_CWD})...")
+        t0 = time.monotonic()
+        gate_status, gate_err, gate_output = _run_test_gate(TEST_CWD)
+        dt = round(time.monotonic() - t0, 2)
+        _test_gate_state["last_status"] = gate_status
+        _test_gate_state["last_duration_seconds"] = dt
+        _test_gate_state["last_output_tail"] = gate_output
+
+        if gate_status == "passed":
+            TRACE.log("test_gate_passed", iteration=state["iteration"],
+                      duration_seconds=dt, command=TEST_COMMAND)
+            print(f"  Test gate PASSED in {dt}s.")
+            _test_gate_state["failure_streak"] = 0
+            test_gate_info = {"status": "passed", "duration_seconds": dt,
+                              "streak": 0, "checkpointed": True}
+        else:
+            # Failed or timeout
+            _test_gate_state["failure_streak"] += 1
+            streak = _test_gate_state["failure_streak"]
+            TRACE.log(
+                "test_gate_timeout" if gate_status == "timeout" else "test_gate_failed",
+                iteration=state["iteration"], duration_seconds=dt, status=gate_status,
+                error=gate_err, output_tail=gate_output[:2000],
+                failure_streak=streak, max_streak=TEST_GATE_MAX_STREAK,
+            )
+            print(f"  Test gate {gate_status.upper()} ({gate_err}); "
+                  f"streak {streak}/{TEST_GATE_MAX_STREAK}.")
+
+            if not TEST_GATE_REQUIRED_FOR_CHECKPOINT:
+                # Warnings-only mode: log + proceed to checkpoint as usual. The iteration
+                # history shows "tests: <status>; checkpointed anyway".
+                print(f"  HARNESS_TEST_GATE_REQUIRED=0; checkpointing despite failure.")
+                test_gate_info = {"status": gate_status, "duration_seconds": dt,
+                                  "streak": streak, "checkpointed": True,
+                                  "error": gate_err}
+            else:
+                # Required mode: skip checkpoint, demote verdict to continue (or escalate
+                # to incomplete on circuit-breaker). The builder gets the regression
+                # message in eval_notes via the planner on the next iteration.
+                skip_checkpoint = True
+                failure_notice = (
+                    f"\n\n[test gate] The previous iteration appeared to complete the work, "
+                    f"but the project's test suite regressed.\n"
+                    f"Test command: {TEST_COMMAND}\n"
+                    f"Status: {gate_status} ({gate_err})\n"
+                    f"Output tail:\n{gate_output}\n\n"
+                    f"The work was NOT committed. Fix the test failures before calling "
+                    f"verify_completion again. You may need to revisit recent edits or run "
+                    f"additional verification."
+                )
+
+                if streak >= TEST_GATE_MAX_STREAK:
+                    # Circuit breaker — terminate the run. Notes start with a marker
+                    # string route_after_eval can recognize for the dedicated diagnostic.
+                    TRACE.log("test_gate_circuit_breaker_triggered",
+                              iteration=state["iteration"],
+                              failure_streak=streak,
+                              max_streak=TEST_GATE_MAX_STREAK,
+                              last_output_tail=gate_output[:2000],
+                              command=TEST_COMMAND)
+                    print(f"  TEST GATE CIRCUIT BREAKER: streak "
+                          f"{streak}/{TEST_GATE_MAX_STREAK} — terminating run.")
+                    notes = (
+                        f"[test gate circuit breaker] Run terminated: tests failing for "
+                        f"{streak} consecutive iteration(s) (cap={TEST_GATE_MAX_STREAK}).\n\n"
+                        f"Test command: {TEST_COMMAND}\n"
+                        f"Status: {gate_status} ({gate_err})\n"
+                        f"Last test output:\n{gate_output}"
+                    )
+                    verdict = "incomplete"
+                    test_gate_info = {"status": gate_status, "duration_seconds": dt,
+                                      "streak": streak, "checkpointed": False,
+                                      "circuit_breaker": True, "error": gate_err}
+                else:
+                    # Below cap: demote done → continue, skip checkpoint, append the
+                    # failure notice. Builder rerun will see the notice in the next
+                    # planner's BUILDER_INSTRUCTIONS via eval_notes carryover.
+                    if verdict == "done":
+                        verdict = "continue"
+                    notes = notes + failure_notice
+                    test_gate_info = {"status": gate_status, "duration_seconds": dt,
+                                      "streak": streak, "checkpointed": False,
+                                      "error": gate_err}
+    elif TEST_GATE_ENABLED and _test_gate_state["disabled_baseline"]:
+        # Gate is enabled at config-level but suppressed because the baseline was broken.
+        TRACE.log("test_gate_skipped", iteration=state["iteration"],
+                  reason="baseline_failing")
+
+    # Per-iteration checkpoint — runs UNLESS test gate failed in required mode.
+    if not skip_checkpoint:
+        _create_checkpoint(
+            iteration=state["iteration"],
+            task=state.get("task", ""),
+            plan_doc=plan_doc,
+            verdict=verdict,
+            builder_model=builder_llm.model_name,
+        )
+
     # Cache this verdict for future skip-eval decisions. Only refresh when the verdict is
     # one of {done, continue} — incomplete and replan are not safe fallback verdicts for
     # subsequent iterations to inherit. Note we cache the full notes (capped) so a skipped
     # iteration can show the previous evidence rather than a generic message.
     update: dict = {"eval_verdict": verdict, "eval_notes": notes}
-    if verdict in ("done", "continue"):
+    if verdict in ("done", "continue") and not skip_checkpoint:
         update["last_successful_eval"] = {
             "iteration": state["iteration"],
             "verdict": verdict,
             "notes_preview": notes[:2000],
             "ts": datetime.now(timezone.utc).isoformat(),
         }
-    _finalize_iteration_summary(state=state, verdict=verdict)
+    _finalize_iteration_summary(state=state, verdict=verdict, test_gate_info=test_gate_info)
     return update
 
 
@@ -5350,6 +5634,28 @@ async def main():
                           f"€{cost_eur:.4f}, saved {r['saved_at']}")
                 print("\nResume one with: ./run.sh --resume <run-id>")
                 print("Or start fresh by entering a new task below.\n")
+        # Baseline test gate. Run once at run-start so we can distinguish "tests broken
+        # by this iteration" from "tests already broken when the run started". A failing
+        # baseline disables the gate for the run — you can't regress what's already broken.
+        if TEST_GATE_ENABLED:
+            print(f"\nTest gate baseline: running {TEST_COMMAND!r} (cwd={TEST_CWD})...")
+            t0 = time.monotonic()
+            status, err, output = _run_test_gate(TEST_CWD)
+            dt = round(time.monotonic() - t0, 2)
+            _test_gate_state["last_status"] = status
+            _test_gate_state["last_duration_seconds"] = dt
+            _test_gate_state["last_output_tail"] = output
+            if status == "passed":
+                TRACE.log("test_gate_baseline_passed",
+                          duration_seconds=dt, command=TEST_COMMAND)
+                print(f"  Baseline PASSED in {dt}s.\n")
+            else:
+                _test_gate_state["disabled_baseline"] = True
+                TRACE.log("test_gate_baseline_failing",
+                          duration_seconds=dt, status=status,
+                          error=err, output_tail=output[:2000])
+                print(f"  Baseline {status.upper()} ({err}); test gate DISABLED for this run.")
+                print(f"  (Output tail: {_truncate_simple(output, 300)})\n")
     # AsyncExitStack lets us register the MCP-session cleanup as a callback alongside the
     # saver context manager, so both run on exit (normal or exception) without nesting more
     # try/finally blocks. The MCP session is opened later (lazily, when the evaluator first
