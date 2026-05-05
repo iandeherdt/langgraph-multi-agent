@@ -657,6 +657,21 @@ def _record_cost(model: str, input_tokens: int, output_tokens: int, *, label: st
               total_usd=round(_cost_tracker["total_usd"], 4))
 
 
+def _dedupe_repeated_string(s: str) -> str:
+    """Return the smallest repeating unit of `s` if `s` is exactly N copies of some prefix,
+    else `s` unchanged. Recovers from langchain AIMessageChunk's __add__ concatenating
+    `response_metadata.model_name` across chunks (so a 3-chunk stream produces
+    "qwen/qwen3.6-27bqwen/qwen3.6-27bqwen/qwen3.6-27b" as the model name in the cost tracker).
+    """
+    n = len(s)
+    if n <= 1:
+        return s
+    for k in range(1, n // 2 + 1):
+        if n % k == 0 and s[:k] * (n // k) == s:
+            return s[:k]
+    return s
+
+
 def _extract_usage(msg) -> tuple[int, int, str]:
     """Extract (input_tokens, output_tokens, model_name) from a langchain message.
 
@@ -664,22 +679,32 @@ def _extract_usage(msg) -> tuple[int, int, str]:
     'total_tokens'}. Older / vendor wrappers sometimes use .response_metadata.token_usage =
     {'prompt_tokens', 'completion_tokens'} (OpenAI shape) or
     .response_metadata.usage = {'input_tokens', 'output_tokens'} (Anthropic shape). We try
-    each shape; absent usage returns (0, 0, "")."""
+    each shape; absent usage returns (0, 0, "").
+
+    The model_name is run through _dedupe_repeated_string because AIMessageChunk's __add__
+    operator concatenates string fields in response_metadata across chunks via langchain's
+    _merge_dicts. A 2-chunk stream produces "<name><name>" as the model_name; recovering
+    the intended slug avoids the corrupted name leaking into _cost_tracker as a dict key.
+    """
+    def _name(value: str) -> str:
+        return _dedupe_repeated_string((value or "").strip())
+
     if msg is None:
         return 0, 0, ""
     # Modern, vendor-agnostic
     um = getattr(msg, "usage_metadata", None)
     if um:
-        return int(um.get("input_tokens", 0) or 0), int(um.get("output_tokens", 0) or 0), getattr(msg, "response_metadata", {}).get("model_name", "") or ""
+        rm = getattr(msg, "response_metadata", {}) or {}
+        return int(um.get("input_tokens", 0) or 0), int(um.get("output_tokens", 0) or 0), _name(rm.get("model_name", ""))
     rm = getattr(msg, "response_metadata", {}) or {}
     # OpenAI / OpenRouter shape
     tu = rm.get("token_usage")
     if tu:
-        return int(tu.get("prompt_tokens", 0) or 0), int(tu.get("completion_tokens", 0) or 0), rm.get("model_name", "") or ""
+        return int(tu.get("prompt_tokens", 0) or 0), int(tu.get("completion_tokens", 0) or 0), _name(rm.get("model_name", ""))
     # Anthropic native shape
     u = rm.get("usage")
     if u:
-        return int(u.get("input_tokens", 0) or 0), int(u.get("output_tokens", 0) or 0), rm.get("model", "") or ""
+        return int(u.get("input_tokens", 0) or 0), int(u.get("output_tokens", 0) or 0), _name(rm.get("model", ""))
     return 0, 0, ""
 
 
@@ -3656,10 +3681,17 @@ def _apply_planner_merge(
         prior_reqs = list(prior_doc.get("requirements", []))
         merged_requirements = list(prior_reqs)
         prior_req_set = set(prior_reqs)
+        # Trace-log + skip exact-text duplicates. The planner skill says "emit only NEW
+        # requirements" on continued; when the model re-emits prior items the trace records
+        # it (planner-misbehavior signal worth grepping for) but we don't persist the dupe
+        # into the plan, since duplicates compound across iterations and pollute every
+        # subsequent builder/eval system message.
         for r in new_requirements:
             if r in prior_req_set:
                 TRACE.log("requirement_duplicate", text=r[:200])
+                continue
             merged_requirements.append(r)
+            prior_req_set.add(r)
 
         merged_architecture = dict(prior_doc.get("architecture", {}))
         for subname, content in new_architecture.items():
@@ -3667,11 +3699,17 @@ def _apply_planner_merge(
 
         prior_tasks = prior_doc.get("tasks", [])
         prior_task_texts = {t["text"] for t in prior_tasks}
+        # Same skip pattern for tasks. Without this, a continued planner that re-emits the
+        # full prior task list ends up with N copies of every task after N iterations.
+        kept_new_tasks: list[dict] = []
         for nt in new_tasks:
             if nt["text"] in prior_task_texts:
                 TRACE.log("task_duplicate", text=nt["text"][:200])
+                continue
+            kept_new_tasks.append(nt)
+            prior_task_texts.add(nt["text"])
         base_id = max((t["id"] for t in prior_tasks), default=0)
-        renumbered = [{**t, "id": base_id + i + 1} for i, t in enumerate(new_tasks)]
+        renumbered = [{**t, "id": base_id + i + 1} for i, t in enumerate(kept_new_tasks)]
         merged_tasks = prior_tasks + renumbered
         return merged_requirements, merged_architecture, merged_tasks
 
