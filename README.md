@@ -142,6 +142,7 @@ All in `.env`:
 | `HARNESS_EVALUATOR_FALLBACK_MODEL` | Fallback if primary evaluator errors out | (unset) |
 | `HARNESS_EVALUATOR_COST_LIMIT_EUR` | Per-evaluator-invocation cost cap (EUR). Cumulative cost of one evaluator_node call exceeding this raises EvaluatorBudgetExhausted; the harness synthesizes `verdict=incomplete` from partial evidence and terminates. Protects against eval spirals (broken login loop, infinite navigate). | `0.75` |
 | `HARNESS_EVALUATOR_COST_LIMIT_ENABLED` | Set `0` to disable the cap entirely. | `1` |
+| `HARNESS_EVAL_RETRY_EMPTY_NOTES_ON_CHEAP` | Set `1` to retry empty-NOTES verdicts on cheap-tier evaluators. Default skips the retry — cheap-tier models (qwen-coder) consistently fail to recover even with the prior tool history re-injected, so the retry just burns ~60s + a model call. | `0` |
 
 OpenRouter routes flakily for tool-calling on some providers (the model returns native XML format, the provider doesn't translate it back). If you see broken tool calls, find a working provider in your OpenRouter activity log and pin via `OPENROUTER_PROVIDERS=...`. To exclude a single bad provider without pinning everything, use `OPENROUTER_IGNORE_PROVIDERS=parasail` (etc.) — the rest of the fallback set still runs.
 
@@ -300,7 +301,9 @@ Disable entirely with `HARNESS_EVALUATOR_COST_LIMIT_ENABLED=0` (rarely the right
 
 ### Evidence-replay on empty-NOTES retry
 
-When the evaluator emits a verdict block with empty NOTES (`< EVAL_NOTES_MIN_CHARS`, default 100), the harness retries once with a corrective preamble. The retry now **re-injects the evidence** the model already gathered (paired tool calls + truncated results from `_eval_tool_history`) and asks the model to write findings without further tool calls. Avoids the prior pathology of restarting tool calls from scratch on retry, which doubled the eval cost and rarely improved the verdict. Trace event: `evaluator_empty_notes_retry_with_evidence` with `evidence_chars` + `tool_calls_referenced`. If the retry still produces empty NOTES, falls through to the existing escalation (`verdict=incomplete` with salvaged findings).
+When the evaluator emits a verdict block with empty NOTES (`< EVAL_NOTES_MIN_CHARS`, default 100), the harness retries once with a corrective preamble. The retry **re-injects the evidence** the model already gathered (paired tool calls + truncated results from `_eval_tool_history`) and asks the model to write findings without further tool calls. Avoids the prior pathology of restarting tool calls from scratch on retry, which doubled the eval cost and rarely improved the verdict. Trace event: `evaluator_empty_notes_retry_with_evidence` with `evidence_chars`, `tool_calls_total`, `tool_calls_shown` (capped at 20 most-recent). If the retry still produces empty NOTES, falls through to the existing escalation (`verdict=incomplete` with salvaged findings).
+
+**Cheap-tier skip:** the retry is a no-op on cheap-tier evaluators (qwen-coder etc.) — observed across multiple runs to never recover even with the prior tool history re-injected. By default (`HARNESS_EVAL_RETRY_EMPTY_NOTES_ON_CHEAP=0`) the retry is skipped on cheap tier, the harness logs `evaluator_empty_notes_retry_skipped` with `reason="cheap_tier_no_retry"`, and the salvage-findings path runs immediately. Saves ~60s + a wasted model call per occurrence. Set the env var to `1` to force a retry (e.g., when testing a different cheap model).
 
 ## Tunable thresholds
 

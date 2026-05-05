@@ -164,6 +164,15 @@ EVAL_INSUFFICIENT_EVIDENCE_RETRY_CAP = 2  # max re-eval rounds before accepting 
 # to verdict=incomplete (genuine eval failure: model can't produce findings even when prompted).
 EVAL_NOTES_MIN_CHARS = 100              # below this, treated as empty/missing for web-app tasks
 EVAL_EMPTY_NOTES_RETRY_CAP = 1          # one retry; second empty notes → incomplete
+# Cheap-tier evaluators (qwen-coder via the builder model) consistently fail to recover on
+# the empty-notes retry even with the prior tool history re-injected — observed across two
+# independent runs, both ending with `evaluator_empty_notes_cap_exceeded` after burning
+# ~60s + a model call on the doomed retry. Default: skip the retry on cheap tier and go
+# straight to the salvage-findings path. Set HARNESS_EVAL_RETRY_EMPTY_NOTES_ON_CHEAP=1 to
+# preserve the old behavior (e.g. when testing a different cheap model that might do better).
+EVAL_RETRY_EMPTY_NOTES_ON_CHEAP = (
+    os.environ.get("HARNESS_EVAL_RETRY_EMPTY_NOTES_ON_CHEAP", "0") not in ("0", "", "false", "False")
+)
 
 # Heartbeat thresholds per subagent label. The evaluator routinely takes 30-60s to compose
 # its verdict block (natural-language synthesis over many tool observations) — the 20s
@@ -4949,7 +4958,7 @@ def _extract_eval_findings(history: list[dict]) -> dict:
 
 def _build_evidence_summary_for_retry(history: list[dict], *,
                                        max_calls: int = 20,
-                                       per_result_chars: int = 500) -> str:
+                                       per_result_chars: int = 500) -> dict:
     """From the evaluator's tool calls in this invocation, build a concise summary the
     model can use to write a verdict without re-running tools.
 
@@ -4961,9 +4970,13 @@ def _build_evidence_summary_for_retry(history: list[dict], *,
     Pairs each `call` entry with its following `result` entry (when present) so the
     summary reads: "browser_console_messages(...) → result body". Truncates each result
     to `per_result_chars` so the prompt doesn't blow up on console-message dumps.
+
+    Returns a dict {summary, calls_total, calls_shown} so the caller can log accurate
+    counts. `calls_total` is every call in `history`; `calls_shown` is what actually
+    ended up in the summary after the tail-cap (≤ max_calls).
     """
     if not history:
-        return ""
+        return {"summary": "", "calls_total": 0, "calls_shown": 0}
 
     lines = ["You already gathered the following evidence in this evaluator call:"]
     # Pair calls with their immediately-following results. The history is recorded in
@@ -4983,11 +4996,12 @@ def _build_evidence_summary_for_retry(history: list[dict], *,
         else:
             i += 1
 
+    calls_total = len(pairs)
     # Cap pairs from the tail (most-recent — the model's latest observations are usually
     # the most decision-relevant for verdict writing).
     if len(pairs) > max_calls:
         pairs = pairs[-max_calls:]
-        lines.append(f"(showing last {max_calls} of {len(history) // 2 or 1} tool calls)")
+        lines.append(f"(showing last {max_calls} of {calls_total} tool calls)")
 
     for idx, (call, result) in enumerate(pairs, 1):
         tool = call.get("tool", "?")
@@ -5017,7 +5031,7 @@ def _build_evidence_summary_for_retry(history: list[dict], *,
         "that. If the evidence is genuinely insufficient to make a verification call, "
         "return verdict=incomplete with that explanation."
     )
-    return "\n".join(lines)
+    return {"summary": "\n".join(lines), "calls_total": calls_total, "calls_shown": len(pairs)}
 
 
 def _format_findings_for_notes(findings_data: dict, *, header: str) -> str:
@@ -5275,10 +5289,12 @@ async def evaluator_node(state: State) -> dict:
             # those observations, the retry would either re-run all the tools (waste) or
             # invent findings (worse). Showing the actual prior outputs back to the model
             # is the cheap, correct fix.
-            evidence_summary = _build_evidence_summary_for_retry(_eval_tool_history)
+            evidence = _build_evidence_summary_for_retry(_eval_tool_history)
+            evidence_summary = evidence["summary"]
             TRACE.log("evaluator_empty_notes_retry_with_evidence",
                       evidence_chars=len(evidence_summary),
-                      tool_calls_referenced=sum(1 for h in _eval_tool_history if h.get("kind") == "call"))
+                      tool_calls_total=evidence["calls_total"],
+                      tool_calls_shown=evidence["calls_shown"])
             prompt = (
                 f"⚠️  YOUR PRIOR VERDICT HAD EMPTY NOTES (round {empty_notes_retry}/"
                 f"{EVAL_EMPTY_NOTES_RETRY_CAP}).\n\n"
@@ -5521,45 +5537,74 @@ async def evaluator_node(state: State) -> dict:
         # is rejected and the eval is re-invoked with a corrective preamble that asks for
         # findings from already-observed data (no more exploration). Cap=1: second empty
         # notes → escalate to verdict=incomplete (genuine eval failure to produce findings).
+        # Cheap-tier evaluators (qwen-coder etc.) consistently fail to recover on the retry
+        # — observed empirically — so skip the retry for them and go straight to the salvage
+        # path. Override with HARNESS_EVAL_RETRY_EMPTY_NOTES_ON_CHEAP=1 if testing a model
+        # known to behave differently.
         if is_web_app and _eval_notes_too_short(notes):
-            if empty_notes_retry < EVAL_EMPTY_NOTES_RETRY_CAP:
+            tier_used = (_evaluator_holder.get("last_selection") or {}).get("tier_used") or ""
+            cheap_no_retry = (tier_used == "cheap" and not EVAL_RETRY_EMPTY_NOTES_ON_CHEAP)
+            effective_cap = 0 if cheap_no_retry else EVAL_EMPTY_NOTES_RETRY_CAP
+            if empty_notes_retry < effective_cap:
                 TRACE.log("evaluator_empty_notes_rejected",
                           retry_round=empty_notes_retry + 1,
-                          retry_cap=EVAL_EMPTY_NOTES_RETRY_CAP,
+                          retry_cap=effective_cap,
                           notes_chars=len((notes or "").strip()),
                           notes_preview=(notes or "").strip()[:300],
                           rejected_verdict=verdict)
                 print(f"\n  REJECTED: empty NOTES on web-app verdict "
-                      f"(round {empty_notes_retry + 1}/{EVAL_EMPTY_NOTES_RETRY_CAP}). "
+                      f"(round {empty_notes_retry + 1}/{effective_cap}). "
                       f"Forcing retry to populate findings.")
                 empty_notes_retry += 1
                 last_failure = "empty_notes"
                 continue
             else:
+                if cheap_no_retry and empty_notes_retry == 0:
+                    # Log the skip explicitly so it's auditable in the trace why no retry
+                    # happened (vs. the more typical "retry cap exhausted" path).
+                    TRACE.log("evaluator_empty_notes_retry_skipped",
+                              reason="cheap_tier_no_retry",
+                              tier_used=tier_used,
+                              notes_chars=len((notes or "").strip()),
+                              rejected_verdict=verdict)
+                    print(f"\n  SKIPPING empty-notes retry on cheap-tier evaluator "
+                          f"({tier_used}) — observed not to recover. Going straight to "
+                          f"salvage-findings path. Set HARNESS_EVAL_RETRY_EMPTY_NOTES_ON_CHEAP=1 "
+                          f"to force a retry anyway.")
                 # Cap exceeded: escalate to incomplete with a salvage attempt from the
                 # tool history. The eval has demonstrated it cannot produce findings even
                 # when explicitly asked; treat as an evaluator failure mode, not a routine
                 # continue (which would loop the builder on the same untested work).
+                # Honest rounds count: standard path is empty_notes_retry+1 (the rejected
+                # round + retries). Cheap-skip path is just 1 (no retry was run).
+                rounds_attempted = empty_notes_retry + 1
                 findings_data = _extract_eval_findings(_eval_tool_history)
                 TRACE.log("evaluator_empty_notes_cap_exceeded",
-                          retry_cap=EVAL_EMPTY_NOTES_RETRY_CAP,
+                          retry_cap=effective_cap,
+                          rounds_attempted=rounds_attempted,
                           findings_count=len(findings_data["findings"]),
                           pages_ok=findings_data["pages_ok"],
                           pages_with_errors=findings_data["pages_with_errors"],
                           navigates=findings_data.get("navigates", 0),
                           screenshots_taken=findings_data.get("screenshots_taken", 0),
                           interactions=findings_data.get("interactions", 0))
-                print(f"\n  ESCALATED: empty NOTES persisted across "
-                      f"{EVAL_EMPTY_NOTES_RETRY_CAP + 1} rounds — verdict=incomplete.")
+                if cheap_no_retry and rounds_attempted == 1:
+                    print(f"\n  ESCALATED: empty NOTES on cheap-tier evaluator "
+                          f"(no retry on cheap by default) — verdict=incomplete.")
+                    header_text = (
+                        f"Evaluator failed to write actionable NOTES (cheap-tier, "
+                        f"no-retry policy)."
+                    )
+                else:
+                    print(f"\n  ESCALATED: empty NOTES persisted across "
+                          f"{rounds_attempted} round(s) — verdict=incomplete.")
+                    header_text = (
+                        f"Evaluator failed to write actionable NOTES across "
+                        f"{rounds_attempted} round(s)."
+                    )
                 # Notes start with the marker string "failed to write actionable NOTES" so
                 # route_after_eval can distinguish this from infrastructure-failure incomplete.
-                notes = _format_findings_for_notes(
-                    findings_data,
-                    header=(
-                        f"Evaluator failed to write actionable NOTES across "
-                        f"{EVAL_EMPTY_NOTES_RETRY_CAP + 1} rounds."
-                    ),
-                )
+                notes = _format_findings_for_notes(findings_data, header=header_text)
                 verdict = "incomplete"
                 break
 
