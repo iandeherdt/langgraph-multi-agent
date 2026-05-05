@@ -153,6 +153,50 @@ Concrete examples of how to read a large `browser_console_messages` result:
 - If the body contains `TypeError: Cannot read property 'foo' of undefined at ...`, that's a runtime error. Quote the line; verdict is `continue` (or `replan` if the architecture is the cause).
 - If the body contains hydration warnings, they're errors in production but warnings in dev — surface them; mention in NOTES that they need investigating before deploy.
 
+## Project login patterns
+
+For Next.js admin routes with cookie-based auth, prefer ONE-SHOT API LOGIN over interactive browser form login. Browser-based form login is slow, error-prone, and burns expensive tool calls.
+
+The standard agency-cms login pattern (and similar projects):
+
+Step 1: Login via API to get the session cookie:
+```bash
+curl -s -c /tmp/admin_cookies.txt -X POST http://localhost:3000/api/admin/login \
+  -H "Content-Type: application/json" \
+  -d '{"password":"admin"}'
+```
+
+Step 2: Verify the cookie was set:
+```bash
+cat /tmp/admin_cookies.txt | grep -E "admin_session|session"
+```
+
+Step 3a (for non-browser verification — preferred when only checking server-rendered HTML):
+```bash
+curl -s -b /tmp/admin_cookies.txt http://localhost:3000/admin/pages
+```
+
+Step 3b (for browser verification — when you need DOM/console inspection):
+Read the cookie value from the file, then inject it into the browser session:
+```javascript
+async (page) => {
+  // Parse cookie value from /tmp/admin_cookies.txt — name and value are tab-separated
+  await page.context().addCookies([{
+    name: 'admin_session',
+    value: '<value-from-cookies-file>',
+    domain: 'localhost',
+    path: '/',
+    httpOnly: true,
+  }]);
+  await page.goto('http://localhost:3000/admin/pages');
+  return page.url();
+}
+```
+
+DO NOT use `browser_type` + `browser_click` to fill the login form repeatedly. Each attempt costs a full LLM tool-call cycle. If the API-login + cookie-injection path doesn't work after one attempt, document the failure and proceed with whatever verification you can do without auth.
+
+Failed login attempts beyond the first are NOT a productive use of the evaluator's budget.
+
 ## WHAT COUNTS AS VERIFICATION FAILURE
 
 - HTTP 200 with empty / skeleton content (a placeholder page, an unstyled layout) is NOT success.

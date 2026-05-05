@@ -19,7 +19,7 @@ planner → builder → [router] → evaluator → [router] → planner | END
 
 - **Planner** — Claude Sonnet 4.6 (Anthropic API). Writes a structured plan and the explicit prompts the builder and evaluator receive. The other models don't get generic system prompts; they get prose authored by Sonnet for this specific iteration. Has a startup short-circuit (`route_after_planner`): if the prior task's trace shows `verification_token_consumed` followed by `builder_exit reason="done"` and the new input is a trivial continuation (`continue`, `go`, `proceed`, …), the planner emits `path="already_complete"` and the harness terminates without invoking the builder. Stops the planner from inventing fictional new requirements on a working codebase.
 - **Builder** — Qwen3-Coder-Next via OpenRouter. Custom `StateGraph` (not `create_react_agent`) with a sophisticated tool surface (see below).
-- **Evaluator** — vision-capable model that drives the browser via Playwright MCP, with read-only file tools + browser tools loaded over a **persistent** SSE session (each MCP tool call shares the same browser page; the default `client.get_tools()` mode opens a fresh session per call and loses page state between tool calls — broken for any verification flow). Verifies builder output via both code (`npm run build`) and browser interaction (navigate / screenshot / snapshot / console_messages / click), guided by a mandatory interaction protocol on web-app tasks. The model is **per-call selectable** via `HARNESS_EVALUATOR_TIER` (`cheap` = builder model, `strong` = Sonnet 4.6, `auto` = heuristic) and `HARNESS_EVALUATOR_MODEL` (explicit override). Defaults to Qwen3.6-27B at the cheap tier, escalates to Sonnet on auto when the task description hits stake-keywords (production, deploy, payment, auth, security, GDPR, …) or when prior iterations have failed verification. See "Tiered evaluator" below.
+- **Evaluator** — vision-capable model that drives the browser via Playwright MCP, with read-only file tools + browser tools loaded over a **persistent** SSE session (each MCP tool call shares the same browser page; the default `client.get_tools()` mode opens a fresh session per call and loses page state between tool calls — broken for any verification flow). Verifies builder output via both code (`npm run build`) and browser interaction (navigate / screenshot / snapshot / console_messages / click), guided by a mandatory interaction protocol on web-app tasks. The model is **per-call selectable** via `HARNESS_EVALUATOR_TIER` (`cheap` = builder model, `strong` = Sonnet 4.6, `auto` = default cheap), `--evaluator-tier <tier>` CLI flag, an in-prompt `<harness:tier strong>` marker, or `HARNESS_EVALUATOR_MODEL` (explicit slug). Defaults to the cheap tier; promotion to strong is **explicit-opt-in only** (env / CLI / prompt marker). Per-invocation cost cap (`HARNESS_EVALUATOR_COST_LIMIT_EUR`, default €0.75) terminates a runaway eval before it burns the run budget. See "Tiered evaluator" below.
 - **Advisor** — Claude Sonnet 4.6 again, gating builder completion. The builder cannot call `mark_done` directly; it must first call `verify_completion(task_summary, evidence, verify_command)` which sends the evidence + plan + recent verify-output to the advisor. The advisor returns a structured verdict including `next_actor`: `builder_continue` (default rejection — code-level work to do), `needs_evaluator` (work looks reasonable but needs browser-based verification), or `builder_disagreement` (wrong-problem; planner re-engages). The harness routes accordingly: `needs_evaluator` short-circuits the builder loop and hands off to the evaluator; `builder_disagreement` routes to the planner under the existing replan cap.
 
 **Inner (builder StateGraph):**
@@ -137,9 +137,11 @@ All in `.env`:
 | `HARNESS_TEST_GATE_MAX_STREAK` | Consecutive test failures before circuit-breaker terminates the run | `3` |
 | `HARNESS_TEST_OUTPUT_TAIL_LINES` | Lines of test output captured in trace + RUN_SUMMARY | `50` |
 | `HARNESS_EVALUATOR_MODEL` | Explicit evaluator slug; bypasses tier logic | (unset) |
-| `HARNESS_EVALUATOR_TIER` | `cheap` (builder model), `strong` (Sonnet 4.6), or `auto` (heuristic) | `auto` |
+| `HARNESS_EVALUATOR_TIER` | `cheap` (builder model), `strong` (Sonnet 4.6), or `auto`. `auto` defaults to `cheap` — strong is opt-in only (env / `--evaluator-tier` CLI / `<harness:tier strong>` prompt marker). | `auto` |
 | `HARNESS_EVALUATOR_STRONG_MODEL` | Model used when tier resolves to `strong` | `claude-sonnet-4-6` |
 | `HARNESS_EVALUATOR_FALLBACK_MODEL` | Fallback if primary evaluator errors out | (unset) |
+| `HARNESS_EVALUATOR_COST_LIMIT_EUR` | Per-evaluator-invocation cost cap (EUR). Cumulative cost of one evaluator_node call exceeding this raises EvaluatorBudgetExhausted; the harness synthesizes `verdict=incomplete` from partial evidence and terminates. Protects against eval spirals (broken login loop, infinite navigate). | `0.75` |
+| `HARNESS_EVALUATOR_COST_LIMIT_ENABLED` | Set `0` to disable the cap entirely. | `1` |
 
 OpenRouter routes flakily for tool-calling on some providers (the model returns native XML format, the provider doesn't translate it back). If you see broken tool calls, find a working provider in your OpenRouter activity log and pin via `OPENROUTER_PROVIDERS=...`. To exclude a single bad provider without pinning everything, use `OPENROUTER_IGNORE_PROVIDERS=parasail` (etc.) — the rest of the fallback set still runs.
 
@@ -243,32 +245,40 @@ Trace events: `test_gate_baseline_passed`, `test_gate_baseline_failing`, `test_g
 
 The evaluator can run on a different (typically stronger) model than the builder. Important when the eval needs to read large evidence buffers carefully — a known failure mode is "Qwen captures 64KB of console errors via `browser_console_messages`, then summarizes them as 'no issues' in the verdict because the buffer is too long to read carefully." A stronger model catches this; a per-call selector + optional fallback lets the harness escalate exactly where it matters.
 
+Strong-tier is **opt-in only**. An earlier version auto-escalated on stake-keywords (`auth`, `production`, `security`, …) but the keyword list false-positived on routine task text (`auth` in "authenticating", "/admin/login") and surprise-charged users for strong-tier verification they hadn't asked for. The current policy: `auto` defaults to cheap; strong needs an explicit signal.
+
 ```bash
-# Force Sonnet for the evaluator on a single run
+# Force Sonnet via env (also affects child runs / re-resumes)
 HARNESS_EVALUATOR_TIER=strong ./run.sh --prompt-name regression-test
+
+# Or per-invocation via CLI flag
+./run.sh --prompt-name regression-test --evaluator-tier strong
+
+# Or via prompt marker — first line of the prompt file
+echo '<harness:tier strong>' > prompts/audit.md
+echo 'Audit the production checkout flow…' >> prompts/audit.md
+./run.sh --prompt-name audit
 
 # Or pick a specific model
 HARNESS_EVALUATOR_MODEL=claude-sonnet-4-6 ./run.sh --prompt-name production-deploy
 
-# Or rely on the auto heuristic (default) — escalates on stake-keywords
-./run.sh --prompt-name "add-auth-to-admin"   # auto → strong (matched 'auth')
-./run.sh --prompt-name "add-contact-section" # auto → cheap (no triggers)
+# Default — auto resolves to cheap regardless of task wording
+./run.sh --prompt-name "add-auth-to-admin"   # auto → cheap
 ```
 
 Precedence:
 
 1. `HARNESS_EVALUATOR_MODEL` set → explicit override (`tier_used="explicit"`).
-2. `HARNESS_EVALUATOR_TIER=cheap` → builder model.
-3. `HARNESS_EVALUATOR_TIER=strong` → `HARNESS_EVALUATOR_STRONG_MODEL` (default `claude-sonnet-4-6`).
-4. `HARNESS_EVALUATOR_TIER=auto` (default): escalates to strong when ANY of the following triggers fire, else cheap:
-   - Task description contains a stake-keyword: `production`, `deploy`, `release`, `payment`, `auth`, `security`, `user data`, `gdpr`, `compliance`, `hipaa` (case-insensitive substring match)
-   - `HARNESS_BUDGET_EUR` ≥ 10 (forward-compat with the not-yet-implemented budget circuit breaker)
-   - The task is web-app shaped AND at least one prior iteration in the run's history was non-ok (suggests Qwen had trouble; escalate verification)
+2. `HARNESS_EVALUATOR_TIER=cheap` (env or `--evaluator-tier cheap`) → builder model.
+3. `HARNESS_EVALUATOR_TIER=strong` (env or `--evaluator-tier strong`) → `HARNESS_EVALUATOR_STRONG_MODEL` (default `claude-sonnet-4-6`).
+4. Prompt marker `<harness:tier strong>` (or `<harness:evaluator-tier=strong>`, `<…cheap>`) — case-insensitive, matched anywhere in the task text → matching tier.
+5. `HARNESS_EVALUATOR_TIER=auto` (default) → cheap.
 
 Selection is logged per evaluator invocation as `evaluator_model_chosen` with `tier_requested`, `tier_used`, `model`, and `reason`. RUN_SUMMARY.md's Status block shows the most recent decision:
 
 ```
-- Evaluator model: claude-sonnet-4-6 (tier=strong, reason="task contains 'auth'")
+- Evaluator model: claude-sonnet-4-6 (tier=strong, reason='explicit override (env)')
+- Evaluator model: qwen/qwen3.6-27b (tier=cheap, reason='default cheap')
 ```
 
 `HARNESS_EVALUATOR_FALLBACK_MODEL` is a single-shot retry on primary model errors (rate limit / transient 5xx / connection drop). `GraphRecursionError` doesn't fall back — that's the eval's own recursion budget, swapping models won't help. Trace events: `evaluator_model_fallback_used`, `evaluator_model_fallback_exhausted`. After fallback exhaustion, falls through to the existing `verdict=incomplete` path.
@@ -276,6 +286,21 @@ Selection is logged per evaluator invocation as `evaluator_model_chosen` with `t
 The agent is rebuilt per-call only when the chosen model differs from the cached one — most runs land on the same model across iterations, so caching keeps the cost low. The persistent MCP session is reused across model swaps; only the agent rebuilds.
 
 The Console error policy in `skills/evaluating/SKILL.md` applies regardless of which model runs — Sonnet is more likely to follow it correctly, but Qwen has a better chance with the explicit instruction than without.
+
+### Per-evaluator cost cap
+
+A single evaluator invocation can spiral on broken login flows, infinite navigate loops, or the wrong dev-server port — without a cap, one stuck eval can burn the entire run budget on verification alone. `HARNESS_EVALUATOR_COST_LIMIT_EUR` (default €0.75) caps cumulative cost per `evaluator_node` call. When the cap fires:
+
+- `evaluator_cost_limit_exceeded` lands in the trace with `cost_eur`, `limit_eur`, `tool_calls_made`, `last_tool`.
+- The harness synthesizes a `verdict=incomplete` from `_eval_tool_history` (the tool calls + outputs captured before the cap), so the operator sees what was checked.
+- `route_after_eval` short-circuits to END with a cost-protection diagnostic — no builder retry; the cap is a budget guarantee, not a transient error.
+- RUN_SUMMARY's Termination section renders eval-only cost separately from run-total cost, plus the resume command with the cap raised.
+
+Disable entirely with `HARNESS_EVALUATOR_COST_LIMIT_ENABLED=0` (rarely the right move — fix the underlying flow instead).
+
+### Evidence-replay on empty-NOTES retry
+
+When the evaluator emits a verdict block with empty NOTES (`< EVAL_NOTES_MIN_CHARS`, default 100), the harness retries once with a corrective preamble. The retry now **re-injects the evidence** the model already gathered (paired tool calls + truncated results from `_eval_tool_history`) and asks the model to write findings without further tool calls. Avoids the prior pathology of restarting tool calls from scratch on retry, which doubled the eval cost and rarely improved the verdict. Trace event: `evaluator_empty_notes_retry_with_evidence` with `evidence_chars` + `tool_calls_referenced`. If the retry still produces empty NOTES, falls through to the existing escalation (`verdict=incomplete` with salvaged findings).
 
 ## Tunable thresholds
 
@@ -338,16 +363,14 @@ RESUME_FRESHNESS_HOURS = 24       # AsyncSqliteSaver checkpoints older than this
 
 # --resume <run-id> path (PBE-iteration-level resume; separate from the above)
 RESUME_ENABLED = True
-RESUME_STATE_SCHEMA_VERSION = 3   # bumped from 2: state.json gained evaluator_model_used
+RESUME_STATE_SCHEMA_VERSION = 4   # bumped from 3: state.json gained last_evaluator_cost_eur
 
-# Tiered evaluator
+# Tiered evaluator. auto defaults to cheap; promotion to strong is explicit-only
+# (env / --evaluator-tier CLI / <harness:tier strong> prompt marker).
 EVALUATOR_TIER = "auto"               # cheap | strong | auto; via HARNESS_EVALUATOR_TIER
 EVALUATOR_STRONG_MODEL = "claude-sonnet-4-6"
-EVALUATOR_AUTO_STRONG_KEYWORDS = (    # task substrings that escalate auto → strong
-    "production", "deploy", "release", "payment", "auth", "security",
-    "user data", "gdpr", "compliance", "hipaa",
-)
-EVALUATOR_AUTO_STRONG_BUDGET_EUR = 10.0  # HARNESS_BUDGET_EUR ≥ this → strong
+EVALUATOR_COST_LIMIT_EUR = 0.75       # per-evaluator-invocation cost cap
+EVALUATOR_COST_LIMITS_ENABLED = True  # HARNESS_EVALUATOR_COST_LIMIT_ENABLED=0 to disable
 
 # Test gate — empty TEST_COMMAND disables; set via HARNESS_TEST_COMMAND env
 TEST_COMMAND = ""                  # default unset → gate disabled

@@ -296,7 +296,7 @@ RUN_SUMMARY_TASK_SUMMARY_CHARS = 80    # per-iteration title/summary length
 # to start fresh. Bump RESUME_STATE_SCHEMA_VERSION whenever the persisted state shape
 # changes in a non-backward-compatible way.
 RESUME_ENABLED = os.environ.get("RESUME_ENABLED", "1").lower() not in ("0", "false", "no", "")
-RESUME_STATE_SCHEMA_VERSION = 3  # bumped from 2: state.json gained evaluator_model_used
+RESUME_STATE_SCHEMA_VERSION = 4  # bumped from 3: state.json gained last_evaluator_cost_eur
 RESUME_STATE_FILENAME = "state.json"
 
 # Test gate. Runs HARNESS_TEST_COMMAND between a successful evaluator verdict and the
@@ -347,31 +347,39 @@ ADVISOR_OUTPUT_CHARS = 4000          # clip recent verify output to this many ch
 # Tiered evaluator. The evaluator can run on a different (typically stronger) model than
 # the builder — important when the eval needs to read large evidence buffers carefully
 # (e.g., a 64KB browser_console_messages dump where the failure mode is "Qwen captured
-# the error then summarized it as 'no issues' in the verdict"). Three configuration
-# knobs, in precedence order:
+# the error then summarized it as 'no issues' in the verdict"). Configuration knobs,
+# in precedence order:
 #   1. HARNESS_EVALUATOR_MODEL — explicit slug ("claude-sonnet-4-6", "qwen/qwen3.6-27b").
 #      Highest precedence; bypasses tier logic entirely.
-#   2. HARNESS_EVALUATOR_TIER — "cheap" (use builder model), "strong" (use Sonnet 4.6),
-#      or "auto" (heuristic — see _select_evaluator_model). Default "auto".
-#   3. HARNESS_EVALUATOR_FALLBACK_MODEL — fallback if the primary evaluator errors out
+#   2. HARNESS_EVALUATOR_TIER (or --evaluator-tier CLI flag) — "cheap" (use builder model),
+#      "strong" (use Sonnet 4.6), or "auto". Default "auto".
+#   3. Prompt marker — `<harness:tier strong>` or `<harness:evaluator-tier=strong>` line
+#      anywhere in the task text → treated as explicit strong override.
+#   4. HARNESS_EVALUATOR_FALLBACK_MODEL — fallback if the primary evaluator errors out
 #      (rate limit / API outage). Empty disables fallback; primary errors fall through
 #      to the existing verdict=incomplete path.
+# AUTO TIER POLICY: defaults to cheap. Earlier versions escalated on stake-keywords
+# ("auth", "production", "security", …) but those false-positive on routine task text
+# (e.g., "auth" in "authenticating" or "/admin/login"), surprise-charging users for
+# strong-tier verification when they didn't ask for it. Now: explicit signal required.
 EVALUATOR_MODEL = os.environ.get("HARNESS_EVALUATOR_MODEL", "").strip()
 EVALUATOR_FALLBACK_MODEL = os.environ.get("HARNESS_EVALUATOR_FALLBACK_MODEL", "").strip()
 EVALUATOR_TIER = os.environ.get("HARNESS_EVALUATOR_TIER", "auto").strip().lower()
+# Where the EVALUATOR_TIER value came from. Set at module load to "env" if the env var
+# was actually present (regardless of value), else "default". --evaluator-tier CLI flag
+# updates this to "cli". Used by _select_evaluator_model to render the reason string.
+_evaluator_tier_source = "env" if os.environ.get("HARNESS_EVALUATOR_TIER", "").strip() else "default"
 # Default model for the "strong" tier. Mirrors ADVISOR_MODEL by default — same model the
 # advisor uses. Override via HARNESS_EVALUATOR_STRONG_MODEL if you want them different.
 EVALUATOR_STRONG_MODEL = os.environ.get("HARNESS_EVALUATOR_STRONG_MODEL", "claude-sonnet-4-6").strip()
-# Auto-tier escalation triggers. Substring matched case-insensitive against the task
-# description. The list reflects "stakes worth paying for stronger verification": shipping,
-# user data, money, regulated domains.
-EVALUATOR_AUTO_STRONG_KEYWORDS = (
-    "production", "deploy", "release", "payment", "auth", "security",
-    "user data", "gdpr", "compliance", "hipaa",
-)
-# Budget-based escalation: HARNESS_BUDGET_EUR ≥ this → strong tier. Forward-compatible
-# with the (not-yet-implemented) budget circuit breaker.
-EVALUATOR_AUTO_STRONG_BUDGET_EUR = 10.0
+# Per-evaluator-invocation cost cap. The evaluator can spiral on broken login flows or
+# stuck-in-a-loop verification — without a cap a single eval can burn the whole run
+# budget. When the cumulative eval cost (sum of model_call_cost events with label="eval"
+# during one evaluator_node call) reaches EVALUATOR_COST_LIMIT_EUR, the streaming loop
+# raises EvaluatorBudgetExhausted; evaluator_node synthesizes a verdict=incomplete with
+# evidence summarized from _eval_tool_history. Disable via HARNESS_EVALUATOR_COST_LIMIT_ENABLED=0.
+EVALUATOR_COST_LIMIT_EUR = float(os.environ.get("HARNESS_EVALUATOR_COST_LIMIT_EUR", "0.75"))
+EVALUATOR_COST_LIMITS_ENABLED = os.environ.get("HARNESS_EVALUATOR_COST_LIMIT_ENABLED", "1") != "0"
 
 # File editor
 FILE_VIEW_DEFAULT_MAX_LINES = 800     # if file ≤ this, return whole file by default (was 400 — too aggressive for code; ~95% of source files <800 lines)
@@ -656,6 +664,38 @@ _cost_tracker: dict = {
     "started_at": None,
 }
 
+# Per-evaluator-invocation cost tracker. Reset to 0 at the top of each evaluator_node call;
+# accumulated by _record_cost when label="eval". Read by _stream_subagent (when label="eval")
+# to enforce HARNESS_EVALUATOR_COST_LIMIT_EUR. Stored in EUR so the cap reads naturally.
+_current_evaluator_cost_eur: float = 0.0
+
+# Last evaluator cost-limit event. Captured once per evaluator_node call when the cap fires.
+# Read by _update_run_summary's Status block to render the "Evaluator cost limit hit at iter N"
+# line. Persisted across resume via state.json (last_evaluator_cost_eur) so the operator can
+# see partial cost on a budget-terminated run.
+_evaluator_cost_limit_event: dict = {
+    "iteration": None,
+    "cost_eur": 0.0,
+    "limit_eur": 0.0,
+    "tool_calls_made": 0,
+    "last_tool": None,
+}
+
+
+class EvaluatorBudgetExhausted(Exception):
+    """Raised inside _stream_subagent when label='eval' and the per-evaluator cost cap is hit.
+    Caught by evaluator_node, which synthesizes a verdict=incomplete from the partial
+    evidence in _eval_tool_history.
+    """
+    def __init__(self, *, cost_eur: float, limit_eur: float, last_tool: str | None = None):
+        super().__init__(
+            f"Evaluator cost limit exceeded: €{cost_eur:.4f} >= €{limit_eur:.4f} "
+            f"(last tool: {last_tool!r})"
+        )
+        self.cost_eur = cost_eur
+        self.limit_eur = limit_eur
+        self.last_tool = last_tool
+
 
 def _normalize_model_for_pricing(model: str) -> tuple[str, dict] | tuple[None, dict]:
     """Match `model` (any of the slug forms LangChain returns) against COST_PER_1M_TOKENS.
@@ -694,6 +734,12 @@ def _record_cost(model: str, input_tokens: int, output_tokens: int, *, label: st
     by_model["calls"] += 1
     by_model["cost_usd"] += cost_usd
     _cost_tracker["total_usd"] += cost_usd
+
+    # Per-evaluator-invocation accumulator. Resets at the top of each evaluator_node call;
+    # the streaming loop reads it to enforce HARNESS_EVALUATOR_COST_LIMIT_EUR.
+    if label == "eval":
+        global _current_evaluator_cost_eur
+        _current_evaluator_cost_eur += cost_usd * COST_USD_TO_EUR
 
     TRACE.log("model_call_cost", model=model, label=label,
               input_tokens=int(input_tokens or 0),
@@ -1082,15 +1128,37 @@ def _update_run_summary(state) -> None:
         else:
             test_gate_block = ""
 
-        # Termination section — fires when the test-gate circuit breaker tripped on the
-        # latest iteration. Surfaces the bypass commands the spec requires.
+        # Termination section — fires when the test-gate circuit breaker tripped OR the
+        # evaluator cost cap (HARNESS_EVALUATOR_COST_LIMIT_EUR) fired on the latest
+        # iteration. Surfaces the bypass commands the spec requires.
         last_entry = _iteration_history[-1] if _iteration_history else None
         termination_block = ""
+        ev_cost = _evaluator_cost_limit_event
+        if (last_entry and ev_cost.get("iteration") == last_entry.get("iter")):
+            # Evaluator cost-cap termination. Render its own block separately from the
+            # run-total cost so the operator can see the eval-only cost.
+            run_total_eur = _cost_tracker["total_usd"] * COST_USD_TO_EUR
+            run_id_for_resume = _current_run_id() or "<run-id>"
+            termination_block += (
+                f"## Termination\n"
+                f"Run terminated by evaluator cost cap.\n\n"
+                f"- Reason: evaluator cost reached €{ev_cost['cost_eur']:.4f} "
+                f"(cap=€{ev_cost['limit_eur']:.4f}) at iter {ev_cost['iteration']}\n"
+                f"- Tool calls made before cap: {ev_cost.get('tool_calls_made', 0)}; "
+                f"last tool: `{ev_cost.get('last_tool')!r}`\n"
+                f"- Eval cost (this iteration): €{ev_cost['cost_eur']:.4f}\n"
+                f"- Run-total cost: €{run_total_eur:.4f}\n\n"
+                f"To raise the per-evaluator cap on the resumed run:\n\n"
+                f"    HARNESS_EVALUATOR_COST_LIMIT_EUR=2.00 ./run.sh --resume {run_id_for_resume}\n\n"
+                f"To disable the cap entirely (use sparingly — protects against runaway "
+                f"verification loops):\n\n"
+                f"    HARNESS_EVALUATOR_COST_LIMIT_ENABLED=0 ./run.sh --resume {run_id_for_resume}\n\n"
+            )
         if last_entry and (last_entry.get("test_gate") or {}).get("circuit_breaker"):
             tgc = last_entry["test_gate"]
             last_h = last_commit.get("hash") or "(none)"
             run_id_for_resume = run_id or "<run-id>"
-            termination_block = (
+            termination_block += (
                 f"## Termination\n"
                 f"Run terminated by test gate.\n\n"
                 f"- Reason: tests failing for {tgc['streak']} consecutive iteration(s) "
@@ -1363,6 +1431,12 @@ def _serialize_state_for_resume(state, *, original_task: str) -> dict:
         # overrides via HARNESS_EVALUATOR_TIER / HARNESS_EVALUATOR_MODEL on the resume
         # command line. Read by main()'s resume path to seed the cached agent.
         "evaluator_model_used": _evaluator_holder.get("agent_model_id"),
+        # Schema v4: cumulative cost (in EUR) of the most recent evaluator invocation.
+        # Captures the partial cost when a run was terminated by the per-evaluator cost
+        # cap (HARNESS_EVALUATOR_COST_LIMIT_EUR). Surfaces on the RUN_SUMMARY Status line
+        # post-resume so the operator can see why the run was cut short.
+        "last_evaluator_cost_eur": round(_current_evaluator_cost_eur, 4),
+        "evaluator_cost_limit_event": dict(_evaluator_cost_limit_event),
     }
 
 
@@ -1451,6 +1525,9 @@ _SCHEMA_CHANGELOG = {
        "last_test_gate_status, last_test_gate_duration_seconds)",
     3: "added evaluator_model_used (the per-iteration evaluator model picked by the "
        "tier selector — preserved across resume so the same model continues)",
+    4: "added last_evaluator_cost_eur (the cumulative cost of the most recent evaluator "
+       "invocation in EUR; preserved so resume sees the partial cost when a run was "
+       "terminated by HARNESS_EVALUATOR_COST_LIMIT_EUR)",
 }
 
 
@@ -1537,6 +1614,15 @@ def _restore_module_state_from_resume(state: dict) -> None:
     # call's cache check sees a "same model" hit and doesn't rebuild the agent on a
     # spurious miss (the actual agent is built lazily on first eval call).
     _evaluator_holder["agent_model_id"] = state.get("evaluator_model_used")
+    # Per-evaluator cost cap event (schema v4). Restore so RUN_SUMMARY's Status line
+    # continues to show the cost-limit hit on a resumed run; the running counter
+    # _current_evaluator_cost_eur itself resets to 0 on the next evaluator_node call.
+    persisted_event = state.get("evaluator_cost_limit_event") or {}
+    if persisted_event.get("iteration") is not None:
+        _evaluator_cost_limit_event.update({
+            k: persisted_event.get(k, _evaluator_cost_limit_event.get(k))
+            for k in ("iteration", "cost_eur", "limit_eur", "tool_calls_made", "last_tool")
+        })
 
 
 # ────────────────────────── helpers ──────────────────────────
@@ -3483,16 +3569,40 @@ def _make_llm_for_model(model_id: str):
     return _openrouter_llm(slug)
 
 
+_PROMPT_TIER_MARKER_RE = re.compile(
+    r"<harness:(?:tier\s+|evaluator-tier\s*=\s*)(strong|cheap|auto)\s*>",
+    re.IGNORECASE,
+)
+
+
+def _detect_prompt_tier_marker(task: str) -> str | None:
+    """Return 'strong' / 'cheap' / 'auto' if the task text contains a marker, else None.
+
+    Accepted forms: `<harness:tier strong>` and `<harness:evaluator-tier=strong>`.
+    The match is case-insensitive and can appear anywhere in the prompt (typically the
+    first line). This is the deliberate per-prompt opt-in — auto-tier no longer escalates
+    on keywords, so committing a marker into a prompt file is the way to ask for strong.
+    """
+    if not task:
+        return None
+    m = _PROMPT_TIER_MARKER_RE.search(task)
+    if not m:
+        return None
+    return m.group(1).strip().lower()
+
+
 def _select_evaluator_model(state, task: str) -> dict:
     """Pick the evaluator model + record why. Precedence:
     1. HARNESS_EVALUATOR_MODEL set → explicit override (tier_used="explicit").
-    2. HARNESS_EVALUATOR_TIER=cheap → builder model.
-    3. HARNESS_EVALUATOR_TIER=strong → EVALUATOR_STRONG_MODEL.
-    4. HARNESS_EVALUATOR_TIER=auto (default) → heuristic:
-       - any EVALUATOR_AUTO_STRONG_KEYWORDS substring in task → strong
-       - HARNESS_BUDGET_EUR ≥ 10 → strong
-       - is_web_app + ≥1 prior non-ok iteration in history → strong
-       - otherwise → cheap (builder model)
+    2. EVALUATOR_TIER == "cheap" (env or --evaluator-tier CLI) → builder model.
+    3. EVALUATOR_TIER == "strong" (env or --evaluator-tier CLI) → EVALUATOR_STRONG_MODEL.
+    4. Prompt marker `<harness:tier strong>` (or cheap) → matching tier.
+    5. EVALUATOR_TIER == "auto" (default) → cheap.
+
+    The prior auto heuristic (escalate on stake-keywords like "auth"/"production",
+    HARNESS_BUDGET_EUR threshold, prior non-ok iterations) was removed — the keyword
+    list false-positived on routine task text and surprise-charged users for strong-tier
+    runs. Strong is now opt-in only.
 
     Returns a dict {model, reason, tier_requested, tier_used}.
     """
@@ -3506,39 +3616,28 @@ def _select_evaluator_model(state, task: str) -> dict:
                 "tier_requested": tier_requested, "tier_used": "explicit"}
 
     if tier_requested == "cheap":
-        return {"model": builder_slug, "reason": "tier=cheap",
+        return {"model": builder_slug,
+                "reason": f"explicit override ({_evaluator_tier_source})",
                 "tier_requested": tier_requested, "tier_used": "cheap"}
 
     if tier_requested == "strong":
-        return {"model": EVALUATOR_STRONG_MODEL, "reason": "tier=strong",
-                "tier_requested": tier_requested, "tier_used": "strong"}
-
-    # tier_requested == "auto" (or unrecognized — treat as auto)
-    task_lc = (task or "").lower()
-    matched_kw = next((kw for kw in EVALUATOR_AUTO_STRONG_KEYWORDS if kw in task_lc), None)
-    if matched_kw:
         return {"model": EVALUATOR_STRONG_MODEL,
-                "reason": f"task contains {matched_kw!r}",
+                "reason": f"explicit override ({_evaluator_tier_source})",
                 "tier_requested": tier_requested, "tier_used": "strong"}
 
-    try:
-        budget_eur = float(os.environ.get("HARNESS_BUDGET_EUR", "0") or "0")
-    except ValueError:
-        budget_eur = 0.0
-    if budget_eur >= EVALUATOR_AUTO_STRONG_BUDGET_EUR:
+    # tier_requested == "auto" (or unrecognized — treat as auto). Check prompt marker
+    # first, then fall through to default cheap.
+    marker = _detect_prompt_tier_marker(task)
+    if marker == "strong":
         return {"model": EVALUATOR_STRONG_MODEL,
-                "reason": f"HARNESS_BUDGET_EUR={budget_eur} >= {EVALUATOR_AUTO_STRONG_BUDGET_EUR}",
+                "reason": "explicit override (prompt marker)",
                 "tier_requested": tier_requested, "tier_used": "strong"}
+    if marker == "cheap":
+        return {"model": builder_slug,
+                "reason": "explicit override (prompt marker)",
+                "tier_requested": tier_requested, "tier_used": "cheap"}
 
-    plan_doc = (state or {}).get("plan") or {}
-    if _is_web_app_task(state or {}, plan_doc):
-        non_ok_prior = sum(1 for entry in _iteration_history if entry.get("status") != "ok")
-        if non_ok_prior >= 1:
-            return {"model": EVALUATOR_STRONG_MODEL,
-                    "reason": f"web-app task + {non_ok_prior} prior non-ok iteration(s)",
-                    "tier_requested": tier_requested, "tier_used": "strong"}
-
-    return {"model": builder_slug, "reason": "default cheap (no escalation triggers)",
+    return {"model": builder_slug, "reason": "default cheap",
             "tier_requested": tier_requested, "tier_used": "cheap"}
 
 
@@ -4336,14 +4435,21 @@ _evaluator_holder: dict = {
 
 
 def _format_evaluator_model_line() -> str:
-    """Render the RUN_SUMMARY 'Evaluator model' line. Returns empty string when no eval
-    has run yet (so the Status block doesn't carry a misleading default before the first
-    iteration completes)."""
+    """Render the RUN_SUMMARY 'Evaluator model' (and cost-limit) Status lines. Returns
+    empty string when no eval has run yet."""
     sel = _evaluator_holder.get("last_selection")
     if not sel:
         return ""
-    return (f"- Evaluator model: {sel.get('model','?')} "
-            f"(tier={sel.get('tier_used','?')}, reason={sel.get('reason','?')!r})\n")
+    model_line = (f"- Evaluator model: {sel.get('model','?')} "
+                  f"(tier={sel.get('tier_used','?')}, reason={sel.get('reason','?')!r})\n")
+    ev = _evaluator_cost_limit_event
+    if ev.get("iteration") is not None:
+        model_line += (
+            f"- Evaluator cost limit: hit at iter {ev['iteration']} "
+            f"(€{ev['cost_eur']:.2f} of €{ev['limit_eur']:.2f}, "
+            f"{ev['tool_calls_made']} tool call(s); last tool: {ev.get('last_tool')!r})\n"
+        )
+    return model_line
 
 # In-memory record of recent eval tool calls + their (truncated) bodies. The recursion-limit
 # handler scans this for findings (console errors, runtime-error dialogs, broken navigation,
@@ -4575,7 +4681,33 @@ async def _stream_subagent(subagent, prompt: str, label: str, recursion_limit: i
     ).__aiter__()
     last_event_time = time.monotonic()
     idle_ticks = 0
+    last_eval_tool: str | None = None
+    eval_tool_call_count = 0
     while True:
+        # Cost-cap enforcement on the evaluator. Checked between events (after each node
+        # update — including any new tool call surfaced — has been processed). Raises
+        # EvaluatorBudgetExhausted; the caller catches and synthesizes a verdict from
+        # whatever evidence has been captured in _eval_tool_history so far.
+        if (label == "eval"
+                and EVALUATOR_COST_LIMITS_ENABLED
+                and _current_evaluator_cost_eur >= EVALUATOR_COST_LIMIT_EUR):
+            TRACE.log("evaluator_cost_limit_exceeded",
+                      cost_eur=round(_current_evaluator_cost_eur, 4),
+                      limit_eur=EVALUATOR_COST_LIMIT_EUR,
+                      tool_calls_made=eval_tool_call_count,
+                      last_tool=last_eval_tool)
+            print(f"\n  EVALUATOR COST LIMIT: €{_current_evaluator_cost_eur:.4f} >= "
+                  f"€{EVALUATOR_COST_LIMIT_EUR:.4f}  (last tool: {last_eval_tool!r}) — "
+                  f"terminating eval and synthesizing verdict from partial evidence.")
+            try:
+                await stream.aclose()
+            except Exception:
+                pass
+            raise EvaluatorBudgetExhausted(
+                cost_eur=_current_evaluator_cost_eur,
+                limit_eur=EVALUATOR_COST_LIMIT_EUR,
+                last_tool=last_eval_tool,
+            )
         try:
             event = await asyncio.wait_for(stream.__anext__(), timeout=interval_s)
         except StopAsyncIteration:
@@ -4608,6 +4740,8 @@ async def _stream_subagent(subagent, prompt: str, label: str, recursion_limit: i
                         if tool_counter is not None:
                             tool_counter[tc["name"]] = tool_counter.get(tc["name"], 0) + 1
                         if label == "eval":
+                            last_eval_tool = tc["name"]
+                            eval_tool_call_count += 1
                             _eval_tool_history.append({
                                 "kind": "call", "tool": tc["name"], "args": tc.get("args", {}),
                             })
@@ -4813,6 +4947,79 @@ def _extract_eval_findings(history: list[dict]) -> dict:
     }
 
 
+def _build_evidence_summary_for_retry(history: list[dict], *,
+                                       max_calls: int = 20,
+                                       per_result_chars: int = 500) -> str:
+    """From the evaluator's tool calls in this invocation, build a concise summary the
+    model can use to write a verdict without re-running tools.
+
+    Used by the empty-notes retry path. The retry's prior failure was "verdict written
+    but NOTES was blank" — the model HAD evidence, just failed to surface it. The fix is
+    to re-show the model what it already gathered and ask it to write findings without
+    making more tool calls.
+
+    Pairs each `call` entry with its following `result` entry (when present) so the
+    summary reads: "browser_console_messages(...) → result body". Truncates each result
+    to `per_result_chars` so the prompt doesn't blow up on console-message dumps.
+    """
+    if not history:
+        return ""
+
+    lines = ["You already gathered the following evidence in this evaluator call:"]
+    # Pair calls with their immediately-following results. The history is recorded in
+    # order: a call event, then a result event with the same tool name.
+    pairs: list[tuple[dict, dict | None]] = []
+    i = 0
+    while i < len(history):
+        entry = history[i]
+        if entry.get("kind") == "call":
+            result = None
+            if i + 1 < len(history) and history[i + 1].get("kind") == "result":
+                result = history[i + 1]
+                i += 2
+            else:
+                i += 1
+            pairs.append((entry, result))
+        else:
+            i += 1
+
+    # Cap pairs from the tail (most-recent — the model's latest observations are usually
+    # the most decision-relevant for verdict writing).
+    if len(pairs) > max_calls:
+        pairs = pairs[-max_calls:]
+        lines.append(f"(showing last {max_calls} of {len(history) // 2 or 1} tool calls)")
+
+    for idx, (call, result) in enumerate(pairs, 1):
+        tool = call.get("tool", "?")
+        args = call.get("args") or {}
+        args_str = _format_args(args) if args else ""
+        # Highlight URLs / paths in args inline so the model can correlate without re-reading.
+        head = f"{idx}. {tool}({args_str})"
+        lines.append(head)
+        if result:
+            body = (result.get("body") or "").strip()
+            if not body:
+                lines.append("   → (empty result)")
+            else:
+                # Single-line preview — collapse newlines to keep the summary readable.
+                body_collapsed = body.replace("\n", " ⏎ ")
+                if len(body_collapsed) > per_result_chars:
+                    body_collapsed = body_collapsed[:per_result_chars] + " …[truncated]"
+                lines.append(f"   → {body_collapsed}")
+        else:
+            lines.append("   → (no result captured — call may not have completed)")
+
+    lines.append("")
+    lines.append(
+        "Write your verdict NOW based on this evidence. Do NOT make additional tool "
+        "calls. If the evidence above shows console errors, runtime-error overlays, "
+        "non-2xx responses, or missing seeded content, your verdict should reflect "
+        "that. If the evidence is genuinely insufficient to make a verification call, "
+        "return verdict=incomplete with that explanation."
+    )
+    return "\n".join(lines)
+
+
 def _format_findings_for_notes(findings_data: dict, *, header: str) -> str:
     """Format extracted findings as multi-line verdict notes.
 
@@ -4932,6 +5139,11 @@ async def evaluator_node(state: State) -> dict:
     # results arrive; the recursion-limit handler reads it to salvage findings into the
     # verdict notes when the eval times out without writing its own verdict block.
     _eval_tool_history.clear()
+    # Reset per-evaluator cost cap counter. _record_cost accumulates into
+    # _current_evaluator_cost_eur on each "eval"-labeled model call; _stream_subagent
+    # checks before each event and raises EvaluatorBudgetExhausted on overrun.
+    global _current_evaluator_cost_eur
+    _current_evaluator_cost_eur = 0.0
 
     plan_doc = state.get("plan") or _empty_plan_doc()
     plan_render = _render_plan_doc(plan_doc)
@@ -5057,6 +5269,16 @@ async def evaluator_node(state: State) -> dict:
                 + base_prompt
             )
         elif last_failure == "empty_notes":
+            # Pull the evidence the model already gathered (tool calls + their results)
+            # and inject it into the retry prompt. The empty-notes failure mode is "model
+            # had observations but didn't transcribe them into NOTES" — without re-feeding
+            # those observations, the retry would either re-run all the tools (waste) or
+            # invent findings (worse). Showing the actual prior outputs back to the model
+            # is the cheap, correct fix.
+            evidence_summary = _build_evidence_summary_for_retry(_eval_tool_history)
+            TRACE.log("evaluator_empty_notes_retry_with_evidence",
+                      evidence_chars=len(evidence_summary),
+                      tool_calls_referenced=sum(1 for h in _eval_tool_history if h.get("kind") == "call"))
             prompt = (
                 f"⚠️  YOUR PRIOR VERDICT HAD EMPTY NOTES (round {empty_notes_retry}/"
                 f"{EVAL_EMPTY_NOTES_RETRY_CAP}).\n\n"
@@ -5065,13 +5287,10 @@ async def evaluator_node(state: State) -> dict:
                 f"each (quoted from your snapshots), what console errors appeared, what "
                 f"happened when nav links were clicked. Verdicts without findings are useless "
                 f"to the next planner pass and are rejected by the harness.\n\n"
-                f"DO NOT gather more data this round. Use what you've already observed. Re-emit "
-                f"the verdict block with NOTES populated from the tool calls you already made. "
-                f"For example, if you navigated to /admin/menu and the page showed an Unhandled "
-                f"Runtime Error overlay with 16 console errors, NOTES should say so explicitly: "
-                f"'/admin/menu shows runtime error overlay; browser_console_messages reported 16 "
-                f"errors'. Cite specific URLs, specific error counts, specific page titles, "
-                f"specific click results.\n\n"
+                + (evidence_summary + "\n\n" if evidence_summary else "")
+                + f"DO NOT make additional tool calls this round. Synthesize NOTES from the "
+                f"evidence above. Cite specific URLs, specific error counts, specific page "
+                f"titles, specific click results.\n\n"
                 + base_prompt
             )
         try:
@@ -5145,6 +5364,53 @@ async def evaluator_node(state: State) -> dict:
             print(f"  NOTES: {_truncate_simple(notes, 400)}")
             _finalize_iteration_summary(state=state, verdict="continue")
             return {"eval_verdict": "continue", "eval_notes": notes}
+        except EvaluatorBudgetExhausted as bex:
+            # Per-evaluator cost cap fired (HARNESS_EVALUATOR_COST_LIMIT_EUR). Synthesize
+            # an incomplete verdict from whatever the evaluator captured before the cap
+            # hit, so the next planner / operator can see what was observed and the run
+            # terminates cleanly without silently burning the whole budget on one stuck
+            # verification flow.
+            findings_data = _extract_eval_findings(_eval_tool_history)
+            tool_call_count = sum(1 for h in _eval_tool_history if h.get("kind") == "call")
+            _evaluator_cost_limit_event.update({
+                "iteration": state["iteration"],
+                "cost_eur": round(bex.cost_eur, 4),
+                "limit_eur": round(bex.limit_eur, 4),
+                "tool_calls_made": tool_call_count,
+                "last_tool": bex.last_tool,
+            })
+            print(f"\n  EVALUATOR COST CAP — synthesizing incomplete verdict from "
+                  f"{tool_call_count} tool call(s).")
+            evidence_lines = []
+            for h in _eval_tool_history:
+                if h.get("kind") != "call":
+                    continue
+                tname = h.get("tool", "?")
+                a = h.get("args") or {}
+                a_str = _format_args(a) if a else ""
+                evidence_lines.append(f"  - {tname}({a_str})")
+            evidence_block = "\n".join(evidence_lines) if evidence_lines else "  (no tool calls completed)"
+            findings_block = _format_findings_for_notes(
+                findings_data,
+                header="Findings extracted from partial tool history:",
+            )
+            notes = (
+                f"[evaluator: cost limit exceeded after €{bex.cost_eur:.4f} of verification "
+                f"(limit €{bex.limit_eur:.4f}, last tool: {bex.last_tool!r})]\n\n"
+                f"Evidence captured before budget exhaustion ({tool_call_count} tool call(s)):\n"
+                f"{evidence_block}\n\n"
+                f"{findings_block}\n\n"
+                f"The verification was incomplete. The builder's work is preserved at the "
+                f"most recent checkpoint. Manual verification recommended:\n"
+                f"  - Review the tool calls listed above to see what was checked.\n"
+                f"  - Retry with HARNESS_EVALUATOR_COST_LIMIT_EUR raised, "
+                f"HARNESS_EVALUATOR_COST_LIMIT_ENABLED=0 to disable, or fix the underlying "
+                f"flow causing the eval to spiral (commonly: broken login, infinite "
+                f"navigate loop, or misconfigured port)."
+            )
+            print(f"  NOTES: {_truncate_simple(notes, 400)}")
+            _finalize_iteration_summary(state=state, verdict="incomplete")
+            return {"eval_verdict": "incomplete", "eval_notes": notes}
         except Exception as e:
             # Defense in depth: any other escape from the eval subagent (tool crash, MCP failure,
             # langchain internal error) shouldn't kill the whole run. Three paths, in order:
@@ -5521,7 +5787,7 @@ def route_after_eval(state: State) -> Literal["planner", "builder", "__end__"]:
     if verdict == "replan":
         return "planner"
     if verdict == "incomplete":
-        # Two distinct paths set verdict=incomplete with very different causes:
+        # Three distinct paths set verdict=incomplete with very different causes:
         #   1. Infra failure — MCP unreachable, transport closed, browser not installed,
         #      DNS broken. Notes start with "INFRASTRUCTURE failure" (set by the eval
         #      exception handler). Manual recovery: restart playwright-mcp, check DNS.
@@ -5529,11 +5795,36 @@ def route_after_eval(state: State) -> Literal["planner", "builder", "__end__"]:
         #      whatever, but emitted empty NOTES across the retry cap. Notes start with
         #      "failed to write actionable NOTES" (set by the empty-notes cap branch).
         #      Infra is fine; manual recovery: read the salvaged findings + screenshots.
+        #   3. Cost cap exhaustion — per-evaluator cost limit hit; eval was terminated
+        #      mid-flight. Notes start with "[evaluator: cost limit exceeded".
         # The diagnostic must distinguish these — telling the user "fix infrastructure"
         # when actually nothing was wrong with infra is a misleading dead-end.
         notes = str(state.get("eval_notes", "(no notes)"))
         is_eval_communication_failure = "failed to write actionable NOTES" in notes
+        is_cost_cap_exhaustion = "[evaluator: cost limit exceeded" in notes
         print(f"\n━━━ Verification incomplete ━━━")
+        if is_cost_cap_exhaustion:
+            ev = _evaluator_cost_limit_event
+            print(f"The evaluator hit the per-invocation cost cap "
+                  f"(€{ev.get('cost_eur', 0):.4f} of €{ev.get('limit_eur', 0):.4f}) and "
+                  f"was terminated to prevent runaway spend.")
+            print(f"Tool calls made before cap: {ev.get('tool_calls_made', 0)}; "
+                  f"last tool: {ev.get('last_tool')!r}")
+            print()
+            print(f"This is a cost-protection termination, not a code or infrastructure "
+                  f"failure. The harness will not retry the builder.")
+            print()
+            print(f"The builder's last work is preserved. To recover:")
+            print(f"  1. Inspect the partial evidence: see the verdict NOTES (logged in")
+            print(f"     RUN_SUMMARY.md) for the tool calls + observations captured before")
+            print(f"     the cap fired.")
+            print(f"  2. If the eval was making real progress and just needed more budget,")
+            print(f"     resume with HARNESS_EVALUATOR_COST_LIMIT_EUR raised.")
+            print(f"  3. If the eval was stuck (e.g., login loop), fix the underlying flow")
+            print(f"     before resuming — raising the cap will just spend more on the same")
+            print(f"     stuck path.")
+            print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            return END
         if is_eval_communication_failure:
             print(f"The evaluator browsed the app but did not communicate findings:")
             print(f"  {_truncate_simple(notes, 500)}")
@@ -5754,6 +6045,26 @@ def _check_service_alias_or_warn() -> None:
         )
 
 
+def _parse_evaluator_tier_arg() -> str | None:
+    """Inline parser for --evaluator-tier {cheap|strong|auto}. Removes both tokens from
+    sys.argv. Returns the tier string when present, else None. Errors out (sys.exit) on
+    `--evaluator-tier` with no value or with an unknown value."""
+    if "--evaluator-tier" not in sys.argv:
+        return None
+    idx = sys.argv.index("--evaluator-tier")
+    if idx + 1 >= len(sys.argv):
+        print("ERROR: --evaluator-tier requires a value (cheap|strong|auto).",
+              file=sys.stderr)
+        sys.exit(2)
+    val = sys.argv[idx + 1].strip().lower()
+    if val not in ("cheap", "strong", "auto"):
+        print(f"ERROR: --evaluator-tier value must be one of cheap|strong|auto "
+              f"(got {val!r}).", file=sys.stderr)
+        sys.exit(2)
+    del sys.argv[idx:idx + 2]
+    return val
+
+
 def _parse_resume_arg() -> str | None:
     """Inline parser for --resume <run-id>. Removes both tokens from sys.argv. Returns
     the run_id string when present, else None. Errors out (sys.exit) on `--resume` with
@@ -5943,10 +6254,14 @@ async def main():
     # Inline arg parsing — argparse would be overkill for two bool/string flags. Env vars
     # HARNESS_GIT_CHECKPOINTS=0 / RESUME_ENABLED=0 take precedence over the matching CLI
     # flags (see top-of-file constants).
-    global ENABLE_GIT_CHECKPOINTS
+    global ENABLE_GIT_CHECKPOINTS, EVALUATOR_TIER, _evaluator_tier_source
     if "--no-checkpoint" in sys.argv:
         ENABLE_GIT_CHECKPOINTS = False
         sys.argv.remove("--no-checkpoint")
+    cli_tier = _parse_evaluator_tier_arg()
+    if cli_tier is not None:
+        EVALUATOR_TIER = cli_tier
+        _evaluator_tier_source = "cli"
     resume_run_id = _parse_resume_arg()
     prompt_input_args = _parse_prompt_input_args()
     if prompt_input_args and resume_run_id:
