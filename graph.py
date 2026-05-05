@@ -174,6 +174,37 @@ EVAL_RETRY_EMPTY_NOTES_ON_CHEAP = (
     os.environ.get("HARNESS_EVAL_RETRY_EMPTY_NOTES_ON_CHEAP", "0") not in ("0", "", "false", "False")
 )
 
+# Per-evaluator-LLM generation knobs. Apply ONLY to the evaluator's LLM (constructed via
+# _make_llm_for_model and the cheap-tier evaluator_llm global). The builder's LLM is
+# untouched — code generation tends to suffer at low temperature, and reasoning on a
+# coding model is slow without quality bump on tool-call decisions.
+#
+# Why these matter for the evaluator: live traces showed Kimi K2.6 at the SDK default
+# (temperature ≈ 0.7, no reasoning, max_tokens ≈ 1024) doing exploratory verification
+# (multiple snapshots, mid-flow pivots, redundant console_messages). Lower temperature +
+# reasoning bias toward "plan the verification, then execute" rather than "explore, then
+# decide what's relevant." Higher max_tokens lets the verdict block actually fit.
+#
+# Defaults are chosen to apply unobtrusively: 0.2 not 0 (some sampling latitude), 4000
+# (matches Anthropic eval max_tokens), reasoning effort "medium" (silently ignored on
+# unsupported OpenRouter models per OpenRouter's universal-reasoning spec; Anthropic
+# thinking stays off by default — see HARNESS_EVAL_ANTHROPIC_THINKING_BUDGET).
+EVAL_TEMPERATURE = os.environ.get("HARNESS_EVAL_TEMPERATURE", "0.2").strip()
+EVAL_MAX_TOKENS = os.environ.get("HARNESS_EVAL_MAX_TOKENS", "4000").strip()
+# OpenRouter Universal Reasoning effort. Always on for eval — empty / invalid values
+# fall back to "medium". OpenRouter silently ignores `reasoning` on models that don't
+# support it (per their reasoning-tokens spec), so it's safe to set unconditionally.
+# Accepted values: minimal | low | medium | high (per OpenRouter docs at
+# openrouter.ai/docs/api/reference/responses/reasoning). Lights up Kimi K2.x, DeepSeek,
+# GPT-OSS, OpenAI o-series, and similar reasoning-capable models.
+_eval_re_raw = os.environ.get("HARNESS_EVAL_REASONING_EFFORT", "medium").strip().lower()
+EVAL_REASONING_EFFORT = _eval_re_raw if _eval_re_raw in ("minimal", "low", "medium", "high") else "medium"
+# Anthropic extended thinking budget (tokens). Off by default — Anthropic's thinking
+# parameter has constraints around temperature (recommendation: temperature=1.0 with
+# thinking) and we don't want to surprise existing runs with cost or behavior changes.
+# To enable on Anthropic eval: set this to a positive integer (e.g. 4000).
+EVAL_ANTHROPIC_THINKING_BUDGET = os.environ.get("HARNESS_EVAL_ANTHROPIC_THINKING_BUDGET", "").strip()
+
 # Heartbeat thresholds per subagent label. The evaluator routinely takes 30-60s to compose
 # its verdict block (natural-language synthesis over many tool observations) — the 20s
 # default fired idle warnings spuriously and could mask real progress. Eval gets the longer
@@ -3539,7 +3570,7 @@ def _check_stuck(state: "BuilderState") -> str | None:
 # ────────────────────────── LLMs ──────────────────────────
 
 
-def _openrouter_llm(model: str) -> ChatOpenAI:
+def _openrouter_llm(model: str, *, for_eval: bool = False) -> ChatOpenAI:
     """Build a ChatOpenAI pointed at OpenRouter (or any OpenAI-compat endpoint).
 
     Provider routing knobs (OpenRouter only):
@@ -3547,9 +3578,14 @@ def _openrouter_llm(model: str) -> ChatOpenAI:
     - OPENROUTER_IGNORE_PROVIDERS=x  excludes specific providers (e.g. parasail) without pinning;
                                      other providers are still tried via fallbacks.
     Both can be combined: order pins primary, ignore blocks bad ones from the fallback set.
+
+    `for_eval=True` applies the per-evaluator generation knobs (HARNESS_EVAL_TEMPERATURE,
+    HARNESS_EVAL_MAX_TOKENS, HARNESS_EVAL_REASONING_EFFORT). Builder calls leave it False
+    so they keep SDK defaults — code generation suffers at low temperature.
     """
     base = os.environ.get("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
     extra: dict = {}
+    extra_body: dict = {}
     if "openrouter" in base:
         provider_cfg: dict = {"require_parameters": True, "allow_fallbacks": True}
         pinned = os.environ.get("OPENROUTER_PROVIDERS", "").strip()
@@ -3559,14 +3595,35 @@ def _openrouter_llm(model: str) -> ChatOpenAI:
         ignored = os.environ.get("OPENROUTER_IGNORE_PROVIDERS", "").strip()
         if ignored:
             provider_cfg["ignore"] = [p.strip() for p in ignored.split(",") if p.strip()]
-        extra["extra_body"] = {"provider": provider_cfg}
-    return ChatOpenAI(
-        model=model,
-        base_url=base,
-        api_key=os.environ.get("OPENAI_API_KEY", "sk-no-key-required"),
-        stream_chunk_timeout=STREAM_CHUNK_TIMEOUT_SECONDS,
+        extra_body["provider"] = provider_cfg
+        # OpenRouter Universal Reasoning. The `reasoning` field is silently ignored on
+        # models that don't support reasoning (per OpenRouter spec), so it's safe to
+        # set unconditionally on eval calls. EVAL_REASONING_EFFORT is normalized to a
+        # valid effort level at module load — empty/invalid → "medium".
+        if for_eval:
+            extra_body["reasoning"] = {"effort": EVAL_REASONING_EFFORT}
+    if extra_body:
+        extra["extra_body"] = extra_body
+
+    kwargs: dict = {
+        "model": model,
+        "base_url": base,
+        "api_key": os.environ.get("OPENAI_API_KEY", "sk-no-key-required"),
+        "stream_chunk_timeout": STREAM_CHUNK_TIMEOUT_SECONDS,
         **extra,
-    )
+    }
+    if for_eval:
+        if EVAL_TEMPERATURE:
+            try:
+                kwargs["temperature"] = float(EVAL_TEMPERATURE)
+            except ValueError:
+                pass  # invalid → leave at SDK default
+        if EVAL_MAX_TOKENS:
+            try:
+                kwargs["max_tokens"] = int(EVAL_MAX_TOKENS)
+            except ValueError:
+                pass
+    return ChatOpenAI(**kwargs)
 
 
 planner_llm = ChatAnthropic(
@@ -3585,7 +3642,7 @@ builder_llm = _openrouter_llm(os.environ.get("BUILDER_MODEL", "qwen/qwen3-coder-
 # global is used by _select_evaluator_model when the chosen tier is "cheap" (and no
 # explicit override was set), and is the backstop fallback when the selector returns
 # the same builder model.
-evaluator_llm = _openrouter_llm(os.environ.get("EVAL_MODEL", "qwen/qwen3.6-27b"))
+evaluator_llm = _openrouter_llm(os.environ.get("EVAL_MODEL", "qwen/qwen3.6-27b"), for_eval=True)
 
 
 def _make_llm_for_model(model_id: str):
@@ -3603,8 +3660,30 @@ def _make_llm_for_model(model_id: str):
     if slug.startswith("claude-") or "anthropic/" in slug:
         # Strip the optional "anthropic/" prefix that some configs use.
         clean = slug.split("/", 1)[-1] if "/" in slug else slug
-        return ChatAnthropic(model=clean, max_tokens=4000)
-    return _openrouter_llm(slug)
+        anth_kwargs: dict = {"model": clean}
+        # max_tokens: HARNESS_EVAL_MAX_TOKENS, default 4000.
+        try:
+            anth_kwargs["max_tokens"] = int(EVAL_MAX_TOKENS) if EVAL_MAX_TOKENS else 4000
+        except ValueError:
+            anth_kwargs["max_tokens"] = 4000
+        # Anthropic extended thinking. Off by default — opt-in via
+        # HARNESS_EVAL_ANTHROPIC_THINKING_BUDGET (positive integer = budget tokens).
+        # When thinking is enabled, leave temperature unset (Anthropic recommendation).
+        thinking_budget = 0
+        if EVAL_ANTHROPIC_THINKING_BUDGET:
+            try:
+                thinking_budget = int(EVAL_ANTHROPIC_THINKING_BUDGET)
+            except ValueError:
+                thinking_budget = 0
+        if thinking_budget > 0:
+            anth_kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
+        elif EVAL_TEMPERATURE:
+            try:
+                anth_kwargs["temperature"] = float(EVAL_TEMPERATURE)
+            except ValueError:
+                pass
+        return ChatAnthropic(**anth_kwargs)
+    return _openrouter_llm(slug, for_eval=True)
 
 
 _PROMPT_TIER_MARKER_RE = re.compile(
