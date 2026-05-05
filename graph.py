@@ -230,6 +230,12 @@ DESIGNS_BUILDER_VISION_REQUIRED = os.environ.get("HARNESS_DESIGNS_BUILDER_VISION
 DESIGNS_EVALUATOR_VISION_REQUIRED = os.environ.get("HARNESS_DESIGNS_EVALUATOR_VISION", "1") != "0"
 DESIGNS_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 DESIGNS_NOTES_EXTENSION = ".md"
+# HTML/CSS designs (single-file mockups). The harness reads the file as text and
+# inlines it into role contexts the same way notes are inlined — every role can
+# read HTML/CSS regardless of vision capability. A companion `<basename>.css` is
+# auto-attached when `<basename>.html` is present.
+DESIGNS_MARKUP_EXTENSIONS = (".html", ".htm")
+DESIGNS_STYLESHEET_EXTENSION = ".css"
 DESIGNS_UNSUPPORTED_EXTENSIONS = (".fig", ".sketch", ".pdf", ".xd", ".ai", ".psd", ".svg")
 
 # Models with vision input. Substring-matched lowercase against slug. Conservative —
@@ -287,17 +293,21 @@ def _scan_designs_folder(workspace_path) -> dict:
         return out
     if not folder.exists() or not folder.is_dir():
         return out
+    def _new_slot(base: str) -> dict:
+        return {
+            "basename": base, "image_path": None, "notes_path": None,
+            "html_path": None, "css_path": None,
+            "image_size_bytes": None, "format": None,
+        }
+
     by_base: dict[str, dict] = {}
     for entry in sorted(folder.iterdir()):
         if not entry.is_file():
             continue
-        name = entry.name
         ext = entry.suffix.lower()
         base = entry.stem
         if ext in DESIGNS_IMAGE_EXTENSIONS:
-            slot = by_base.setdefault(base, {"basename": base, "image_path": None,
-                                             "notes_path": None, "image_size_bytes": None,
-                                             "format": None})
+            slot = by_base.setdefault(base, _new_slot(base))
             slot["image_path"] = str(entry)
             slot["format"] = ext.lstrip(".")
             try:
@@ -305,10 +315,19 @@ def _scan_designs_folder(workspace_path) -> dict:
             except OSError:
                 pass
         elif ext == DESIGNS_NOTES_EXTENSION:
-            slot = by_base.setdefault(base, {"basename": base, "image_path": None,
-                                             "notes_path": None, "image_size_bytes": None,
-                                             "format": None})
+            slot = by_base.setdefault(base, _new_slot(base))
             slot["notes_path"] = str(entry)
+        elif ext in DESIGNS_MARKUP_EXTENSIONS:
+            slot = by_base.setdefault(base, _new_slot(base))
+            slot["html_path"] = str(entry)
+            if not slot.get("format"):
+                slot["format"] = "html"
+        elif ext == DESIGNS_STYLESHEET_EXTENSION:
+            # Companion stylesheet: only attached if a same-basename slot already exists
+            # OR a future entry creates one. We default-create the slot — a lone .css
+            # without an .html sibling is still a valid (if minimal) design ref.
+            slot = by_base.setdefault(base, _new_slot(base))
+            slot["css_path"] = str(entry)
         elif ext in DESIGNS_UNSUPPORTED_EXTENSIONS:
             out["unsupported"].append(str(entry))
         # Files with other extensions are silently ignored (e.g., .DS_Store, README.md
@@ -336,12 +355,14 @@ def _load_design_for_role(basename: str, designs_manifest: list[dict],
     payload = {
         "basename": basename, "found": False, "image_b64": None,
         "image_format": None, "notes_text": None, "fallback_description": None,
+        "html_text": None, "css_text": None,
     }
     entry = next((m for m in designs_manifest if m.get("basename") == basename), None)
     if not entry:
         payload["fallback_description"] = (
-            f"design ref '{basename}' is not present in designs/ — neither image nor notes "
-            f"available. Implement based on plan task description and surrounding context."
+            f"design ref '{basename}' is not present in designs/ — neither image, HTML, "
+            f"nor notes available. Implement based on plan task description and "
+            f"surrounding context."
         )
         return payload
     payload["found"] = True
@@ -352,6 +373,20 @@ def _load_design_for_role(basename: str, designs_manifest: list[dict],
                 payload["notes_text"] = f.read()
         except OSError:
             pass
+    # HTML mockup (always loadable — text content; every role can read it)
+    if entry.get("html_path"):
+        try:
+            with open(entry["html_path"], "r", encoding="utf-8", errors="replace") as f:
+                payload["html_text"] = f.read()
+        except OSError:
+            pass
+    # Companion CSS (always loadable — text content)
+    if entry.get("css_path"):
+        try:
+            with open(entry["css_path"], "r", encoding="utf-8", errors="replace") as f:
+                payload["css_text"] = f.read()
+        except OSError:
+            pass
     # Image (only when role has vision)
     if role_has_vision and entry.get("image_path"):
         try:
@@ -360,16 +395,16 @@ def _load_design_for_role(basename: str, designs_manifest: list[dict],
             payload["image_format"] = entry.get("format") or Path(entry["image_path"]).suffix.lstrip(".").lower()
         except OSError:
             pass
-    if payload["image_b64"] is None and not payload["notes_text"]:
-        # Image exists but role has no vision, and no notes file. Provide a textual stub
-        # so the role at least knows the design exists by name + dimensions.
+    has_textual_content = bool(payload["notes_text"] or payload["html_text"] or payload["css_text"])
+    if payload["image_b64"] is None and not has_textual_content:
+        # Image exists but role has no vision AND no textual artifact (notes/html/css).
         size = entry.get("image_size_bytes")
         size_str = f"{size} bytes" if size else "unknown size"
         payload["fallback_description"] = (
             f"design '{basename}' exists as {entry.get('format', 'image')} ({size_str}) but "
-            f"this role lacks vision capability and no .md notes file is provided. Implement "
-            f"based on the plan task description and route name; flag any ambiguity in your "
-            f"task summary."
+            f"this role lacks vision capability and no .md/.html notes are provided. "
+            f"Implement based on the plan task description and route name; flag any "
+            f"ambiguity in your task summary."
         )
     return payload
 
@@ -377,7 +412,8 @@ def _load_design_for_role(basename: str, designs_manifest: list[dict],
 def _format_design_block_for_text(payload: dict) -> str:
     """Render one design payload as a text block suitable for inlining in a role's
     system message. Image content is referenced by basename (the actual image bytes
-    are passed separately as a multimodal content block when supported).
+    are passed separately as a multimodal content block when supported). HTML/CSS
+    are inlined as text — every role can read them regardless of vision capability.
     """
     parts = [f"=== {payload['basename']} ==="]
     if payload.get("image_b64"):
@@ -386,6 +422,10 @@ def _format_design_block_for_text(payload: dict) -> str:
         parts.append(f"[image: {payload['fallback_description']}]")
     if payload.get("notes_text"):
         parts.append(f"\n--- notes ---\n{payload['notes_text']}\n--- end notes ---")
+    if payload.get("html_text"):
+        parts.append(f"\n--- html ({payload['basename']}.html) ---\n{payload['html_text']}\n--- end html ---")
+    if payload.get("css_text"):
+        parts.append(f"\n--- css ({payload['basename']}.css) ---\n{payload['css_text']}\n--- end css ---")
     parts.append(f"=== end {payload['basename']} ===")
     return "\n".join(parts)
 
