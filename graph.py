@@ -200,19 +200,32 @@ EVAL_MAX_TOKENS = os.environ.get("HARNESS_EVAL_MAX_TOKENS", "4000").strip()
 _eval_re_raw = os.environ.get("HARNESS_EVAL_REASONING_EFFORT", "medium").strip().lower()
 EVAL_REASONING_EFFORT = _eval_re_raw if _eval_re_raw in ("minimal", "low", "medium", "high") else "medium"
 
-# Models known to accept the OpenRouter `reasoning` parameter. Substring-matched
-# against the slug. Setting `reasoning` on a non-reasoning model causes a 404
-# from OpenRouter's provider router ("No endpoints found that can handle the
-# requested parameters") because `provider.require_parameters: true` blocks
-# silent-drop routing — observed live with deepseek/deepseek-v3.2 (chat).
-# Conservative list — add slugs only when confirmed reasoning-capable.
+# Models known to accept the OpenRouter `reasoning` parameter alongside tool_calls
+# and provider.require_parameters=true. Substring-matched against the slug
+# (lowercased). Conservative list — has been narrowed twice after live failures.
+#
+# Setting `reasoning` on a model whose OpenRouter providers don't accept it causes:
+#   404 - {'error': {'message': 'No endpoints found that can handle the requested
+#   parameters', 'code': 404}}
+# because `provider.require_parameters: true` (which we always set so tool_calls
+# route to capable providers) blocks silent-drop routing.
+#
+# Confirmed-failing patterns — DO NOT re-add without re-testing:
+#   - "kimi-k2"           — matches K2.6 (chat/multimodal) which 404s. Only the
+#                           explicit `kimi-k2-thinking` variant is confirmed.
+#   - "deepseek-v3.2"     — 404s. Use deepseek-r1 / r1-0528 for reasoning.
 REASONING_CAPABLE_SLUG_PATTERNS = (
-    "kimi-k2",          # All Moonshot K2 variants per OpenRouter's K2.6 page (multimodal + thinking)
-    "deepseek-r1",      # R1 family — explicit reasoning models
-    "deepseek-v3.2-speciale",  # Speciale = thinking variant
-    "gpt-oss",          # OpenAI GPT-OSS reasoning models on OpenRouter
-    "/o1", "/o3", "/o4-mini",  # OpenAI o-series via OpenRouter (anchored on `/` to avoid spurious matches)
+    "kimi-k2-thinking",     # Moonshot's explicit reasoning variant
+    "deepseek-r1",           # DeepSeek R1 family — matches r1, r1-0528, etc.
+    "/o1", "/o3", "/o4-mini",  # OpenAI o-series (anchored on `/` to avoid matching e.g. "...01")
 )
+
+# Master off-switch. Set HARNESS_EVAL_REASONING_OFF=1 to skip the `reasoning`
+# parameter entirely on every eval call regardless of slug — useful when:
+#   - testing a new model where you're not sure if reasoning works
+#   - debugging unrelated 404s and want to rule out the reasoning path
+#   - cost-tuning (reasoning tokens are billed)
+EVAL_REASONING_OFF = os.environ.get("HARNESS_EVAL_REASONING_OFF", "0").strip().lower() in ("1", "true", "yes")
 
 
 def _slug_supports_reasoning(slug: str) -> bool:
@@ -220,7 +233,7 @@ def _slug_supports_reasoning(slug: str) -> bool:
     the OpenRouter `reasoning` parameter — non-reasoning models 404 if the param
     is set together with provider.require_parameters=true.
     """
-    if not slug:
+    if not slug or EVAL_REASONING_OFF:
         return False
     s = slug.lower()
     return any(p in s for p in REASONING_CAPABLE_SLUG_PATTERNS)
