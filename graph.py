@@ -105,6 +105,27 @@ EVAL_RECURSION_LIMIT = 100
 # extract findings from a budget-overrun run. Cleared at the top of each eval iteration.
 EVAL_TOOL_HISTORY_FOR_FINDINGS = 30
 
+# MCP transport recovery. Long evaluator runs (the new persistent-session model means a
+# single SSE connection lives for the entire run) drop transport occasionally — peer-side
+# disconnect, network blip, MCP-side resource exhaustion. Without recovery, every drop
+# routed to verdict=incomplete and terminated the run. The recovery flow attempts a fresh
+# session before giving up: wait, reconnect, resume the eval. After exhausting retries the
+# original incomplete path still fires, so we fail no worse than before.
+MCP_RECOVERY_ENABLED = os.environ.get("MCP_RECOVERY_ENABLED", "1").lower() not in ("0", "false", "no", "")
+MCP_RECOVERY_WAIT_SECONDS = int(os.environ.get("MCP_RECOVERY_WAIT_SECONDS", "10"))
+MCP_RECOVERY_MAX_RETRIES = int(os.environ.get("MCP_RECOVERY_MAX_RETRIES", "3"))
+# Patterns identifying transport-level failures eligible for recovery. Subset of (and
+# distinct purpose from) EVAL_INCOMPLETE_EXCEPTION_PATTERNS — these intercept BEFORE the
+# pattern-match-to-incomplete path so the recovery handler runs first. Patterns left in
+# EVAL_INCOMPLETE_EXCEPTION_PATTERNS still fire after recovery exhaustion, preserving the
+# existing terminal behavior.
+MCP_TRANSPORT_ERROR_PATTERNS = [
+    "ClosedResourceError",
+    "BrokenResourceError",
+    "send_nowait",
+    "MCP transport",
+]
+
 # Eval skipping when an iteration touched no UI files. Browser-based verification is the
 # dominant cost on long runs (50+ Sonnet tool calls per eval). Many iterations don't change
 # the rendered UI at all — type-error fixes, server-side refactors, build-system tweaks,
@@ -3797,6 +3818,43 @@ async def _close_evaluator_mcp_session() -> None:
         _evaluator_holder["mcp_session"] = None
 
 
+async def _reconnect_evaluator_mcp_session() -> None:
+    """Tear down the dead MCP session + agent and rebuild from scratch.
+
+    Call when the persistent SSE session has died mid-eval (peer disconnect, network blip,
+    MCP-side resource exhaustion). Best-effort cleanup of the dead session; build_evaluator_
+    subagent does the rebuild and re-binds tools to a fresh session. The OLD agent is dropped
+    because its tools are bound to the dead session.
+
+    Raises whatever build_evaluator_subagent raises if the reconnect itself fails — the
+    caller (recovery loop) catches and retries with backoff."""
+    # Best-effort close of the dead session. The session_cm's __aexit__ may itself raise
+    # ClosedResourceError or similar — that's expected; the session is already dead. We
+    # just want to stop tracking it.
+    cm = _evaluator_holder.get("mcp_session_cm")
+    if cm is not None:
+        try:
+            await cm.__aexit__(None, None, None)
+        except Exception:
+            pass
+    _evaluator_holder["mcp_session_cm"] = None
+    _evaluator_holder["mcp_session"] = None
+    # Drop the old agent — its tools are bound to the dead session and would fail on
+    # the next call. build_evaluator_subagent constructs a new agent with new tools.
+    _evaluator_holder["agent"] = None
+    _evaluator_holder["agent"] = await build_evaluator_subagent()
+
+
+def _is_mcp_transport_error(err_str: str) -> bool:
+    """True if the exception message matches a known transport-failure pattern. Used by
+    the recovery handler to decide whether to attempt reconnect or fall through to the
+    incomplete-verdict path immediately."""
+    if not err_str:
+        return False
+    lc = err_str.lower()
+    return any(p.lower() in lc for p in MCP_TRANSPORT_ERROR_PATTERNS)
+
+
 def _tool_msg_content_str(content) -> str:
     """Normalize a langchain ToolMessage.content for display + logging.
 
@@ -4270,14 +4328,33 @@ async def evaluator_node(state: State) -> dict:
     #     already accepted them.
     evidence_retry = 0
     empty_notes_retry = 0
-    last_failure: str | None = None  # "evidence" | "empty_notes" | None
+    # mcp_recovery_attempt counts transport-recovery rounds within this iteration. Reset
+    # per evaluator_node call. mcp_just_recovered is a one-shot flag that gates the post-
+    # recovery preamble injection on the next prompt build.
+    mcp_recovery_attempt = 0
+    mcp_just_recovered = False
+    last_failure: str | None = None  # "evidence" | "empty_notes" | "mcp_recovered" | None
     text = ""
     verdict = "continue"
     notes = ""
     tool_counter: dict = {}
     while True:
         prompt = base_prompt
-        if last_failure == "evidence":
+        if mcp_just_recovered:
+            prompt = (
+                f"⚠️  HARNESS NOTICE: the Playwright MCP transport was disconnected and the "
+                f"harness reconnected to a fresh session (recovery round "
+                f"{mcp_recovery_attempt}/{MCP_RECOVERY_MAX_RETRIES}).\n\n"
+                f"Browser state has been reset. The current page is likely about:blank, the "
+                f"console-messages buffer is empty, and any in-progress click/type chain needs "
+                f"to restart from the beginning. Re-navigate to the URL you were verifying, "
+                f"continue the verification protocol from the last completed step, and re-emit "
+                f"your verdict.\n\n"
+                + base_prompt
+            )
+            mcp_just_recovered = False
+            last_failure = "mcp_recovered"
+        elif last_failure == "evidence":
             shortfall = _eval_evidence_shortfall(tool_counter)
             prompt = (
                 f"⚠️  YOUR PRIOR VERDICT WAS REJECTED BY THE HARNESS (round {evidence_retry}/"
@@ -4343,22 +4420,79 @@ async def evaluator_node(state: State) -> dict:
             return {"eval_verdict": "continue", "eval_notes": notes}
         except Exception as e:
             # Defense in depth: any other escape from the eval subagent (tool crash, MCP failure,
-            # langchain internal error) shouldn't kill the whole run. Two paths:
-            #   1. MCP / Playwright / browser-launch failure (infrastructure) → verdict=incomplete.
-            #      The builder can't fix this; route_after_eval terminates the run with a
-            #      diagnostic so the operator rebuilds containers / checks the MCP transport.
-            #   2. Anything else → verdict=continue (existing behavior).
+            # langchain internal error) shouldn't kill the whole run. Three paths, in order:
+            #   1. MCP transport disconnect (ClosedResourceError, BrokenResourceError, etc.)
+            #      → recovery loop: wait + reconnect + resume the eval. After
+            #      MCP_RECOVERY_MAX_RETRIES failed reconnects, fall through to (2).
+            #   2. MCP / Playwright / browser-launch failure (infrastructure) →
+            #      verdict=incomplete; route_after_eval terminates with a diagnostic.
+            #   3. Anything else → verdict=continue.
             # Grep with: jq -c 'select(.kind == "evaluator_exception")' workspace/.trace/*.jsonl
             import traceback
             tb = traceback.format_exc()
             err_str = str(e)
             err_lc = err_str.lower()
+            TRACE.log("evaluator_exception", error_type=type(e).__name__,
+                      error=err_str[:500], traceback=tb[-2000:])
+
+            # Path 1: transport recovery (intercepts before the pattern-match-to-incomplete
+            # path). Patterns ALSO live in EVAL_INCOMPLETE_EXCEPTION_PATTERNS so that after
+            # recovery exhaustion the existing terminal flow still fires unchanged.
+            #
+            # Loop structure: keep attempting reconnect with exponential backoff until
+            # either (a) reconnect succeeds → restart the outer eval loop with a recovery
+            # preamble, or (b) MCP_RECOVERY_MAX_RETRIES exhausted → fall through to the
+            # pattern-match incomplete path. The wait grows: 10s, 20s, 40s by default.
+            if MCP_RECOVERY_ENABLED and _is_mcp_transport_error(err_str):
+                last_reconn_err: Exception | None = None
+                while mcp_recovery_attempt < MCP_RECOVERY_MAX_RETRIES:
+                    wait_s = MCP_RECOVERY_WAIT_SECONDS * (2 ** mcp_recovery_attempt)
+                    TRACE.log("mcp_transport_died",
+                              attempt=mcp_recovery_attempt + 1,
+                              retry_cap=MCP_RECOVERY_MAX_RETRIES,
+                              error_type=type(e).__name__,
+                              error=err_str[:500],
+                              wait_seconds=wait_s,
+                              previous_reconnect_error=(str(last_reconn_err)[:200]
+                                                        if last_reconn_err else None))
+                    print(f"\n  MCP TRANSPORT DIED ({type(e).__name__}); waiting {wait_s}s "
+                          f"then attempting recovery (round {mcp_recovery_attempt + 1}/"
+                          f"{MCP_RECOVERY_MAX_RETRIES})...")
+                    await asyncio.sleep(wait_s)
+                    try:
+                        await _reconnect_evaluator_mcp_session()
+                        TRACE.log("mcp_transport_recovered",
+                                  attempt=mcp_recovery_attempt + 1)
+                        print(f"  MCP RECOVERED on attempt {mcp_recovery_attempt + 1}; "
+                              f"resuming eval with reset browser state.")
+                        mcp_recovery_attempt += 1
+                        mcp_just_recovered = True
+                        break
+                    except Exception as reconn_err:
+                        TRACE.log("mcp_reconnect_failed",
+                                  attempt=mcp_recovery_attempt + 1,
+                                  retry_cap=MCP_RECOVERY_MAX_RETRIES,
+                                  error_type=type(reconn_err).__name__,
+                                  error=str(reconn_err)[:500])
+                        print(f"  MCP RECOVERY FAILED on attempt "
+                              f"{mcp_recovery_attempt + 1}: "
+                              f"{type(reconn_err).__name__}: {str(reconn_err)[:200]}")
+                        mcp_recovery_attempt += 1
+                        last_reconn_err = reconn_err
+                if mcp_just_recovered:
+                    continue  # restart outer eval loop with the recovery preamble
+                # Recovery exhausted — log and fall through to incomplete path below.
+                TRACE.log("mcp_recovery_exhausted",
+                          total_attempts=mcp_recovery_attempt,
+                          last_reconnect_error=(str(last_reconn_err)[:500]
+                                                if last_reconn_err else None))
+                print(f"  MCP recovery exhausted after {mcp_recovery_attempt} "
+                      f"attempts; routing to verdict=incomplete.")
+
             matched = next(
                 (p for p in EVAL_INCOMPLETE_EXCEPTION_PATTERNS if p.lower() in err_lc),
                 None,
             )
-            TRACE.log("evaluator_exception", error_type=type(e).__name__,
-                      error=err_str[:500], traceback=tb[-2000:])
             if matched:
                 TRACE.log("evaluator_verdict_incomplete_due_to_infrastructure",
                           matched_pattern=matched,
