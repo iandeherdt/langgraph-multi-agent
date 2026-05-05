@@ -2,6 +2,8 @@
 
 A LangGraph harness for **validating open-weight LLMs as agentic coding agents**, with the eventual target of running everything locally on a 32 GB AMD R9700 (or dual-R9700). Built to test whether a model can drive a full multi-file project end-to-end without thrashing.
 
+Long runs (1-2h, 10-30 iterations) are first-class: per-iteration git commits to a per-run branch, a structured `RUN_SUMMARY.md` updated continuously, cost tracking by model, eval-skip on non-UI iterations, MCP transport recovery, and `./run.sh --resume <run-id>` to continue an interrupted run from where it stopped.
+
 ## Architecture
 
 Two layers of state machines.
@@ -42,6 +44,20 @@ START → model → tools → [router] → model | END
 
 **Screenshot inspection:** the playwright-mcp container's `/tmp/.playwright-mcp/` is bind-mounted to `workspace/.playwright-mcp/` on the host. Screenshots, snapshot YAMLs, and console-message dumps from the evaluator land there in real time and are readable from your Mac without `docker cp`.
 
+## Run artifacts
+
+A long run (1-2h, 10-30 iterations) produces several artifacts. They're complementary, not redundant:
+
+| Artifact | Path | Purpose |
+|---|---|---|
+| **JSONL trace** | `workspace/.trace/<UTC>-<slug>.jsonl` | Machine-readable event log. Every tool call, tool result, model retry, verdict, cost, etc. The source of truth for `jq` analysis but unwieldy to read by hand on long runs. |
+| **RUN_SUMMARY.md** | `workspace/.harness/RUN_SUMMARY.md` | Human-readable structured summary, updated after every iteration. Status, iteration history with one-line summaries, cost, open concerns, next planned actions, resume command. The builder reads this as `# PREVIOUS RUN STATE` on iter ≥ 2 — replaces dragging the trace through context. |
+| **Per-run git branch** | `harness-run-<UTC>` in the workspace git repo | One commit per iteration with verdict-aware metadata. Review with `git -C workspace log harness-run-<UTC> --oneline`; diff the run end-to-end with `git -C workspace diff <init-commit> harness-run-<UTC>`. |
+| **state.json** | `workspace/.harness/<run-id>/state.json` | Per-run resume snapshot. Loaded by `./run.sh --resume <run-id>` (see Resume section). |
+| **Screenshots** | `workspace/.playwright-mcp/` | Real-time screenshots, snapshot YAMLs, console-message dumps from the evaluator's MCP browser tools. Readable from your host without `docker cp`. |
+
+The git branch + RUN_SUMMARY.md are both gitignored at the workspace level (the workspace gitignore excludes `.trace/`, `.servers/`, `.playwright-mcp/`, `.harness/`, `__pycache__/`, `*.pyc`). Project-specific `.gitignore`s under `<project>/.gitignore` get merged automatically.
+
 ## Quick start
 
 ```bash
@@ -75,6 +91,13 @@ All in `.env`:
 | `OPENROUTER_IGNORE_PROVIDERS` | Comma-separated providers to exclude (other providers still tried) | (unset) |
 | `PLAYWRIGHT_MCP_URL` | MCP server SSE URL | `http://playwright-mcp:8931/sse` |
 | `STREAM_CHUNK_TIMEOUT_SECONDS` | Per-chunk model-stream timeout (seconds) | `60` |
+| `HARNESS_GIT_CHECKPOINTS` | Per-iteration git commits to a per-run branch | `1` |
+| `HARNESS_COST_CCY` | Currency for cost summaries (`EUR` or `USD`) | `EUR` |
+| `EVAL_SKIP_ENABLED` | Skip browser eval on iterations that touched no UI files | `1` |
+| `MCP_RECOVERY_ENABLED` | Reconnect Playwright MCP after transport drops | `1` |
+| `MCP_RECOVERY_WAIT_SECONDS` | Initial backoff before MCP reconnect attempts | `10` |
+| `MCP_RECOVERY_MAX_RETRIES` | MCP reconnect attempts before giving up | `3` |
+| `RESUME_ENABLED` | Persist `state.json` per iteration; surface in-progress runs | `1` |
 
 OpenRouter routes flakily for tool-calling on some providers (the model returns native XML format, the provider doesn't translate it back). If you see broken tool calls, find a working provider in your OpenRouter activity log and pin via `OPENROUTER_PROVIDERS=...`. To exclude a single bad provider without pinning everything, use `OPENROUTER_IGNORE_PROVIDERS=parasail` (etc.) — the rest of the fallback set still runs.
 
@@ -85,32 +108,62 @@ The `local` compose profile starts a llama.cpp server alongside, for the eventua
 - **Model retry**: every planner / builder model call is wrapped in `_ainvoke_streaming`, which retries the full astream on transient upstream errors (HTTP 5xx, connection drops, asyncio timeouts) up to `MODEL_RETRY_MAX_ATTEMPTS=3` with exponential backoff (2s / 4s / 8s). Partial chunks from failed attempts are discarded; the returned `AIMessage` is always assembled from a single successful stream. Each retry shows `↻ <label> retry N/M in Ks (ErrorType: ...)` on stdout and a `model_retry` event in the trace. 4xx errors and 429 are NOT retried (TODO: 429 needs Retry-After parsing). A separate `STREAM_CHUNK_TIMEOUT_SECONDS=60` catches stuck streams faster than langchain's 120s default.
 - **Checkpoint resume**: outer + inner graph state is persisted to `workspace/.trace/checkpoints.db` (SQLite) at every node boundary. On crash, the next start scans for unfinished tasks (last trace event isn't `task_end`, file modified <24h ago) and prompts `Resume? [y/N]` (default N — fresh runs are fresh by default; same-task-text does NOT auto-resume). On resume, the inner builder graph picks up at the exact step it crashed at, not from step 0.
 - **Schema versioning**: each saved checkpoint is stamped with `CHECKPOINT_SCHEMA_VERSION` in metadata. **Bump it whenever the `State` or `BuilderState` TypedDict shape changes** (in `graph.py`). Mismatched checkpoints are rejected with a `checkpoint_schema_mismatch` trace event and the run starts fresh — no silent corruption from old state.
-- **MCP infrastructure failures route to `verdict=incomplete` → END**: when an evaluator-side exception matches `EVAL_INCOMPLETE_EXCEPTION_PATTERNS` (Playwright not installed, NS_ERROR_UNKNOWN_HOST, ConnectError, anyio `ClosedResourceError` / `BrokenResourceError`, MCP transport closed, ECONNREFUSED, …), the harness sets `verdict=incomplete` and terminates the run with a diagnostic. Without this, MCP transport drops mid-eval used to map to `verdict=continue` and loop the builder on infrastructure problems it couldn't fix.
-- **Per-tool errors are recoverable**: MCP tools are loaded with `handle_tool_error=True`, so a `ToolException` raised by a single tool (e.g. `File access denied` on a screenshot with a bad filename, `element not found` on a stale ref) becomes the tool result instead of crashing the subagent. The model reads the error and retries with different args. Real infrastructure failures still bypass this path and hit the `incomplete` route above.
-- **Persistent MCP session**: the evaluator opens `client.session("playwright")` once at first use and binds tools to that session via `load_mcp_tools(session)` (mode 2 of `langchain-mcp-adapters`). The default `client.get_tools()` opens a fresh session per tool call, which means each MCP tool gets a fresh Playwright page and page state is destroyed between calls — `browser_navigate` succeeds, then `browser_snapshot` returns `about:blank`. The session is cleaned up via `AsyncExitStack` at process exit.
+- **MCP transport recovery (try first, fail-incomplete second)**: when the evaluator hits a transport-level error (anyio `ClosedResourceError` / `BrokenResourceError` / `send_nowait` / `MCP transport closed`), the harness attempts reconnect before giving up. `_reconnect_evaluator_mcp_session()` closes the dead session, drops the cached agent, and rebuilds via `build_evaluator_subagent()` (which opens a fresh SSE session + reloads tools). Up to `MCP_RECOVERY_MAX_RETRIES=3` rounds with exponential backoff (10s / 20s / 40s). On success, the eval restarts with a recovery preamble explaining the browser state was reset; on exhaustion, falls through to the existing `verdict=incomplete` path. Patterns logged via `mcp_transport_died` / `mcp_transport_recovered` / `mcp_recovery_exhausted`.
+- **Other MCP infrastructure failures route straight to `verdict=incomplete` → END**: when an evaluator-side exception matches `EVAL_INCOMPLETE_EXCEPTION_PATTERNS` and isn't transport-recoverable (Playwright not installed, NS_ERROR_UNKNOWN_HOST, ConnectError, ECONNREFUSED, browser launch errors, …), the harness sets `verdict=incomplete` and terminates with a diagnostic. The diagnostic is split: infra failures point at `docker compose restart playwright-mcp`; an evaluator-communication failure (model didn't write findings even after retry) explains the workspace screenshot dir + suggests narrower next-iteration instructions.
+- **Per-tool errors are recoverable**: MCP tools are loaded with `handle_tool_error=True`, so a `ToolException` raised by a single tool (e.g. `File access denied` on a screenshot with a bad filename, `element not found` on a stale ref) becomes the tool result instead of crashing the subagent. The model reads the error and retries with different args. Real infrastructure failures still bypass this path and hit the recovery / incomplete routes above.
+- **Persistent MCP session**: the evaluator opens `client.session("playwright")` once at first use and binds tools to that session via `load_mcp_tools(session)` (mode 2 of `langchain-mcp-adapters`). The default `client.get_tools()` opens a fresh session per tool call, which means each MCP tool gets a fresh Playwright page and page state is destroyed between calls — `browser_navigate` succeeds, then `browser_snapshot` returns `about:blank`. The session is cleaned up via `AsyncExitStack` at process exit; transport drops trigger the recovery flow above.
 - **Multimodal MCP responses normalized**: `ToolMessage.content` from MCP browser tools is a list of content blocks (`{type: "text"}`, `{type: "image"}`) on `@playwright/mcp@0.0.73`. `_tool_msg_content_str()` flattens to a string for display + logging — without it, `.strip()` on a list crashed the eval streaming loop with `AttributeError`.
 - **Verdict validation on web-app tasks**: two retry tracks reject thin verdicts inline before they propagate to the next stage.
   - *Empty NOTES*: a verdict block with under `EVAL_NOTES_MIN_CHARS=100` of stripped content is rejected with a corrective preamble that asks for findings from already-observed data (no more exploration). Cap 1; second empty notes → `verdict=incomplete` with salvaged findings folded in.
   - *Insufficient interaction evidence*: `verdict=done` on a web-app task without minimum browser-tool counts (`browser_navigate` ≥ 1, `browser_take_screenshot` ≥ 1, `browser_click` ≥ 2) gets rejected with a corrective preamble naming the missing minimums. Cap 2.
-- **Findings salvage on recursion-limit timeout**: if the evaluator hits `EVAL_RECURSION_LIMIT=100` without writing a verdict block, `_extract_eval_findings()` scans the in-memory tool-history buffer for actionable patterns (`Console: N errors` with N>0, `Unhandled Runtime Error` overlays in snapshots, `browser_click` results landing on `/login` when the click target wasn't login-related, HTTP 4xx/5xx from curl) and folds them into the verdict notes. A budget-overrun run still produces actionable evidence for the next planner pass.
+- **Findings salvage on recursion-limit timeout / empty-notes cap exhaustion**: if the evaluator hits `EVAL_RECURSION_LIMIT=100` without writing a verdict block — or empty-notes retries exhaust — `_extract_eval_findings()` scans the in-memory tool-history buffer for actionable patterns (`Console: N errors` with N>0, `Unhandled Runtime Error` overlays in snapshots, `browser_click` results landing on `/login` when the click target wasn't login-related, HTTP 4xx/5xx from curl) AND positive observations (pages browsed cleanly, screenshots taken, interactions performed). Notes are formatted by `_format_findings_for_notes()` so a budget-overrun run still produces actionable evidence — failures listed first, or "the eval did exercise the app: N navigates, M screenshots, K interactions" when no failures were observed but the eval clearly worked.
+- **Eval skip on non-UI iterations**: when an iteration touched no UI-relevant files (`src/app/`, `src/pages/`, `src/components/`, `public/`, `*.css`, `tailwind.config`, `next.config`, `globals.css`, layout files), the evaluator stage is skipped and the cached `last_successful_eval` verdict is reused. Server-side fixes, type errors, build-system tweaks, internal logic changes don't change rendered UI; rerunning the full browser protocol (~50 MCP tool calls) is wasted budget. Tracked via `_files_touched_holder` populated by `str_replace` + `create_file`. Trace event `eval_skipped_no_ui_change` records the touched files + cached verdict source. Disable with `EVAL_SKIP_ENABLED=0`.
 
-### Manual checkpoint-resume verification
+## Resume
 
-There's no automated test for end-to-end resume (it requires a real model + a kill mid-builder), but the recipe is short:
+Two resume mechanisms, complementary:
 
-1. `./run.sh` and give it a multi-step task that takes ≥30s of builder work (e.g. "scaffold a Next.js app with Prisma").
-2. Watch the builder progress (`Step N of 50`). When you see, say, step 5 has executed, **kill the process** (Ctrl-C the docker run, or `docker kill` from another shell).
-3. Confirm `workspace/.trace/checkpoints.db` exists and the most-recent trace `.jsonl` does NOT end with a `task_end` line: `tail -1 workspace/.trace/<latest>.jsonl | jq .kind` → not `"task_end"`.
-4. `./run.sh` again. Expect: `Found unfinished task from Nm ago: '<task text>' / Last event: <kind> / Resume? [y/N]:`. Type `y`.
-5. Verify in stdout that the builder step counter resumes at ≥6 (the exact post-crash checkpoint), not 1. The trace will show a `task_resume` event followed by the existing iteration's events continuing.
+**`./run.sh --resume <run-id>`** (PBE-iteration-level, the new one). Targets the failure modes that aren't a single mid-step crash: budget exhaustion, MCP recovery failure, OpenRouter timeout mid-iteration, OOM, container restart, accidental Ctrl-C. State is persisted to `workspace/.harness/<run-id>/state.json` after every iteration end (plan, iteration count, cost, last successful eval, iteration history, model identifiers, branch name, schema version). Resume validates schema_version + branch existence, hard-resets the workspace to the run branch's tip via `git checkout && git reset --hard`, restores module state (cost tracker, iteration history, git checkpoint state) from the JSON, and seeds the outer-graph initial state so the next iteration starts at `iteration_count + 1`. The `run-id` is the timestamp suffix of the harness branch (`harness-run-20260505T091530Z` → run-id `20260505T091530Z`); RUN_SUMMARY.md prints the exact resume command.
 
-If step 5 shows the counter at 1, checkpointing isn't actually working — check that `_graph_holder["builder"]` is being replaced in `main()`.
+On a fresh `./run.sh` start (no `--resume`), in-progress runs are detected and listed:
 
-For automated resilience tests (model retry classification, schema mismatch detection, transient-error retry), run:
+```
+Detected in-progress runs (not yet finished with verdict=done):
+  - 20260505T091530Z: 'Build a CMS with Prisma...', 3 iter(s), €0.4521, saved 2026-05-05T09:42:08+00:00
+
+Resume one with: ./run.sh --resume <run-id>
+Or start fresh by entering a new task below.
+```
+
+The detection filters out completed runs (last verdict=done). It doesn't auto-resume — the user picks deliberately. `RESUME_ENABLED=0` disables both saves and detection.
+
+**Built-in checkpointer resume** (builder-step-level, the original). For mid-step crashes inside a single builder iteration, LangGraph's `AsyncSqliteSaver` persists graph state at every node boundary to `workspace/.trace/checkpoints.db`. On crash, the next start scans for unfinished tasks (last trace event isn't `task_end`, file modified <24h ago) and prompts `Resume? [y/N]` (default N). On resume, the inner builder graph picks up at the exact step it crashed at, not from step 0. Bumped `CHECKPOINT_SCHEMA_VERSION` rejects old checkpoints with a clear `checkpoint_schema_mismatch` trace event.
+
+### Manual verification recipes
+
+End-to-end resume isn't automated — both paths need a real model + a kill mid-run:
+
+1. `./run.sh` and give it a multi-step task. Wait for several iterations to land. Confirm `workspace/.harness/<run-id>/state.json` and the per-run git branch exist.
+2. **Ctrl-C the harness mid-iter.**
+3. `./run.sh --resume <run-id>`. Expect the resume banner with original task / iterations / cost / branch, then iteration `N+1` starts. Trace shows `run_resumed` event.
+
+For automated resilience tests (model retry classification, schema mismatch detection, transient-error retry):
 
 ```bash
 docker compose run --rm --use-aliases --service-ports langgraph python /app/test_resilience.py
 ```
+
+## Cost tracking
+
+Every model call (planner / builder / advisor / evaluator) is instrumented for token usage. `_record_cost()` updates a per-model running total + emits `model_call_cost` trace events with input/output tokens, USD cost, and matched pricing key. Per-1M-token rates live in `COST_PER_1M_TOKENS` near the top of `graph.py` — case-insensitive substring match against the model slug, so `anthropic/claude-sonnet-4-6` and `claude-sonnet-4-6` hit the same key.
+
+The running total appears in `RUN_SUMMARY.md`'s Status block:
+
+```
+- Estimated cost so far: €0.4521 so far  ·  claude-sonnet-4-6: €0.3892 · qwen3-coder-next: €0.0421 · qwen3.6-27b: €0.0208
+```
+
+Default currency is EUR (with `COST_USD_TO_EUR=0.92` factor); set `HARNESS_COST_CCY=USD` for dollar rendering. Costs are restored across resumes from the persisted `cost_tracking` field in `state.json` so the running total stays continuous.
 
 ## Tunable thresholds
 
@@ -133,10 +186,19 @@ EVAL_INSUFFICIENT_EVIDENCE_RETRY_CAP = 2
 EVAL_NOTES_MIN_CHARS = 100        # below this, NOTES treated as empty
 EVAL_EMPTY_NOTES_RETRY_CAP = 1    # 1 retry, then verdict=incomplete
 
+# Eval skip on iterations that touched no UI files
+EVAL_SKIP_ENABLED = True
+EVAL_SKIP_REQUIRES_PRIOR_EVAL = True   # no skip without a cached verdict to inherit
+
 # Eval idle thresholds: longer than builder/planner because verdict composition
 # (natural-language synthesis) routinely takes 30-60s
 EVAL_HEARTBEAT_THRESHOLD_SECONDS = 60
 EVAL_HEARTBEAT_INTERVAL_SECONDS = 60
+
+# MCP transport recovery — try reconnect before falling to verdict=incomplete
+MCP_RECOVERY_ENABLED = True
+MCP_RECOVERY_WAIT_SECONDS = 10    # initial backoff; doubled per retry → 10s, 20s, 40s
+MCP_RECOVERY_MAX_RETRIES = 3
 
 STUCK_EDIT_REPEAT_THRESHOLD = 3
 STUCK_EDIT_WINDOW = 10
@@ -159,12 +221,24 @@ MODEL_RETRY_BASE_DELAY = 2        # seconds; doubled per attempt → 2, 4, 8
 MODEL_RETRY_RETRYABLE_STATUS = {500, 502, 503, 504, 529}
 STREAM_CHUNK_TIMEOUT_SECONDS = 60 # per-chunk; catches stuck streams faster than langchain's 120s
 
-CHECKPOINT_SCHEMA_VERSION = 2     # bump when State/BuilderState TypedDict changes
-RESUME_FRESHNESS_HOURS = 24       # checkpoints older than this aren't offered
+CHECKPOINT_SCHEMA_VERSION = 3     # bump when State/BuilderState TypedDict changes
+RESUME_FRESHNESS_HOURS = 24       # AsyncSqliteSaver checkpoints older than this aren't offered
+
+# --resume <run-id> path (PBE-iteration-level resume; separate from the above)
+RESUME_ENABLED = True
+RESUME_STATE_SCHEMA_VERSION = 1   # bump on non-backward-compat state.json shape changes
 
 VERIFY_COMPLETION_CAP = 3         # advisor verdicts per task before forced give_up
 VERIFY_COMPLETION_ERROR_CAP = 2   # advisor errors (separate budget; doesn't burn verdict cap)
 SHELL_HISTORY_FOR_VERIFY = 10     # ring buffer of recent shell outputs surfaced to advisor
+
+# Cost tracking
+COST_USD_TO_EUR = 0.92            # used when HARNESS_COST_CCY=EUR (default)
+RUN_SUMMARY_TASK_SUMMARY_CHARS = 80   # per-iteration title length in iteration history
+
+# Per-iteration git checkpoints
+ENABLE_GIT_CHECKPOINTS = True
+GIT_CHECKPOINT_BRANCH_PREFIX = "harness-run-"
 
 FILE_VIEW_DEFAULT_MAX_LINES = 800 # if file ≤ this, return whole file (most source files <800)
 FILE_VIEW_TRUNCATE_TO = 400       # if file >, return first N lines unless start/end specified
