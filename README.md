@@ -19,7 +19,7 @@ planner → builder → [router] → evaluator → [router] → planner | END
 
 - **Planner** — Claude Sonnet 4.6 (Anthropic API). Writes a structured plan and the explicit prompts the builder and evaluator receive. The other models don't get generic system prompts; they get prose authored by Sonnet for this specific iteration. Has a startup short-circuit (`route_after_planner`): if the prior task's trace shows `verification_token_consumed` followed by `builder_exit reason="done"` and the new input is a trivial continuation (`continue`, `go`, `proceed`, …), the planner emits `path="already_complete"` and the harness terminates without invoking the builder. Stops the planner from inventing fictional new requirements on a working codebase.
 - **Builder** — Qwen3-Coder-Next via OpenRouter. Custom `StateGraph` (not `create_react_agent`) with a sophisticated tool surface (see below).
-- **Evaluator** — Qwen3.6-27B (vision-capable) via OpenRouter, with read-only file tools + Playwright MCP browser tools loaded over a **persistent** SSE session (each MCP tool call shares the same browser page; the default `client.get_tools()` mode opens a fresh session per call and loses page state between tool calls — broken for any verification flow). Verifies builder output via both code (`npm run build`) and browser interaction (navigate / screenshot / snapshot / console_messages / click), guided by a mandatory interaction protocol on web-app tasks.
+- **Evaluator** — vision-capable model that drives the browser via Playwright MCP, with read-only file tools + browser tools loaded over a **persistent** SSE session (each MCP tool call shares the same browser page; the default `client.get_tools()` mode opens a fresh session per call and loses page state between tool calls — broken for any verification flow). Verifies builder output via both code (`npm run build`) and browser interaction (navigate / screenshot / snapshot / console_messages / click), guided by a mandatory interaction protocol on web-app tasks. The model is **per-call selectable** via `HARNESS_EVALUATOR_TIER` (`cheap` = builder model, `strong` = Sonnet 4.6, `auto` = heuristic) and `HARNESS_EVALUATOR_MODEL` (explicit override). Defaults to Qwen3.6-27B at the cheap tier, escalates to Sonnet on auto when the task description hits stake-keywords (production, deploy, payment, auth, security, GDPR, …) or when prior iterations have failed verification. See "Tiered evaluator" below.
 - **Advisor** — Claude Sonnet 4.6 again, gating builder completion. The builder cannot call `mark_done` directly; it must first call `verify_completion(task_summary, evidence, verify_command)` which sends the evidence + plan + recent verify-output to the advisor. The advisor returns a structured verdict including `next_actor`: `builder_continue` (default rejection — code-level work to do), `needs_evaluator` (work looks reasonable but needs browser-based verification), or `builder_disagreement` (wrong-problem; planner re-engages). The harness routes accordingly: `needs_evaluator` short-circuits the builder loop and hands off to the evaluator; `builder_disagreement` routes to the planner under the existing replan cap.
 
 **Inner (builder StateGraph):**
@@ -69,7 +69,11 @@ docker compose build
 ./run.sh
 ```
 
-`./run.sh` is a thin wrapper for `docker compose run --rm --use-aliases --service-ports langgraph`. Both flags are required (the wrapper sets them for you, and `graph.py`'s startup self-check will warn loudly if you invoke without `--use-aliases`):
+`./run.sh` is a thin wrapper for `docker compose run --rm --use-aliases --service-ports langgraph python graph.py "$@"`. It also runs a preflight that auto-removes stale `langgraph-run-*` containers still bound to host port 3000 (a previous run killed via `docker kill` rather than Ctrl-C will leave one of these and block subsequent `--service-ports` binds). Set `HARNESS_NO_KILL_STALE=1` to make the preflight warn-and-exit instead of auto-removing.
+
+`./shell.sh` is the bare-shell counterpart: `docker compose run --rm --use-aliases --service-ports langgraph bash "$@"`. Use it for poking around the workspace or running the dev server by hand. `docker compose exec langgraph bash` does NOT work — `exec` only attaches to `compose up` containers, not the transient `compose run` containers the harness uses.
+
+Both flags are required (the wrappers set them for you, and `graph.py`'s startup self-check will warn loudly if you invoke without `--use-aliases`):
 - `--use-aliases`: without it, the transient `compose run` container only registers its container-name on the project network, so the `playwright-mcp` sibling can't resolve `langgraph:3000` for `browser_navigate` calls and Firefox returns `NS_ERROR_UNKNOWN_HOST`. With it, the run container picks up the service-name DNS alias.
 - `--service-ports`: `compose run` ignores the service's `ports:` mapping by default (a known compose-run-vs-up difference). Without this, the dev server the builder spawns is reachable inside the container and from playwright-mcp, but NOT from your host browser at `http://localhost:3000`. With it, the declared port is published.
 
@@ -132,6 +136,10 @@ All in `.env`:
 | `HARNESS_TEST_GATE_REQUIRED` | `1` blocks checkpoint on failures; `0` is warnings-only mode | `1` |
 | `HARNESS_TEST_GATE_MAX_STREAK` | Consecutive test failures before circuit-breaker terminates the run | `3` |
 | `HARNESS_TEST_OUTPUT_TAIL_LINES` | Lines of test output captured in trace + RUN_SUMMARY | `50` |
+| `HARNESS_EVALUATOR_MODEL` | Explicit evaluator slug; bypasses tier logic | (unset) |
+| `HARNESS_EVALUATOR_TIER` | `cheap` (builder model), `strong` (Sonnet 4.6), or `auto` (heuristic) | `auto` |
+| `HARNESS_EVALUATOR_STRONG_MODEL` | Model used when tier resolves to `strong` | `claude-sonnet-4-6` |
+| `HARNESS_EVALUATOR_FALLBACK_MODEL` | Fallback if primary evaluator errors out | (unset) |
 
 OpenRouter routes flakily for tool-calling on some providers (the model returns native XML format, the provider doesn't translate it back). If you see broken tool calls, find a working provider in your OpenRouter activity log and pin via `OPENROUTER_PROVIDERS=...`. To exclude a single bad provider without pinning everything, use `OPENROUTER_IGNORE_PROVIDERS=parasail` (etc.) — the rest of the fallback set still runs.
 
@@ -231,6 +239,44 @@ HARNESS_TEST_GATE_MAX_STREAK=<higher> ./run.sh --resume <run-id>
 
 Trace events: `test_gate_baseline_passed`, `test_gate_baseline_failing`, `test_gate_passed`, `test_gate_failed`, `test_gate_timeout`, `test_gate_circuit_breaker_triggered`, `test_gate_skipped`. The streak + disabled-baseline state is persisted in `state.json` so resume preserves the circuit-breaker condition (the operator overrides via the env vars on the resume command).
 
+## Tiered evaluator
+
+The evaluator can run on a different (typically stronger) model than the builder. Important when the eval needs to read large evidence buffers carefully — a known failure mode is "Qwen captures 64KB of console errors via `browser_console_messages`, then summarizes them as 'no issues' in the verdict because the buffer is too long to read carefully." A stronger model catches this; a per-call selector + optional fallback lets the harness escalate exactly where it matters.
+
+```bash
+# Force Sonnet for the evaluator on a single run
+HARNESS_EVALUATOR_TIER=strong ./run.sh --prompt-name regression-test
+
+# Or pick a specific model
+HARNESS_EVALUATOR_MODEL=claude-sonnet-4-6 ./run.sh --prompt-name production-deploy
+
+# Or rely on the auto heuristic (default) — escalates on stake-keywords
+./run.sh --prompt-name "add-auth-to-admin"   # auto → strong (matched 'auth')
+./run.sh --prompt-name "add-contact-section" # auto → cheap (no triggers)
+```
+
+Precedence:
+
+1. `HARNESS_EVALUATOR_MODEL` set → explicit override (`tier_used="explicit"`).
+2. `HARNESS_EVALUATOR_TIER=cheap` → builder model.
+3. `HARNESS_EVALUATOR_TIER=strong` → `HARNESS_EVALUATOR_STRONG_MODEL` (default `claude-sonnet-4-6`).
+4. `HARNESS_EVALUATOR_TIER=auto` (default): escalates to strong when ANY of the following triggers fire, else cheap:
+   - Task description contains a stake-keyword: `production`, `deploy`, `release`, `payment`, `auth`, `security`, `user data`, `gdpr`, `compliance`, `hipaa` (case-insensitive substring match)
+   - `HARNESS_BUDGET_EUR` ≥ 10 (forward-compat with the not-yet-implemented budget circuit breaker)
+   - The task is web-app shaped AND at least one prior iteration in the run's history was non-ok (suggests Qwen had trouble; escalate verification)
+
+Selection is logged per evaluator invocation as `evaluator_model_chosen` with `tier_requested`, `tier_used`, `model`, and `reason`. RUN_SUMMARY.md's Status block shows the most recent decision:
+
+```
+- Evaluator model: claude-sonnet-4-6 (tier=strong, reason="task contains 'auth'")
+```
+
+`HARNESS_EVALUATOR_FALLBACK_MODEL` is a single-shot retry on primary model errors (rate limit / transient 5xx / connection drop). `GraphRecursionError` doesn't fall back — that's the eval's own recursion budget, swapping models won't help. Trace events: `evaluator_model_fallback_used`, `evaluator_model_fallback_exhausted`. After fallback exhaustion, falls through to the existing `verdict=incomplete` path.
+
+The agent is rebuilt per-call only when the chosen model differs from the cached one — most runs land on the same model across iterations, so caching keeps the cost low. The persistent MCP session is reused across model swaps; only the agent rebuilds.
+
+The Console error policy in `skills/evaluating/SKILL.md` applies regardless of which model runs — Sonnet is more likely to follow it correctly, but Qwen has a better chance with the explicit instruction than without.
+
 ## Tunable thresholds
 
 All of these are named constants at the top of `graph.py`:
@@ -292,7 +338,16 @@ RESUME_FRESHNESS_HOURS = 24       # AsyncSqliteSaver checkpoints older than this
 
 # --resume <run-id> path (PBE-iteration-level resume; separate from the above)
 RESUME_ENABLED = True
-RESUME_STATE_SCHEMA_VERSION = 2   # bumped from 1: state.json gained test-gate fields
+RESUME_STATE_SCHEMA_VERSION = 3   # bumped from 2: state.json gained evaluator_model_used
+
+# Tiered evaluator
+EVALUATOR_TIER = "auto"               # cheap | strong | auto; via HARNESS_EVALUATOR_TIER
+EVALUATOR_STRONG_MODEL = "claude-sonnet-4-6"
+EVALUATOR_AUTO_STRONG_KEYWORDS = (    # task substrings that escalate auto → strong
+    "production", "deploy", "release", "payment", "auth", "security",
+    "user data", "gdpr", "compliance", "hipaa",
+)
+EVALUATOR_AUTO_STRONG_BUDGET_EUR = 10.0  # HARNESS_BUDGET_EUR ≥ this → strong
 
 # Test gate — empty TEST_COMMAND disables; set via HARNESS_TEST_COMMAND env
 TEST_COMMAND = ""                  # default unset → gate disabled
