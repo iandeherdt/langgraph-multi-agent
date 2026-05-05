@@ -53,4 +53,19 @@ if [ -n "${stale}" ]; then
     fi
 fi
 
-exec docker compose run --rm --use-aliases --service-ports langgraph python graph.py "$@"
+# --- Forward host shell env vars to the container --------------------------------
+# docker-compose.yml uses `env_file: .env`, which loads variables from .env only;
+# variables exported in the host shell (e.g., `HARNESS_EVALUATOR_TIER=cheap ./run.sh ...`)
+# are NOT forwarded by default. `docker compose run -e VAR` (no `=value`) forwards
+# the var's value from the host shell. Sweep relevant prefixes/names so per-invocation
+# overrides Just Work without having to edit .env.
+forward_args=()
+while IFS='=' read -r name _; do
+    case "${name}" in
+        HARNESS_*|OPENROUTER_*|ANTHROPIC_*|OPENAI_*|HF_TOKEN|HUGGING_FACE_HUB_TOKEN)
+            forward_args+=(-e "${name}")
+            ;;
+    esac
+done < <(env)
+
+exec docker compose run --rm --use-aliases --service-ports "${forward_args[@]}" langgraph python graph.py "$@"

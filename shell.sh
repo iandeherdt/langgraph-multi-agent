@@ -13,4 +13,16 @@
 # `compose up` containers, not the transient `compose run` containers the harness uses.
 
 set -euo pipefail
-exec docker compose run --rm --use-aliases --service-ports langgraph bash "$@"
+
+# Forward host shell env vars (HARNESS_*, OPENROUTER_*, etc.) to the container.
+# See run.sh for why this sweep is necessary (docker-compose.yml only env_file's .env).
+forward_args=()
+while IFS='=' read -r name _; do
+    case "${name}" in
+        HARNESS_*|OPENROUTER_*|ANTHROPIC_*|OPENAI_*|HF_TOKEN|HUGGING_FACE_HUB_TOKEN)
+            forward_args+=(-e "${name}")
+            ;;
+    esac
+done < <(env)
+
+exec docker compose run --rm --use-aliases --service-ports "${forward_args[@]}" langgraph bash "$@"
