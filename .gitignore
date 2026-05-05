@@ -7,3 +7,10 @@ __pycache__/
 .pytest_cache/
 workspace/
 models/*.gguf
+
+# User prompt files. The directory itself is tracked via .gitkeep; individual
+# *.md / *.txt files are gitignored so user prompts (which often contain project-
+# specific or sensitive content) don't leak into the repo.
+prompts/*.md
+prompts/*.txt
+!prompts/.gitkeep

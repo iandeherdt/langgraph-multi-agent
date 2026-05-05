@@ -5546,6 +5546,176 @@ def _parse_resume_arg() -> str | None:
     return run_id
 
 
+# ────────────────────────── prompt-input modes ──────────────────────────
+
+
+# Where named prompts live. The directory itself is committed (via .gitkeep); individual
+# *.md / *.txt files are gitignored at the repo level so user prompts don't leak into the
+# repo. `./run.sh --prompt-name foo` resolves to <repo>/prompts/foo.md (or .txt fallback).
+PROMPTS_DIR = Path(__file__).parent / "prompts"
+PROMPT_LENGTH_WARN_THRESHOLD = 50_000
+
+
+def _parse_prompt_input_args() -> dict:
+    """Parse the three mutually-exclusive prompt-input flags from sys.argv:
+        --prompt-file <path>
+        --prompt -          (literal '-' meaning "read from stdin until EOF")
+        --prompt-name <name>
+    Removes consumed argv items. Returns a dict {mode, ...} on hit, or {} when none set.
+    Two flags set at once is a hard error (mutually exclusive)."""
+    result: dict = {}
+
+    if "--prompt-file" in sys.argv:
+        idx = sys.argv.index("--prompt-file")
+        if idx + 1 >= len(sys.argv):
+            print("ERROR: --prompt-file requires a path.", file=sys.stderr)
+            sys.exit(2)
+        path = Path(sys.argv[idx + 1]).expanduser()
+        del sys.argv[idx:idx + 2]
+        result = {"mode": "file", "path": path}
+
+    if "--prompt-name" in sys.argv:
+        if result:
+            print("ERROR: --prompt-file and --prompt-name are mutually exclusive.", file=sys.stderr)
+            sys.exit(2)
+        idx = sys.argv.index("--prompt-name")
+        if idx + 1 >= len(sys.argv):
+            print("ERROR: --prompt-name requires a name.", file=sys.stderr)
+            sys.exit(2)
+        name = sys.argv[idx + 1]
+        del sys.argv[idx:idx + 2]
+        result = {"mode": "named", "name": name}
+
+    if "--prompt" in sys.argv:
+        if result:
+            print("ERROR: prompt-input flags are mutually exclusive.", file=sys.stderr)
+            sys.exit(2)
+        idx = sys.argv.index("--prompt")
+        if idx + 1 >= len(sys.argv) or sys.argv[idx + 1] != "-":
+            print("ERROR: --prompt expects '-' (read from stdin until EOF). For files use "
+                  "--prompt-file <path>.", file=sys.stderr)
+            sys.exit(2)
+        del sys.argv[idx:idx + 2]
+        result = {"mode": "stdin"}
+
+    return result
+
+
+def _load_prompt_from_file(path: Path) -> str:
+    """Read a prompt file. Errors out on missing / empty. Trailing whitespace stripped;
+    interior content (newlines, indentation) preserved verbatim."""
+    if not path.exists():
+        print(f"ERROR: Prompt file not found: {path}", file=sys.stderr)
+        sys.exit(2)
+    try:
+        content = path.read_text().rstrip()
+    except OSError as e:
+        print(f"ERROR: cannot read prompt file {path}: {e}", file=sys.stderr)
+        sys.exit(2)
+    if not content:
+        print(f"ERROR: Prompt file is empty: {path}", file=sys.stderr)
+        sys.exit(2)
+    return content
+
+
+def _load_prompt_from_stdin() -> str:
+    """Read until EOF (Ctrl-D) and treat the whole buffer as one prompt."""
+    print("Paste your task description, then Ctrl-D to submit:", flush=True)
+    try:
+        content = sys.stdin.read().rstrip()
+    except Exception as e:
+        print(f"ERROR: stdin read failed: {e}", file=sys.stderr)
+        sys.exit(2)
+    if not content:
+        print("ERROR: No prompt received on stdin.", file=sys.stderr)
+        sys.exit(2)
+    return content
+
+
+def _list_available_prompt_names() -> list[str]:
+    """Discover prompt names in PROMPTS_DIR. Returns sorted unique stems for *.md / *.txt."""
+    if not PROMPTS_DIR.exists():
+        return []
+    names = set()
+    for f in PROMPTS_DIR.iterdir():
+        if f.is_file() and not f.name.startswith(".") and f.suffix in (".md", ".txt"):
+            names.add(f.stem)
+    return sorted(names)
+
+
+def _load_prompt_by_name(name: str) -> tuple[str, Path]:
+    """Look up prompts/<name>.md, then prompts/<name>.txt as fallback. Errors with a list
+    of available prompts when neither exists."""
+    md = PROMPTS_DIR / f"{name}.md"
+    txt = PROMPTS_DIR / f"{name}.txt"
+    if md.exists():
+        return _load_prompt_from_file(md), md
+    if txt.exists():
+        return _load_prompt_from_file(txt), txt
+    avail = _list_available_prompt_names()
+    avail_str = ", ".join(avail) if avail else "(none — write one to prompts/<name>.md)"
+    print(f"ERROR: No prompt found at prompts/{name}.md or prompts/{name}.txt", file=sys.stderr)
+    print(f"Available prompts: {avail_str}", file=sys.stderr)
+    sys.exit(2)
+
+
+def _validate_loaded_prompt(prompt: str) -> None:
+    """Soft warnings on suspect prompts. Doesn't exit; the operator may know better."""
+    n = len(prompt)
+    if n > PROMPT_LENGTH_WARN_THRESHOLD:
+        print(f"  WARN: prompt is {n} chars (> {PROMPT_LENGTH_WARN_THRESHOLD}). "
+              f"Possible copy-paste error?")
+    # "Looks like a path" heuristic: single short line containing /, and the path exists.
+    stripped = prompt.strip()
+    if "\n" not in stripped and "/" in stripped and len(stripped) < 500:
+        try:
+            if Path(stripped).expanduser().exists():
+                print(f"  WARN: this prompt looks like a file path. "
+                      f"Did you mean --prompt-file {stripped}?")
+        except OSError:
+            pass
+
+
+def _read_interactive_prompt() -> str | None:
+    """Single read in the interactive REPL. Returns the prompt string or None on EOF.
+
+    Triple-quote convention: if the user's first line is exactly `\"\"\"`, the harness
+    enters multi-line mode and collects subsequent lines until another `\"\"\"` line.
+    Lets users opt into multi-line mode without restarting with --prompt-file.
+    """
+    try:
+        first = input("Task: ")
+    except EOFError:
+        print()
+        return None
+    if first.strip() == '"""':
+        print('Multi-line input mode — end with """ on its own line.', flush=True)
+        lines: list[str] = []
+        while True:
+            try:
+                line = input()
+            except EOFError:
+                break
+            if line.strip() == '"""':
+                break
+            lines.append(line)
+        return "\n".join(lines)
+    return first
+
+
+def _resolve_preloaded_prompt(prompt_args: dict) -> tuple[str, str, Path | None]:
+    """Returns (prompt_text, mode_label, source_path_or_None) for the trace event."""
+    if prompt_args["mode"] == "file":
+        path = prompt_args["path"]
+        return _load_prompt_from_file(path), "file", path
+    if prompt_args["mode"] == "named":
+        text, path = _load_prompt_by_name(prompt_args["name"])
+        return text, "named", path
+    if prompt_args["mode"] == "stdin":
+        return _load_prompt_from_stdin(), "stdin", None
+    raise ValueError(f"unknown prompt mode: {prompt_args.get('mode')!r}")
+
+
 async def main():
     # Inline arg parsing — argparse would be overkill for two bool/string flags. Env vars
     # HARNESS_GIT_CHECKPOINTS=0 / RESUME_ENABLED=0 take precedence over the matching CLI
@@ -5555,6 +5725,11 @@ async def main():
         ENABLE_GIT_CHECKPOINTS = False
         sys.argv.remove("--no-checkpoint")
     resume_run_id = _parse_resume_arg()
+    prompt_input_args = _parse_prompt_input_args()
+    if prompt_input_args and resume_run_id:
+        print("ERROR: --resume cannot be combined with --prompt-file / --prompt / --prompt-name. "
+              "Resume re-runs the original task from state.json.", file=sys.stderr)
+        sys.exit(2)
 
     _check_service_alias_or_warn()
     print(f"Planner:   {planner_llm.model}  (Anthropic)")
@@ -5674,6 +5849,24 @@ async def main():
         # One-shot resume offer at startup. Only the most-recent unfinished task is offered.
         resume = await _maybe_resume(saver)
 
+        # If a non-interactive prompt mode was selected, load it once. After running that
+        # one task we exit; no REPL loop. preloaded_prompt is consumed on first iteration.
+        preloaded_prompt: str | None = None
+        preloaded_mode: str | None = None
+        preloaded_path: Path | None = None
+        if prompt_input_args:
+            preloaded_prompt, preloaded_mode, preloaded_path = _resolve_preloaded_prompt(
+                prompt_input_args
+            )
+            _validate_loaded_prompt(preloaded_prompt)
+            print(f"Loaded prompt ({preloaded_mode}): {len(preloaded_prompt)} chars, "
+                  f"{len(preloaded_prompt.splitlines())} line(s)"
+                  + (f" from {preloaded_path}" if preloaded_path else "") + "\n")
+
+        # one_shot terminates the REPL after the first successful task — true when a
+        # non-interactive prompt mode was used. Interactive REPL loops until Ctrl-D.
+        one_shot = bool(prompt_input_args)
+
         while True:
             initial_state: dict
             if resume_state is not None:
@@ -5713,11 +5906,26 @@ async def main():
                 initial_state = {"task": user_input, "iteration": 0, "plan": _empty_plan_doc(),
                                  "replan_count": 0, "planner_path": ""}
                 resume = None
+            elif preloaded_prompt is not None:
+                # Non-interactive prompt mode: --prompt-file / --prompt - / --prompt-name.
+                # Run once and exit. The trace event records which mode + the source path
+                # for file/named modes so post-run analysis can correlate runs back to the
+                # exact prompt content used.
+                user_input = preloaded_prompt
+                trace_path = TRACE.start_task(user_input)
+                thread_id = trace_path.stem
+                print(f"Trace: {trace_path}\n")
+                _run_started_holder["original_task"] = user_input
+                TRACE.log("task_prompt_loaded", mode=preloaded_mode,
+                          prompt_chars=len(user_input),
+                          prompt_lines=len(user_input.splitlines()),
+                          prompt_path=str(preloaded_path) if preloaded_path else None)
+                initial_state = {"task": user_input, "iteration": 0, "plan": _empty_plan_doc(),
+                                 "replan_count": 0, "planner_path": ""}
+                preloaded_prompt = None  # consume — don't re-use on hypothetical next loop
             else:
-                try:
-                    user_input = input("Task: ")
-                except EOFError:
-                    print()
+                user_input = _read_interactive_prompt()
+                if user_input is None:  # EOF
                     break
                 if not user_input.strip():
                     continue
@@ -5725,6 +5933,14 @@ async def main():
                 thread_id = trace_path.stem
                 print(f"Trace: {trace_path}\n")
                 _run_started_holder["original_task"] = user_input
+                _validate_loaded_prompt(user_input)
+                # Distinguish single-line interactive from triple-quote multi-line so post-
+                # run analysis can correlate input shape with task complexity / outcome.
+                interactive_mode = "multiline-interactive" if "\n" in user_input else "interactive"
+                TRACE.log("task_prompt_loaded", mode=interactive_mode,
+                          prompt_chars=len(user_input),
+                          prompt_lines=len(user_input.splitlines()),
+                          prompt_path=None)
                 initial_state = {"task": user_input, "iteration": 0, "plan": _empty_plan_doc(),
                                  "replan_count": 0, "planner_path": ""}
 
@@ -5742,6 +5958,9 @@ async def main():
                 TRACE.end_task(reason="exception", error=str(e))
                 raise
             print()
+            # Non-interactive prompt modes run one task and exit (no REPL after).
+            if one_shot:
+                break
 
     # Session is over (Ctrl-D, EOF on input, or unhandled exception bubbled up).
     # Print the run-summary hint so the user knows where to look. Outside the AsyncExitStack
