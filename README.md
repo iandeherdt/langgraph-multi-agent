@@ -305,6 +305,106 @@ When the evaluator emits a verdict block with empty NOTES (`< EVAL_NOTES_MIN_CHA
 
 **Cheap-tier skip:** the retry is a no-op on cheap-tier evaluators (qwen-coder etc.) — observed across multiple runs to never recover even with the prior tool history re-injected. By default (`HARNESS_EVAL_RETRY_EMPTY_NOTES_ON_CHEAP=0`) the retry is skipped on cheap tier, the harness logs `evaluator_empty_notes_retry_skipped` with `reason="cheap_tier_no_retry"`, and the salvage-findings path runs immediately. Saves ~60s + a wasted model call per occurrence. Set the env var to `1` to force a retry (e.g., when testing a different cheap model).
 
+## Visual designs
+
+The harness reads design references from `<workspace>/designs/` and threads them through the planner → builder → evaluator pipeline. The evaluator must verify implementation against the designs and surface a `DESIGN_COMPLIANCE` block in its verdict; non-compliant findings coerce a `done` verdict to `continue`.
+
+### Folder convention
+
+```
+workspace/designs/
+  homepage.html               ← visual mockup
+  homepage.css                ← optional companion stylesheet
+  homepage.md                 ← optional design notes
+  admin-pages-list.html
+  admin-pages-list.md
+  brand.fig                   ← unsupported format → logged + skipped
+```
+
+Pairs are linked by basename. Each design can have any combination of:
+
+| Type | Extension | Loaded for |
+|---|---|---|
+| Visual mockup | `.png`, `.jpg`, `.jpeg`, `.webp` | Vision-capable roles only (image bytes attached) |
+| HTML/CSS mockup | `.html`, `.htm`, `.css` | All roles (full source inlined as text) |
+| Notes | `.md` | All roles (text inlined) |
+| Unsupported | `.fig`, `.sketch`, `.pdf`, `.xd`, `.ai`, `.psd`, `.svg` | Skipped — logged as `design_format_unsupported` |
+
+If `designs/` doesn't exist or is empty, the entire feature is a no-op — no trace events, no role injections, no schema changes.
+
+### Per-task `design_refs`
+
+The planner gets a `# DESIGNS AVAILABLE` block listing every design's basename + attached content types. For each task it generates, it emits a `# DESIGN_REFS` line attaching the relevant basenames:
+
+```
+# DESIGN_REFS
+- 3: homepage
+- 7: admin-pages-list
+- 9: homepage, admin-pages-list
+```
+
+Tasks without a DESIGN_REFS line get no design attachment — that's the default. The planner skill (`skills/planning/SKILL.md`) lists when designs apply (UI rendering, layout, copy, interactions) vs. when they don't (data-layer, tooling, build config).
+
+When the planner doesn't emit per-task refs (e.g. on a project where the planner isn't yet design-aware) and `designs/` is non-empty AND the task is web-app shaped, the harness falls back to attaching every design to the eval prompt. This is a safety net, not a feature — prefer per-task refs.
+
+Trace events: `planner_designs_manifest` (summary), `planner_design_refs_assigned` (per task), `planner_design_refs_unknown` (when the planner names a basename not in the manifest), `designs_scanned` (one event per run), `design_format_unsupported` (one event per skipped file).
+
+### Role injections
+
+When an iteration's task carries non-empty `design_refs`, the evaluator's prompt gets a `DESIGN VERIFICATION REQUIRED FOR THIS ITERATION` block with the design content (image when role has vision, HTML/CSS/notes always as text) and a directive to write a `DESIGN_COMPLIANCE` block in the verdict NOTES. The skill (`skills/evaluating/SKILL.md`) documents the format:
+
+```
+DESIGN_COMPLIANCE:
+- ref: admin-pages-list  compliant: true   observations: Featured column matches mockup; toggle button is purple as specified.
+- ref: homepage-hero     compliant: false  observations: Hero shows generic blue background; mockup specifies the dark gradient.
+```
+
+Trace event `design_injected` records what was attached:
+
+```
+{ "kind": "design_injected",
+  "role": "evaluator",
+  "refs": ["homepage"],
+  "vision_used": false,
+  "content_types": ["html", "css"],
+  "text_chars": 24987,
+  "image_blocks": 0,
+  "per_design_cap_chars": 25000 }
+```
+
+`vision_used` is true only when an image was attached + the role has vision. `content_types` is the explicit list of what's in the prompt.
+
+### Verdict coercion (non-negotiability)
+
+`_parse_design_compliance_from_notes` extracts the per-ref findings. If `verdict == "done"` AND any ref reports `compliant: false`, the harness:
+
+1. Coerces `verdict` → `continue`.
+2. Logs `design_compliance_violation` with the non-compliant refs and observations.
+3. Prepends a harness-prefix banner to NOTES so the next planner pass sees what failed.
+
+This is non-negotiable — the evaluator cannot ship `done` over its own non-compliance findings. Refs the eval skipped entirely are reported as `compliant: null` with `observations: "(not addressed by evaluator)"`.
+
+### Auto-tier escalation
+
+When `designs/` is non-empty AND the task is design-tagged (or is web-app shaped under the heuristic fallback), `_select_evaluator_model` resolves auto → strong with reason `"design_refs_present (auto → strong)"`. Visual verification needs the strongest available model. Operator override (`HARNESS_EVALUATOR_TIER=cheap`) still wins.
+
+A parallel `builder_design_tier_recommendation` event fires when an iteration has `design_refs` AND `HARNESS_BUILDER_MODEL` isn't set. Cheap-tier builders (qwen-coder) consistently fail to translate restrained design systems with next/font + Tailwind config; the trace surfaces an explicit recommendation to set `HARNESS_BUILDER_MODEL=anthropic/claude-sonnet-4-6` (or similar) for design-heavy iterations. Automatic mid-run swap is a separate followup — currently the operator acts on the recommendation between runs.
+
+### Prompt-size controls
+
+A single design's HTML/CSS can be large. `HARNESS_DESIGN_INJECT_HTML_CAP` (default 25000 chars) caps each design's injected source. `_truncate_design_text` keeps the first 70% + last ~25% with a `[…N chars elided…]` marker — the role still sees structural head/tail (style block opening, footer markers). Multi-design eval calls now stay under prompt budget; pre-cap, a 56 KB combined design block was pushing eval costs past the per-evaluator cap.
+
+### Configuration
+
+| Var | Purpose | Default |
+|---|---|---|
+| `HARNESS_DESIGNS_DIR` | Subfolder of `<workspace>` to scan | `designs` |
+| `HARNESS_DESIGNS_ENABLED` | `auto` (enable when folder has content) / `disabled` / `enabled` (warn if empty) | `auto` |
+| `HARNESS_DESIGNS_PLANNER_VISION` | `1` to allow vision-image attachment when planner has vision | `1` |
+| `HARNESS_DESIGNS_BUILDER_VISION` | `1` to allow vision-image attachment for the builder | `1` |
+| `HARNESS_DESIGNS_EVALUATOR_VISION` | `1` to allow vision-image attachment for the evaluator | `1` |
+| `HARNESS_DESIGN_INJECT_HTML_CAP` | Per-design HTML/CSS truncation cap (chars) | `25000` |
+
 ## Tunable thresholds
 
 All of these are named constants at the top of `graph.py`:
