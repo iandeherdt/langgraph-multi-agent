@@ -104,6 +104,26 @@ EVAL_RECURSION_LIMIT = 100
 # extract findings from a budget-overrun run. Cleared at the top of each eval iteration.
 EVAL_TOOL_HISTORY_FOR_FINDINGS = 30
 
+# Eval skipping when an iteration touched no UI files. Browser-based verification is the
+# dominant cost on long runs (50+ Sonnet tool calls per eval). Many iterations don't change
+# the rendered UI at all — type-error fixes, server-side refactors, build-system tweaks,
+# internal logic changes. For those, the eval result from the previous successful iteration
+# is still valid; rerunning the protocol is wasted budget. The skip path reuses the cached
+# last_successful_eval verdict + notes (with a "skipped because no UI change" preface)
+# and short-circuits the evaluator node.
+EVAL_SKIP_ENABLED = os.environ.get("EVAL_SKIP_ENABLED", "1").lower() not in ("0", "false", "no", "")
+EVAL_SKIP_REQUIRES_PRIOR_EVAL = True   # only skip if there's a cached eval to fall back on
+# Path patterns that mark a file as UI-relevant. Mix of prefix (matches anywhere in path,
+# case-insensitive substring) and glob (fnmatch on basename, case-insensitive). A glob is
+# detected by the presence of `*` or `?` in the pattern.
+UI_PATH_PATTERNS = [
+    "src/app/", "src/pages/", "src/components/", "components/", "pages/", "app/",
+    "public/", "static/", "assets/",
+    "*.css", "*.scss", "*.sass", "*.less",
+    "tailwind.config", "next.config", "postcss.config", "vite.config",
+    "globals.css", "layout.tsx", "layout.jsx",
+]
+
 # Eval evidence enforcement (Layer 2: harness-level rejection of thin verdicts).
 # A verdict of "done" on a web-app task without observable interaction evidence (browse +
 # screenshot + clicks) is rubber-stamping. The harness counts MCP browser tool calls during
@@ -227,7 +247,7 @@ MODEL_RETRY_RETRYABLE_STATUS = {500, 502, 503, 504, 529}
 # or BuilderState TypedDict changes shape — old checkpoints will be rejected (load fails
 # loudly with checkpoint_schema_mismatch trace event) and the run starts fresh.
 CHECKPOINT_DB_PATH = TRACE_DIR / "checkpoints.db"
-CHECKPOINT_SCHEMA_VERSION = 2  # bumped from 1: State gained `planner_path` field
+CHECKPOINT_SCHEMA_VERSION = 3  # bumped from 2: State gained iteration_files_touched + last_successful_eval
 RESUME_FRESHNESS_HOURS = 24  # checkpoints older than this are not offered for resume
 
 # Trivial continuation inputs that carry no new requirements. The planner short-circuits
@@ -1377,6 +1397,7 @@ def str_replace(path: str, old_str: str, new_str: str) -> str:
 
     TRACE.log("tool_result", tool="str_replace", ok=True, path=path,
               old_chars=len(old_str), new_chars=len(new_str))
+    _record_file_touch(path)
     return msg
 
 
@@ -1406,6 +1427,7 @@ def create_file(path: str, content: str) -> str:
         TRACE.log("syntax_check", path=path, ok=True)
 
     TRACE.log("tool_result", tool="create_file", ok=True, path=path, bytes=len(content))
+    _record_file_touch(path)
     return msg
 
 
@@ -2443,6 +2465,15 @@ class State(TypedDict):
     eval_notes: str
     replan_count: int  # how many times the builder has triggered revise_plan in this task
     planner_path: str  # "" | "fresh" | "continued" | "replaced" | "already_complete"
+    # Files touched by the most recent builder iteration. Set by builder_node from the
+    # _files_touched_holder that str_replace / create_file write into. Read by
+    # evaluator_node to decide whether browser verification can be skipped (no UI change
+    # → reuse cached verdict). Reset per builder iteration.
+    iteration_files_touched: list[str]
+    # Most recent eval verdict that was actually computed (not skipped) and was good enough
+    # to reuse — verdict in {done, continue}. None until the first real eval lands.
+    # Shape: {iteration, verdict, notes_preview, ts}.
+    last_successful_eval: dict
 
 
 # ────────────────────────── builder state graph ──────────────────────────
@@ -2721,6 +2752,7 @@ async def builder_node(outer_state: State, config: RunnableConfig | None = None)
     _reset_exit()
     _reset_verification()
     _shell_output_history.clear()
+    _files_touched_holder.clear()
 
     # Sync holder so plan-mutating tools and mark_done can persist with the right task/replan_count.
     plan_doc = outer_state.get("plan") or _empty_plan_doc()
@@ -2791,11 +2823,15 @@ async def builder_node(outer_state: State, config: RunnableConfig | None = None)
             verdict=f"builder_exit:{exit_signal}",
             builder_model=builder_llm.model_name,
         )
+    # Sync the file-touch holder into State for evaluator_node's skip-eval check. Sorted
+    # for deterministic trace output. The holder is cleared at the next builder entry.
+    touched = sorted(_files_touched_holder)
     return {
         "builder_summary": summary,
         "builder_exit_signal": exit_signal,
         "builder_exit_payload": exit_payload,
         "plan": final["plan"],
+        "iteration_files_touched": touched,
     }
 
 
@@ -3149,6 +3185,53 @@ _evaluator_holder: dict = {"agent": None, "mcp_session_cm": None, "mcp_session":
 # non-2xx HTTP) so a budget-overrun run still produces actionable verdict notes instead of
 # generic boilerplate. Cleared at the top of each evaluator_node invocation.
 _eval_tool_history: list[dict] = []
+
+# Per-iteration file-touch tracking. Populated by str_replace + create_file as they run;
+# reset at the top of each builder_node call; read by evaluator_node to decide whether
+# browser verification can be skipped on a non-UI-change iteration. Module-level (vs.
+# threaded through @tool args) because @tool functions don't have direct access to State,
+# matching the existing _plan_holder / _exit_holder pattern.
+_files_touched_holder: set[str] = set()
+
+
+def _record_file_touch(path: str) -> None:
+    """Record a file mutation. Normalize to absolute path string for stable matching."""
+    if not path:
+        return
+    try:
+        # Resolve to absolute even if the path was relative; the matcher then doesn't have
+        # to care about whether the builder used /workspace/proj/x or proj/x or x.
+        p = str(Path(path).resolve()) if not Path(path).is_absolute() else str(path)
+    except Exception:
+        p = str(path)
+    _files_touched_holder.add(p)
+
+
+def _iteration_affects_ui(touched_files) -> bool:
+    """True if any touched file matches a UI-relevant pattern.
+
+    Patterns are case-insensitive. Globs (containing * or ?) match by fnmatch against the
+    basename; non-glob patterns match by substring against the full path. A defensive empty-
+    or-None handling covers the no-touches case (always False — nothing changed).
+    """
+    if not touched_files:
+        return False
+    import fnmatch
+    paths_lower = [str(p).lower() for p in touched_files]
+    for pat in UI_PATH_PATTERNS:
+        pat_lower = pat.lower()
+        is_glob = "*" in pat or "?" in pat
+        for p in paths_lower:
+            if is_glob:
+                # fnmatch against basename AND full path — the glob *.css should hit both
+                # /workspace/proj/styles.css and a hypothetical app/styles.css.
+                base = p.rsplit("/", 1)[-1]
+                if fnmatch.fnmatch(base, pat_lower) or fnmatch.fnmatch(p, pat_lower):
+                    return True
+            else:
+                if pat_lower in p:
+                    return True
+    return False
 
 
 async def build_evaluator_subagent():
@@ -3604,6 +3687,60 @@ async def evaluator_node(state: State) -> dict:
     plan_render = _render_plan_doc(plan_doc)
     requirements_render = _render_requirements(plan_doc.get("requirements", []))
     is_web_app = _is_web_app_task(state, plan_doc)
+
+    # Skip-eval check: if the iteration touched no UI files AND we have a cached
+    # successful eval to fall back on, reuse the cached verdict instead of running the
+    # full browser protocol. Browser verification is the dominant cost on long runs and
+    # type-error fixes / server-side refactors / build tweaks don't change rendered UI.
+    # Sonnet still runs the advisor (verify_completion); only the evaluator stage is
+    # skipped — the cost saving is the 50+ MCP tool calls per protocol pass, not the
+    # advisor call itself.
+    touched = state.get("iteration_files_touched") or []
+    last_eval = state.get("last_successful_eval") or {}
+    skip_eligible = (
+        EVAL_SKIP_ENABLED
+        and is_web_app                           # only meaningful on web-app tasks
+        and not _iteration_affects_ui(touched)
+        and (not EVAL_SKIP_REQUIRES_PRIOR_EVAL or last_eval)
+        and last_eval.get("verdict") in ("done", "continue")
+    )
+    if skip_eligible:
+        cached_verdict = last_eval["verdict"]
+        cached_notes = last_eval.get("notes_preview") or "(no cached notes)"
+        cached_iter = last_eval.get("iteration", "?")
+        skip_reason = (
+            f"Eval skipped: this iteration touched {len(touched)} file(s), none of which "
+            f"match UI patterns ({', '.join(UI_PATH_PATTERNS[:5])}, …). Reusing the "
+            f"verdict from iteration {cached_iter} (verdict={cached_verdict!r}). The "
+            f"rendered UI cannot have changed without a UI-file edit, so the previous "
+            f"browser-based verification is still representative."
+        )
+        notes = f"[harness: skipped browser eval — no UI files touched]\n\n{cached_notes}"
+        TRACE.log("eval_skipped_no_ui_change",
+                  iteration=state["iteration"],
+                  touched_files=touched[:50],
+                  touched_files_count=len(touched),
+                  cached_from_iteration=cached_iter,
+                  cached_verdict=cached_verdict)
+        print(f"  EVAL SKIPPED: no UI-relevant files touched; reusing iter {cached_iter} "
+              f"verdict={cached_verdict!r}")
+        if touched:
+            print(f"    touched (non-UI): {', '.join(touched[:6])}{'…' if len(touched) > 6 else ''}")
+        # Checkpoint here too — even a skipped eval is the end of an iteration.
+        _create_checkpoint(
+            iteration=state["iteration"],
+            task=state.get("task", ""),
+            plan_doc=plan_doc,
+            verdict=f"{cached_verdict} (eval-skipped)",
+            builder_model=builder_llm.model_name,
+        )
+        # Don't refresh last_successful_eval — keep the original cached one as the source
+        # of truth so subsequent skips still point at the iteration that was actually
+        # browser-verified.
+        return {
+            "eval_verdict": cached_verdict,
+            "eval_notes": skip_reason + "\n\n" + notes,
+        }
     base_prompt = (
         f"REQUIREMENTS (load-bearing contract — verify EACH one is satisfied):\n"
         f"{requirements_render}\n\n"
@@ -3829,7 +3966,19 @@ async def evaluator_node(state: State) -> dict:
         verdict=verdict,
         builder_model=builder_llm.model_name,
     )
-    return {"eval_verdict": verdict, "eval_notes": notes}
+    # Cache this verdict for future skip-eval decisions. Only refresh when the verdict is
+    # one of {done, continue} — incomplete and replan are not safe fallback verdicts for
+    # subsequent iterations to inherit. Note we cache the full notes (capped) so a skipped
+    # iteration can show the previous evidence rather than a generic message.
+    update: dict = {"eval_verdict": verdict, "eval_notes": notes}
+    if verdict in ("done", "continue"):
+        update["last_successful_eval"] = {
+            "iteration": state["iteration"],
+            "verdict": verdict,
+            "notes_preview": notes[:2000],
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+    return update
 
 
 # ────────────────────────── outer routers + graph ──────────────────────────
