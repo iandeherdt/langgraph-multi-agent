@@ -663,15 +663,61 @@ def _reset_iteration_summary_holder() -> None:
     _iteration_summary_holder["advisor_missing"] = []
 
 
+def _summary_line_for_early_exit(*, exit_signal: str, exit_payload: dict | None,
+                                 plan_doc: dict, file_count: int) -> str:
+    """Produce a tailored one-line summary for an early-exit iteration where
+    verify_completion never ran. The default builder-summary first line ("Builder
+    exited: model_unreachable (after 0 steps)") is too generic for the iteration-history
+    list — this version surfaces the most useful detail per signal type and includes
+    file/plan progress so the iteration's actual scope is visible at a glance.
+    """
+    payload = exit_payload or {}
+    tasks = (plan_doc or {}).get("tasks") or []
+    done = sum(1 for t in tasks if t.get("status") == "done")
+    total = len(tasks)
+
+    # Per-signal detail extraction. Each exit tool stores different keys in payload.
+    detail = ""
+    if exit_signal == "model_unreachable":
+        et = payload.get("error_type", "")
+        em = (payload.get("error") or "")[:100]
+        detail = f"{et}: {em}".strip(": ") if (et or em) else ""
+    elif exit_signal == "give_up":
+        detail = (payload.get("reason") or "")[:120]
+    elif exit_signal == "help":
+        detail = (payload.get("reason") or "")[:120]
+    elif exit_signal == "replan":
+        detail = (payload.get("rationale") or "")[:120]
+
+    head = exit_signal if not detail else f"{exit_signal} — {detail}"
+    progress = f"{file_count} file(s) written, plan {done}/{total}"
+    return f"crashed/exited: {head}; {progress}"
+
+
 def _record_iteration_history(*, iteration: int, status: str, verdict: str,
                               touched_count: int, commit_hash: str | None,
                               advisor_missing: list | None = None,
-                              builder_summary: str = "") -> None:
+                              builder_summary: str = "",
+                              exit_signal: str | None = None,
+                              exit_payload: dict | None = None,
+                              plan_doc: dict | None = None) -> None:
     """Append one entry to _iteration_history with a one-line summary line.
 
-    Summary precedence: verify_completion's task_summary (most informative) → builder
-    summary's first non-empty line → "exploration" (early-exit fallback)."""
-    summary = _iteration_summary_holder.get("task_summary") or ""
+    Summary precedence: for early-exit status, generate from exit_signal + payload +
+    counts (the builder's verbose default summary line is too generic). Otherwise:
+    verify_completion's task_summary (most informative) → builder summary's first
+    non-empty line → "exploration" (last-resort fallback).
+    """
+    summary = ""
+    if status == "early-exit" and exit_signal:
+        summary = _summary_line_for_early_exit(
+            exit_signal=exit_signal,
+            exit_payload=exit_payload,
+            plan_doc=plan_doc or {},
+            file_count=touched_count,
+        )
+    if not summary:
+        summary = _iteration_summary_holder.get("task_summary") or ""
     if not summary and builder_summary:
         first = builder_summary.strip().splitlines()[0] if builder_summary.strip() else ""
         summary = first
@@ -692,7 +738,31 @@ def _record_iteration_history(*, iteration: int, status: str, verdict: str,
         "touched_count": touched_count,
         "cost_usd_at_end": round(cost_so_far_usd, 4),
         "commit_hash": commit_hash or "",
+        # Stored for _gather_open_concerns to surface failure context when the most
+        # recent iteration was early-exit / incomplete and the advisor never produced
+        # a missing list to surface.
+        "exit_signal": exit_signal or "",
+        "exit_payload_detail": _shorten_exit_payload(exit_signal, exit_payload),
     })
+
+
+def _shorten_exit_payload(exit_signal: str | None, exit_payload: dict | None) -> str:
+    """Pull the most-relevant single-line detail from an exit payload for surfacing in
+    Open concerns. Returns '' when nothing useful is available."""
+    if not exit_payload:
+        return ""
+    payload = exit_payload
+    if exit_signal == "model_unreachable":
+        et = payload.get("error_type", "")
+        em = (payload.get("error") or "")[:200]
+        return f"{et}: {em}".strip(": ") if (et or em) else ""
+    if exit_signal == "give_up":
+        return (payload.get("reason") or "")[:200]
+    if exit_signal == "help":
+        return (payload.get("reason") or "")[:200]
+    if exit_signal == "replan":
+        return (payload.get("rationale") or "")[:200]
+    return ""
 
 
 _VERDICT_TO_STATUS = {
@@ -727,19 +797,47 @@ def _compact_model_name(model: str) -> str:
 def _gather_open_concerns(state) -> list[str]:
     """Collect actionable concerns for the summary's 'Open concerns' section.
 
-    Sources:
-      - Most recent iteration with status != ok → its advisor_missing items
+    Sources, in order:
+      - Most recent iteration with status != ok → advisor_missing items (when present)
+        AND exit_signal+payload (when builder ended early without the advisor running)
+        AND verdict-based hint when status is 'incomplete' (eval-side failures)
       - Pending architecture proposals on the plan
-      - Any non-empty notes from the most recent eval that wasn't 'done'
     """
     concerns: list[str] = []
-    # Recent rejected/incomplete iteration's advisor missing items
     for entry in reversed(_iteration_history):
-        if entry["status"] != "ok":
-            for m in entry.get("advisor_missing", []):
-                concerns.append(f"(iter {entry['iter']}) {m}")
-            break  # only the most recent non-ok
-    # Pending architecture proposals
+        if entry["status"] == "ok":
+            continue
+        # Most recent non-ok iteration. Surface advisor missing items if the advisor
+        # actually ran — those are usually the most actionable signals.
+        for m in entry.get("advisor_missing") or []:
+            concerns.append(f"(iter {entry['iter']}) {m}")
+        # When the iteration was an early-exit (builder crashed / give_up / help / replan),
+        # the advisor never ran — surface the exit signal + payload detail instead so the
+        # human/operator can see why the run stopped.
+        if entry["status"] == "early-exit" and entry.get("exit_signal"):
+            sig = entry["exit_signal"]
+            detail = entry.get("exit_payload_detail") or ""
+            label_map = {
+                "model_unreachable": "model unreachable",
+                "give_up": "builder called give_up",
+                "help": "builder called request_user_help",
+                "replan": "builder called revise_plan",
+            }
+            label = label_map.get(sig, sig)
+            line = f"(iter {entry['iter']}) builder ended early — {label}"
+            if detail:
+                line += f": {detail}"
+            concerns.append(line)
+        # When the iteration was 'incomplete' (eval-side: MCP infra failure or empty-notes
+        # cap exceeded), the eval_notes contain the diagnostic — pull a one-liner.
+        elif entry["status"] == "incomplete" and not entry.get("advisor_missing"):
+            concerns.append(
+                f"(iter {entry['iter']}) eval returned 'incomplete'; check trace for "
+                f"evaluator_exception / evaluator_empty_notes_cap_exceeded"
+            )
+        break  # only the most recent non-ok iteration
+
+    # Pending architecture proposals (orthogonal to verdict status).
     plan = state.get("plan") if state else None
     if isinstance(plan, dict):
         for prop in plan.get("pending_proposals") or []:
@@ -788,9 +886,18 @@ def _update_run_summary(state) -> None:
                 marker = {"ok": "✓", "rejected": "✗", "incomplete": "⚠", "early-exit": "↩"}.get(
                     entry["status"], "•")
                 hash_str = f" [{entry['commit_hash']}]" if entry["commit_hash"] else ""
+                # Strip "builder_exit:" prefix from verdict — the ↩ marker already conveys
+                # "early exit" and the early-exit summary line embeds the signal name, so
+                # leaving the prefix in produces redundant noise like
+                # "(builder_exit:model_unreachable, 6 files)" on a line that already says
+                # "crashed/exited: model_unreachable …".
+                v = entry["verdict"]
+                if v.startswith("builder_exit:"):
+                    v = v[len("builder_exit:"):]
+                file_word = "file" if entry["touched_count"] == 1 else "files"
                 history_lines.append(
                     f"- Iter {entry['iter']}: {entry['summary']} "
-                    f"({entry['verdict']}, {entry['touched_count']} files){hash_str} {marker}"
+                    f"({v}, {entry['touched_count']} {file_word}){hash_str} {marker}"
                 )
 
         concerns = _gather_open_concerns(state)
@@ -839,7 +946,9 @@ def _update_run_summary(state) -> None:
         TRACE.log("run_summary_failed", error=str(e)[:300])
 
 
-def _finalize_iteration_summary(*, state, verdict: str, builder_summary: str = "") -> None:
+def _finalize_iteration_summary(*, state, verdict: str, builder_summary: str = "",
+                                exit_signal: str | None = None,
+                                exit_payload: dict | None = None) -> None:
     """Record the iteration in history + rewrite RUN_SUMMARY.md. Idempotent. Called from
     every return path in evaluator_node and from builder_node early-exit returns. The
     iteration history's status is derived from the verdict via _VERDICT_TO_STATUS; for
@@ -856,6 +965,9 @@ def _finalize_iteration_summary(*, state, verdict: str, builder_summary: str = "
         touched_count=len((state or {}).get("iteration_files_touched") or []),
         commit_hash=last_commit,
         builder_summary=builder_summary,
+        exit_signal=exit_signal,
+        exit_payload=exit_payload,
+        plan_doc=(state or {}).get("plan") or {},
     )
     _update_run_summary(state)
     _reset_iteration_summary_holder()
@@ -3204,6 +3316,8 @@ async def builder_node(outer_state: State, config: RunnableConfig | None = None)
             state=synthetic_state,
             verdict=f"builder_exit:{exit_signal}",
             builder_summary=summary,
+            exit_signal=exit_signal,
+            exit_payload=exit_payload,
         )
     # Sync the file-touch holder into State for evaluator_node's skip-eval check. Sorted
     # for deterministic trace output. The holder is cleared at the next builder entry.
